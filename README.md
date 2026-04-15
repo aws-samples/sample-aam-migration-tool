@@ -32,7 +32,7 @@ The tool handles:
 - Creating entitlements in AAM from existing role-to-user group mappings
 - Auditing entitlement state post-migration
 
-### Path 3: Utilities
+### Part 3: Utilities
 - resource/org policy analysis (Blake)
 - CloudTrail undocumented roles for AssumeRoleWithSAML (Sowjanya has a script that does some of this)
 - SCP creation / immutability support aka adding tags to roles (guidance not technical implementation)
