@@ -46,6 +46,10 @@ Both paths follow a phased approach:
 | Testing, validation, business logic, operational continuity | Customer |
 | Role discovery, decommissioning sign-off | Shared |
 
+## Why "Truffle"?
+
+"Truffle" also means to dig or search — as in truffle hunting. It fits a migration tool that digs through accounts, sniffing out roles, policies, and entitlements buried across your AWS organization.
+
 ## Key Considerations
 
 - **Emergency access**: Set up break-glass procedures (IAM users or direct IAM federation) before starting any migration
