@@ -6,7 +6,7 @@ Description: >
 Parameters:
   IdentityCenterRoleArn:
     Type: String
-    Default: "arn:aws:iam::075384444871:role/aws-reserved/sso.amazonaws.com/us-east-1/AWSReservedSSO_AdministratorAccess_abc123def456"
+    Default: "arn:aws:iam::183068582925:role/aws-reserved/sso.amazonaws.com/us-east-1/AWSReservedSSO_AdministratorAccess_abc123def456"
     Description: Full ARN of the Identity Center role to reference in resource policies
 
 Resources:
@@ -27,9 +27,12 @@ Resources:
           - Sid: AllowIdentityCenterRole
             Effect: Allow
             Principal:
-              AWS: !Ref IdentityCenterRoleArn
+              AWS: "*"
             Action: s3:GetObject
             Resource: !Sub "${TestBucket.Arn}/*"
+            Condition:
+              ArnEquals:
+                "aws:PrincipalArn": !Ref IdentityCenterRoleArn
 
   # ─── SQS ─────────────────────────────────────────────────────────────────
   TestQueue:
@@ -48,9 +51,12 @@ Resources:
           - Sid: AllowIdentityCenterRole
             Effect: Allow
             Principal:
-              AWS: !Ref IdentityCenterRoleArn
+              AWS: "*"
             Action: sqs:ReceiveMessage
             Resource: !GetAtt TestQueue.Arn
+            Condition:
+              ArnEquals:
+                "aws:PrincipalArn": !Ref IdentityCenterRoleArn
 
 
   # ─── SNS ─────────────────────────────────────────────────────────────────
@@ -70,9 +76,12 @@ Resources:
           - Sid: AllowIdentityCenterRole
             Effect: Allow
             Principal:
-              AWS: !Ref IdentityCenterRoleArn
+              AWS: "*"
             Action: sns:Subscribe
             Resource: !Ref TestTopic
+            Condition:
+              ArnEquals:
+                "aws:PrincipalArn": !Ref IdentityCenterRoleArn
 
   # ─── KMS ─────────────────────────────────────────────────────────────────
   TestKmsKey:
@@ -91,9 +100,12 @@ Resources:
           - Sid: AllowIdentityCenterRole
             Effect: Allow
             Principal:
-              AWS: !Ref IdentityCenterRoleArn
+              AWS: "*"
             Action: kms:DescribeKey
             Resource: "*"
+            Condition:
+              ArnEquals:
+                "aws:PrincipalArn": !Ref IdentityCenterRoleArn
 
   # ─── Secrets Manager ────────────────────────────────────────────────────
   TestSecret:
@@ -112,9 +124,12 @@ Resources:
           - Sid: AllowIdentityCenterRole
             Effect: Allow
             Principal:
-              AWS: !Ref IdentityCenterRoleArn
+              AWS: "*"
             Action: secretsmanager:GetSecretValue
             Resource: !Ref TestSecret
+            Condition:
+              ArnEquals:
+                "aws:PrincipalArn": !Ref IdentityCenterRoleArn
 
   # ─── ECR ─────────────────────────────────────────────────────────────────
   TestEcrRepo:
@@ -127,9 +142,12 @@ Resources:
           - Sid: AllowIdentityCenterRole
             Effect: Allow
             Principal:
-              AWS: !Ref IdentityCenterRoleArn
+              AWS: "*"
             Action: ecr:BatchGetImage
             Resource: "*"
+            Condition:
+              ArnEquals:
+                "aws:PrincipalArn": !Ref IdentityCenterRoleArn
 
   # ─── EFS ─────────────────────────────────────────────────────────────────
   TestEfs:
@@ -141,16 +159,18 @@ Resources:
           - Sid: AllowIdentityCenterRole
             Effect: Allow
             Principal:
-              AWS: !Ref IdentityCenterRoleArn
+              AWS: "*"
             Action: elasticfilesystem:DescribeMountTargets
             Resource: "*"
+            Condition:
+              ArnEquals:
+                "aws:PrincipalArn": !Ref IdentityCenterRoleArn
 
 
   # ─── OpenSearch ──────────────────────────────────────────────────────────
   TestOpenSearchDomain:
     Type: AWS::OpenSearchService::Domain
     Properties:
-      DomainName: policy-scan-test
       EngineVersion: OpenSearch_2.11
       ClusterConfig:
         InstanceType: t3.small.search
@@ -165,9 +185,46 @@ Resources:
           - Sid: AllowIdentityCenterRole
             Effect: Allow
             Principal:
-              AWS: !Ref IdentityCenterRoleArn
+              AWS: "*"
             Action: es:DescribeDomain
-            Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/policy-scan-test/*"
+            Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/*"
+            Condition:
+              ArnEquals:
+                "aws:PrincipalArn": !Ref IdentityCenterRoleArn
+
+  # ─── OpenSearch Serverless ───────────────────────────────────────────────
+  TestAossEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: policy-scan-test-enc
+      Type: encryption
+      Policy: >-
+        {"Rules":[{"ResourceType":"collection","Resource":["collection/policy-scan-test"]}],"AWSOwnedKey":true}
+
+  TestAossNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: policy-scan-test-net
+      Type: network
+      Policy: >-
+        [{"Rules":[{"ResourceType":"collection","Resource":["collection/policy-scan-test"]}],"AllowFromPublic":true}]
+
+  TestAossCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn:
+      - TestAossEncryptionPolicy
+      - TestAossNetworkPolicy
+    Properties:
+      Name: policy-scan-test
+      Type: TIMESERIES
+
+  TestAossAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: policy-scan-test-access
+      Type: data
+      Policy: !Sub >-
+        [{"Rules":[{"ResourceType":"index","Resource":["index/policy-scan-test/*"],"Permission":["aoss:ReadDocument"]}],"Principal":["${IdentityCenterRoleArn}"]}]
 
   # ─── Backup Vault ────────────────────────────────────────────────────────
   TestBackupVault:
@@ -180,9 +237,12 @@ Resources:
           - Sid: AllowIdentityCenterRole
             Effect: Allow
             Principal:
-              AWS: !Ref IdentityCenterRoleArn
+              AWS: "*"
             Action: backup:DescribeBackupVault
             Resource: "*"
+            Condition:
+              ArnEquals:
+                "aws:PrincipalArn": !Ref IdentityCenterRoleArn
 
   # ─── EventBridge ─────────────────────────────────────────────────────────
   TestEventBus:
@@ -199,9 +259,12 @@ Resources:
         Sid: AllowIdentityCenterRole
         Effect: Allow
         Principal:
-          AWS: !Ref IdentityCenterRoleArn
+          AWS: "*"
         Action: events:DescribeEventBus
         Resource: !GetAtt TestEventBus.Arn
+        Condition:
+          ArnEquals:
+            "aws:PrincipalArn": !Ref IdentityCenterRoleArn
 
   # ─── CloudWatch Logs ─────────────────────────────────────────────────────
   TestLogGroup:
@@ -222,29 +285,22 @@ Resources:
               "Sid": "AllowIdentityCenterRole",
               "Effect": "Allow",
               "Principal": {
-                "AWS": "${IdentityCenterRoleArn}"
+                "AWS": "*"
               },
               "Action": "logs:DescribeLogGroups",
-              "Resource": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+              "Resource": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*",
+              "Condition": {
+                "ArnEquals": {
+                  "aws:PrincipalArn": "${IdentityCenterRoleArn}"
+                }
+              }
             }
           ]
         }
 
-  # ─── Glue ────────────────────────────────────────────────────────────────
-  TestGlueResourcePolicy:
-    Type: AWS::Glue::ResourcePolicy
-    Properties:
-      ResourcePolicy:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: AllowIdentityCenterRole
-            Effect: Allow
-            Principal:
-              AWS: !Ref IdentityCenterRoleArn
-            Action: glue:GetDatabase
-            Resource: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
 
   # ─── IAM Role (trust policy) ────────────────────────────────────────────
+  # IAM trust policies validate principals, so use Condition instead
   TestRole:
     Type: AWS::IAM::Role
     Properties:
@@ -255,8 +311,11 @@ Resources:
           - Sid: AllowIdentityCenterRole
             Effect: Allow
             Principal:
-              AWS: !Ref IdentityCenterRoleArn
+              AWS: "*"
             Action: sts:AssumeRole
+            Condition:
+              ArnEquals:
+                "aws:PrincipalArn": !Ref IdentityCenterRoleArn
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/ReadOnlyAccess
 
@@ -287,12 +346,16 @@ Resources:
           def handler(event, context):
               return {"statusCode": 200}
 
+  # Lambda::Permission doesn't support Condition, but it also doesn't validate
+  # the principal ARN — it accepts any account ID as the principal.
+  # We use the account ID from the role ARN so it doesn't fail validation.
   TestLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref TestLambdaFunction
       Action: lambda:GetFunction
-      Principal: !Ref IdentityCenterRoleArn
+      Principal: !Select [4, !Split [":", !Ref IdentityCenterRoleArn]]
+      SourceArn: !Ref IdentityCenterRoleArn
 
 Outputs:
   BucketName:

@@ -457,6 +457,34 @@ def scan_opensearch(session, region, account_id, terms):
     return matches
 
 
+def scan_opensearch_serverless(session, region, account_id, terms):
+    heading("OpenSearch Serverless (Data Access Policies)")
+    matches = []
+    aoss = session.client("opensearchserverless", region_name=region)
+    # List all data access policies
+    token = None
+    while True:
+        kwargs = {"type": "data"}
+        if token:
+            kwargs["nextToken"] = token
+        resp = safe(aoss.list_access_policies, **kwargs)
+        if not resp:
+            break
+        for summary in resp.get("accessPolicySummaries", []):
+            name = summary["name"]
+            detail = safe(aoss.get_access_policy, type="data", name=name)
+            if detail:
+                pol = policy_text(detail.get("accessPolicyDetail", {}).get("policy"))
+                hit = check_policy(pol, f"aoss-data-access-policy:{region}:{name}",
+                                   "OpenSearch Serverless", terms)
+                if hit:
+                    matches.append(hit)
+        token = resp.get("nextToken")
+        if not token:
+            break
+    return matches
+
+
 def scan_s3_express(session, region, account_id, terms):
     heading("S3 Express (Directory Buckets)")
     matches = []
@@ -705,6 +733,7 @@ REGIONAL_SCANNERS = [
     scan_codeartifact, scan_codebuild, scan_dynamodb, scan_entity_resolution,
     scan_eventbridge, scan_eventbridge_schemas, scan_glue, scan_kms,
     scan_kinesis, scan_lambda, scan_lex, scan_mediastore, scan_opensearch,
+    scan_opensearch_serverless,
     scan_s3_express, scan_glacier, scan_s3_tables, scan_secrets_manager,
     scan_ses, scan_sns, scan_sqs, scan_ssm, scan_ssm_incidents,
     scan_ssm_contacts, scan_ecr, scan_efs, scan_redshift_serverless,

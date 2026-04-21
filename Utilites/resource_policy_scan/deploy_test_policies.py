@@ -2,9 +2,9 @@
 """
 deploy_test_policies.py
 
-Creates test resources and attaches resource policies for services that don't
-support resource policies via CloudFormation. Run this AFTER deploying the
-test_resources.yaml stack.
+Deploys the CloudFormation stack (test_resources.yaml) and creates additional
+test resources with resource policies for services that don't support policies
+via CloudFormation.
 
 Usage:
     python deploy_test_policies.py [--region us-east-1] [--cleanup]
@@ -12,12 +12,13 @@ Usage:
 
 import argparse
 import json
+import os
 import time
 
 import boto3
 from botocore.exceptions import ClientError
 
-ROLE_ARN = "arn:aws:iam::075384444871:role/aws-reserved/sso.amazonaws.com/us-east-1/AWSReservedSSO_AdministratorAccess_abc123def456"
+ROLE_SUFFIX = "aws-reserved/sso.amazonaws.com/us-east-1/AWSReservedSSO_AdministratorAccess_abc123def456"
 PREFIX = "policy-scan-test"
 
 
@@ -25,15 +26,24 @@ def get_account_id(session):
     return session.client("sts").get_caller_identity()["Account"]
 
 
-def policy_doc(action, resource="*"):
+def get_role_arn(account_id):
+    return f"arn:aws:iam::{account_id}:role/{ROLE_SUFFIX}"
+
+
+def policy_doc(role_arn, action, resource="*"):
     return json.dumps({
         "Version": "2012-10-17",
         "Statement": [{
             "Sid": "AllowIdentityCenterRole",
             "Effect": "Allow",
-            "Principal": {"AWS": ROLE_ARN},
+            "Principal": {"AWS": "*"},
             "Action": action,
             "Resource": resource,
+            "Condition": {
+                "ArnEquals": {
+                    "aws:PrincipalArn": role_arn,
+                }
+            },
         }]
     })
 
@@ -42,9 +52,82 @@ def wait(seconds=2):
     time.sleep(seconds)
 
 
+TEMPLATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_resources.yaml")
+STACK_NAME = PREFIX
+
+
+def deploy_cfn_stack(session, region, role_arn):
+    """Deploy the CloudFormation stack and wait for completion."""
+    print("=== CloudFormation Stack ===")
+    cfn = session.client("cloudformation", region_name=region)
+
+    with open(TEMPLATE_FILE, "r") as f:
+        template_body = f.read()
+
+    try:
+        cfn.describe_stacks(StackName=STACK_NAME)
+        # Stack exists — update it
+        try:
+            cfn.update_stack(
+                StackName=STACK_NAME,
+                TemplateBody=template_body,
+                Parameters=[{"ParameterKey": "IdentityCenterRoleArn", "ParameterValue": role_arn}],
+                Capabilities=["CAPABILITY_NAMED_IAM"],
+            )
+            print(f"  Updating stack: {STACK_NAME}")
+            waiter = cfn.get_waiter("stack_update_complete")
+        except ClientError as e:
+            if "No updates are to be performed" in str(e):
+                print(f"  Stack {STACK_NAME} already up to date")
+                return
+            raise
+    except ClientError:
+        # Stack doesn't exist — create it
+        cfn.create_stack(
+            StackName=STACK_NAME,
+            TemplateBody=template_body,
+            Parameters=[{"ParameterKey": "IdentityCenterRoleArn", "ParameterValue": role_arn}],
+            Capabilities=["CAPABILITY_NAMED_IAM"],
+        )
+        print(f"  Creating stack: {STACK_NAME}")
+        waiter = cfn.get_waiter("stack_create_complete")
+
+    print("  Waiting for stack to complete (this may take several minutes)...")
+    waiter.wait(StackName=STACK_NAME, WaiterConfig={"Delay": 15, "MaxAttempts": 60})
+    print(f"  Stack {STACK_NAME} deployed successfully")
+
+
+def delete_cfn_stack(session, region):
+    """Delete the CloudFormation stack and wait for completion."""
+    print("=== CloudFormation Stack ===")
+    cfn = session.client("cloudformation", region_name=region)
+
+    # Empty the S3 bucket first (can't delete non-empty buckets)
+    try:
+        s3 = session.client("s3", region_name=region)
+        account_id = get_account_id(session)
+        bucket_name = f"{PREFIX}-{account_id}"
+        resp = s3.list_objects_v2(Bucket=bucket_name)
+        for obj in resp.get("Contents", []):
+            s3.delete_object(Bucket=bucket_name, Key=obj["Key"])
+        print(f"  Emptied bucket: {bucket_name}")
+    except ClientError:
+        pass
+
+    try:
+        cfn.delete_stack(StackName=STACK_NAME)
+        print(f"  Deleting stack: {STACK_NAME}")
+        waiter = cfn.get_waiter("stack_delete_complete")
+        print("  Waiting for stack deletion...")
+        waiter.wait(StackName=STACK_NAME, WaiterConfig={"Delay": 15, "MaxAttempts": 60})
+        print(f"  Stack {STACK_NAME} deleted")
+    except ClientError as e:
+        print(f"  Stack deletion: {e}")
+
+
 # ─── Individual resource creators ────────────────────────────────────────────
 
-def setup_api_gateway(session, region, account_id):
+def setup_api_gateway(session, region, account_id, role_arn):
     """Create a REST API with a resource policy."""
     print("=== API Gateway ===")
     apigw = session.client("apigateway", region_name=region)
@@ -52,7 +135,7 @@ def setup_api_gateway(session, region, account_id):
         resp = apigw.create_rest_api(
             name=PREFIX,
             description="Policy scan test API",
-            policy=policy_doc("execute-api:Invoke",
+            policy=policy_doc(role_arn, "execute-api:Invoke",
                               f"arn:aws:execute-api:{region}:{account_id}:*/*"),
         )
         print(f"  Created REST API: {resp['id']}")
@@ -62,7 +145,7 @@ def setup_api_gateway(session, region, account_id):
         return None
 
 
-def setup_codeartifact(session, region, account_id):
+def setup_codeartifact(session, region, account_id, role_arn):
     """Create a CodeArtifact domain with a resource policy."""
     print("=== CodeArtifact ===")
     ca = session.client("codeartifact", region_name=region)
@@ -75,7 +158,7 @@ def setup_codeartifact(session, region, account_id):
     try:
         ca.put_domain_permissions_policy(
             domain=PREFIX,
-            policyDocument=policy_doc("codeartifact:ListRepositoriesInDomain",
+            policyDocument=policy_doc(role_arn, "codeartifact:ListRepositoriesInDomain",
                                       f"arn:aws:codeartifact:{region}:{account_id}:domain/{PREFIX}"),
         )
         print("  Attached domain policy")
@@ -83,7 +166,7 @@ def setup_codeartifact(session, region, account_id):
         print(f"  Skipped policy: {e}")
 
 
-def setup_codebuild(session, region, account_id):
+def setup_codebuild(session, region, account_id, role_arn):
     """Create a CodeBuild project with a resource policy."""
     print("=== CodeBuild ===")
     cb = session.client("codebuild", region_name=region)
@@ -108,14 +191,14 @@ def setup_codebuild(session, region, account_id):
     try:
         cb.put_resource_policy(
             resourceArn=project_arn,
-            policy=policy_doc("codebuild:BatchGetProjects", project_arn),
+            policy=policy_doc(role_arn, "codebuild:BatchGetProjects", project_arn),
         )
         print("  Attached project policy")
     except ClientError as e:
         print(f"  Skipped policy: {e}")
 
 
-def setup_dynamodb(session, region, account_id):
+def setup_dynamodb(session, region, account_id, role_arn):
     """Create a DynamoDB table with a resource policy."""
     print("=== DynamoDB ===")
     ddb = session.client("dynamodb", region_name=region)
@@ -135,14 +218,14 @@ def setup_dynamodb(session, region, account_id):
     try:
         ddb.put_resource_policy(
             ResourceArn=table_arn,
-            Policy=policy_doc("dynamodb:DescribeTable", table_arn),
+            Policy=policy_doc(role_arn, "dynamodb:DescribeTable", table_arn),
         )
         print("  Attached table policy")
     except ClientError as e:
         print(f"  Skipped policy: {e}")
 
 
-def setup_kinesis(session, region, account_id):
+def setup_kinesis(session, region, account_id, role_arn):
     """Create a Kinesis stream with a resource policy."""
     print("=== Kinesis ===")
     kinesis = session.client("kinesis", region_name=region)
@@ -158,14 +241,14 @@ def setup_kinesis(session, region, account_id):
         stream_arn = desc["StreamDescriptionSummary"]["StreamARN"]
         kinesis.put_resource_policy(
             ResourceARN=stream_arn,
-            Policy=policy_doc("kinesis:DescribeStream", stream_arn),
+            Policy=policy_doc(role_arn, "kinesis:DescribeStream", stream_arn),
         )
         print("  Attached stream policy")
     except ClientError as e:
         print(f"  Skipped policy: {e}")
 
 
-def setup_eventbridge_schemas(session, region, account_id):
+def setup_eventbridge_schemas(session, region, account_id, role_arn):
     """Create an EventBridge Schemas registry with a resource policy."""
     print("=== EventBridge Schemas ===")
     schemas = session.client("schemas", region_name=region)
@@ -177,7 +260,7 @@ def setup_eventbridge_schemas(session, region, account_id):
     try:
         schemas.put_resource_policy(
             RegistryName=PREFIX,
-            Policy=policy_doc("schemas:DescribeRegistry",
+            Policy=policy_doc(role_arn, "schemas:DescribeRegistry",
                               f"arn:aws:schemas:{region}:{account_id}:registry/{PREFIX}"),
         )
         print("  Attached registry policy")
@@ -185,7 +268,21 @@ def setup_eventbridge_schemas(session, region, account_id):
         print(f"  Skipped policy: {e}")
 
 
-def setup_mediastore(session, region, account_id):
+def setup_glue(session, region, account_id, role_arn):
+    """Attach a resource policy to the Glue Data Catalog."""
+    print("=== Glue ===")
+    glue = session.client("glue", region_name=region)
+    try:
+        glue.put_resource_policy(
+            PolicyInJson=policy_doc(role_arn, "glue:GetDatabase",
+                                    f"arn:aws:glue:{region}:{account_id}:catalog"),
+        )
+        print("  Attached Glue catalog resource policy")
+    except ClientError as e:
+        print(f"  Skipped policy: {e}")
+
+
+def setup_mediastore(session, region, account_id, role_arn):
     """Create a MediaStore container with a resource policy."""
     print("=== MediaStore ===")
     ms = session.client("mediastore", region_name=region)
@@ -203,7 +300,7 @@ def setup_mediastore(session, region, account_id):
     try:
         ms.put_container_policy(
             ContainerName=PREFIX,
-            Policy=policy_doc("mediastore:DescribeContainer",
+            Policy=policy_doc(role_arn, "mediastore:DescribeContainer",
                               f"arn:aws:mediastore:{region}:{account_id}:container/{PREFIX}"),
         )
         print("  Attached container policy")
@@ -211,7 +308,7 @@ def setup_mediastore(session, region, account_id):
         print(f"  Skipped policy: {e}")
 
 
-def setup_glacier(session, region, account_id):
+def setup_glacier(session, region, account_id, role_arn):
     """Create a Glacier vault with an access policy."""
     print("=== Glacier ===")
     glacier = session.client("glacier", region_name=region)
@@ -224,7 +321,7 @@ def setup_glacier(session, region, account_id):
         glacier.set_vault_access_policy(
             accountId=account_id,
             vaultName=PREFIX,
-            policy={"Policy": policy_doc("glacier:DescribeVault",
+            policy={"Policy": policy_doc(role_arn, "glacier:DescribeVault",
                                          f"arn:aws:glacier:{region}:{account_id}:vaults/{PREFIX}")},
         )
         print("  Attached vault access policy")
@@ -232,7 +329,7 @@ def setup_glacier(session, region, account_id):
         print(f"  Skipped policy: {e}")
 
 
-def setup_ses(session, region, account_id):
+def setup_ses(session, region, account_id, role_arn):
     """Create an SES identity with a sending policy."""
     print("=== SES ===")
     sesv2 = session.client("sesv2", region_name=region)
@@ -247,7 +344,7 @@ def setup_ses(session, region, account_id):
         ses.put_identity_policy(
             Identity=identity,
             PolicyName="test-policy",
-            Policy=policy_doc("ses:GetIdentityVerificationAttributes",
+            Policy=policy_doc(role_arn, "ses:GetIdentityVerificationAttributes",
                               f"arn:aws:ses:{region}:{account_id}:identity/{identity}"),
         )
         print("  Attached identity policy")
@@ -255,7 +352,7 @@ def setup_ses(session, region, account_id):
         print(f"  Skipped policy: {e}")
 
 
-def setup_vpc_endpoint(session, region, account_id):
+def setup_vpc_endpoint(session, region, account_id, role_arn):
     """Create a VPC endpoint with a resource policy."""
     print("=== VPC Endpoints ===")
     ec2 = session.client("ec2", region_name=region)
@@ -270,7 +367,7 @@ def setup_vpc_endpoint(session, region, account_id):
             VpcId=vpc_id,
             ServiceName=f"com.amazonaws.{region}.s3",
             VpcEndpointType="Gateway",
-            PolicyDocument=policy_doc("s3:GetObject"),
+            PolicyDocument=policy_doc(role_arn, "s3:GetObject"),
         )
         vpce_id = resp["VpcEndpoint"]["VpcEndpointId"]
         print(f"  Created VPC endpoint: {vpce_id}")
@@ -280,7 +377,7 @@ def setup_vpc_endpoint(session, region, account_id):
         return None
 
 
-def setup_cloudtrail(session, region, account_id):
+def setup_cloudtrail(session, region, account_id, role_arn):
     """Create a CloudTrail event data store with a resource policy."""
     print("=== CloudTrail ===")
     ct = session.client("cloudtrail", region_name=region)
@@ -308,14 +405,14 @@ def setup_cloudtrail(session, region, account_id):
     try:
         ct.put_resource_policy(
             ResourceArn=eds_arn,
-            ResourcePolicy=policy_doc("cloudtrail:GetEventDataStore", eds_arn),
+            ResourcePolicy=policy_doc(role_arn, "cloudtrail:GetEventDataStore", eds_arn),
         )
         print("  Attached resource policy")
     except ClientError as e:
         print(f"  Skipped policy: {e}")
 
 
-def setup_ssm(session, region, account_id):
+def setup_ssm(session, region, account_id, role_arn):
     """Create an SSM document and share it (resource policy equivalent)."""
     print("=== Systems Manager ===")
     ssm = session.client("ssm", region_name=region)
@@ -340,14 +437,14 @@ def setup_ssm(session, region, account_id):
     try:
         ssm.put_resource_policy(
             ResourceArn=arn,
-            Policy=policy_doc("ssm:GetOpsItem", arn),
+            Policy=policy_doc(role_arn, "ssm:GetOpsItem", arn),
         )
         print("  Attached OpsItemGroup resource policy")
     except ClientError as e:
         print(f"  Skipped OpsItemGroup policy: {e}")
 
 
-def setup_entity_resolution(session, region, account_id):
+def setup_entity_resolution(session, region, account_id, role_arn):
     """Create an Entity Resolution schema mapping with a resource policy."""
     print("=== Entity Resolution ===")
     er = session.client("entityresolution", region_name=region)
@@ -372,14 +469,14 @@ def setup_entity_resolution(session, region, account_id):
     try:
         er.put_policy(
             arn=schema_arn,
-            policy=policy_doc("entityresolution:GetSchemaMapping", schema_arn),
+            policy=policy_doc(role_arn, "entityresolution:GetSchemaMapping", schema_arn),
         )
         print("  Attached schema policy")
     except ClientError as e:
         print(f"  Skipped policy: {e}")
 
 
-def setup_lex(session, region, account_id):
+def setup_lex(session, region, account_id, role_arn):
     """Create a Lex V2 bot with a resource policy."""
     print("=== Lex V2 ===")
     lex = session.client("lexv2-models", region_name=region)
@@ -407,7 +504,7 @@ def setup_lex(session, region, account_id):
     try:
         lex.create_resource_policy(
             resourceArn=bot_arn,
-            policy=policy_doc("lex:DescribeBot", bot_arn),
+            policy=policy_doc(role_arn, "lex:DescribeBot", bot_arn),
         )
         print("  Attached bot policy")
     except ClientError as e:
@@ -415,7 +512,7 @@ def setup_lex(session, region, account_id):
             try:
                 lex.update_resource_policy(
                     resourceArn=bot_arn,
-                    policy=policy_doc("lex:DescribeBot", bot_arn),
+                    policy=policy_doc(role_arn, "lex:DescribeBot", bot_arn),
                     expectedRevisionId="*",
                 )
                 print("  Updated bot policy")
@@ -425,7 +522,7 @@ def setup_lex(session, region, account_id):
             print(f"  Skipped policy: {e}")
 
 
-def setup_private_ca(session, region, account_id):
+def setup_private_ca(session, region, account_id, role_arn):
     """Create a Private CA with a resource policy."""
     print("=== Private CA ===")
     pca = session.client("acm-pca", region_name=region)
@@ -447,14 +544,14 @@ def setup_private_ca(session, region, account_id):
     try:
         pca.put_policy(
             ResourceArn=ca_arn,
-            Policy=policy_doc("acm-pca:DescribeCertificateAuthority", ca_arn),
+            Policy=policy_doc(role_arn, "acm-pca:DescribeCertificateAuthority", ca_arn),
         )
         print("  Attached CA policy")
     except ClientError as e:
         print(f"  Skipped policy: {e}")
 
 
-def setup_ssm_incidents(session, region, account_id):
+def setup_ssm_incidents(session, region, account_id, role_arn):
     """Create an SSM Incident Manager response plan with a resource policy."""
     print("=== SSM Incident Manager ===")
     inc = session.client("ssm-incidents", region_name=region)
@@ -483,7 +580,7 @@ def setup_ssm_incidents(session, region, account_id):
     try:
         inc.put_resource_policy(
             resourceArn=rp_arn,
-            policy=policy_doc("ssm-incidents:GetResponsePlan", rp_arn),
+            policy=policy_doc(role_arn, "ssm-incidents:GetResponsePlan", rp_arn),
         )
         print("  Attached response plan policy")
     except ClientError as e:
@@ -545,6 +642,14 @@ def cleanup(session, region, account_id):
         print(f"  Deleted Schemas registry: {PREFIX}")
     except ClientError as e:
         print(f"  Schemas cleanup: {e}")
+
+    # Glue
+    try:
+        glue = session.client("glue", region_name=region)
+        glue.delete_resource_policy()
+        print("  Deleted Glue catalog resource policy")
+    except ClientError as e:
+        print(f"  Glue cleanup: {e}")
 
     # MediaStore
     try:
@@ -649,8 +754,10 @@ def cleanup(session, region, account_id):
     except ClientError as e:
         print(f"  SSM Incidents cleanup: {e}")
 
-    print("\nCleanup complete. Don't forget to delete the CFN stack too:")
-    print("  aws cloudformation delete-stack --stack-name policy-scan-test")
+    # CloudFormation stack (last — some SDK resources depend on CFN resources)
+    delete_cfn_stack(session, region)
+
+    print("\nCleanup complete.")
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -667,37 +774,42 @@ def main():
 
     print(f"Account: {account_id}")
     print(f"Region:  {region}")
-    print(f"Role:    {ROLE_ARN}")
+    role_arn = get_role_arn(account_id)
+    print(f"Role:    {role_arn}")
     print("=" * 70)
 
     if args.cleanup:
         cleanup(session, region, account_id)
         return
 
-    setup_api_gateway(session, region, account_id)
-    setup_codeartifact(session, region, account_id)
-    setup_codebuild(session, region, account_id)
-    setup_dynamodb(session, region, account_id)
-    setup_kinesis(session, region, account_id)
-    setup_eventbridge_schemas(session, region, account_id)
-    setup_mediastore(session, region, account_id)
-    setup_glacier(session, region, account_id)
-    setup_ses(session, region, account_id)
-    setup_vpc_endpoint(session, region, account_id)
-    setup_cloudtrail(session, region, account_id)
-    setup_ssm(session, region, account_id)
-    setup_entity_resolution(session, region, account_id)
-    setup_lex(session, region, account_id)
-    setup_private_ca(session, region, account_id)
-    setup_ssm_incidents(session, region, account_id)
+    # Deploy CloudFormation stack first
+    deploy_cfn_stack(session, region, role_arn)
+
+    # Then deploy non-CFN resources
+    setup_api_gateway(session, region, account_id, role_arn)
+    setup_codeartifact(session, region, account_id, role_arn)
+    setup_codebuild(session, region, account_id, role_arn)
+    setup_dynamodb(session, region, account_id, role_arn)
+    setup_kinesis(session, region, account_id, role_arn)
+    setup_eventbridge_schemas(session, region, account_id, role_arn)
+    setup_glue(session, region, account_id, role_arn)
+    setup_mediastore(session, region, account_id, role_arn)
+    setup_glacier(session, region, account_id, role_arn)
+    setup_ses(session, region, account_id, role_arn)
+    setup_vpc_endpoint(session, region, account_id, role_arn)
+    setup_cloudtrail(session, region, account_id, role_arn)
+    setup_ssm(session, region, account_id, role_arn)
+    setup_entity_resolution(session, region, account_id, role_arn)
+    setup_lex(session, region, account_id, role_arn)
+    setup_private_ca(session, region, account_id, role_arn)
+    setup_ssm_incidents(session, region, account_id, role_arn)
 
     print("\n" + "=" * 70)
-    print("All non-CFN test resources deployed.")
+    print("All test resources deployed.")
     print("Run the scanner to verify:")
-    print(f'  python scan_resource_policies.py --search "{ROLE_ARN}" --regions {region}')
+    print(f'  python scan_resource_policies.py --search "{role_arn}" --regions {region}')
     print("\nTo clean up:")
     print(f"  python deploy_test_policies.py --region {region} --cleanup")
-    print(f"  aws cloudformation delete-stack --stack-name {PREFIX}")
 
 
 if __name__ == "__main__":
