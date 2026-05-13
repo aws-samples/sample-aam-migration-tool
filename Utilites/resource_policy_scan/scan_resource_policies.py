@@ -8,10 +8,10 @@ multi-account (hub-and-spoke role assumption).
 
 Usage:
     # Single account — use current credentials
-    python scan_resource_policies.py --search "string1,string2"
+    python3 scan_resource_policies.py --search "string1,string2"
 
     # Multi-account — assume a role in each target account
-    python scan_resource_policies.py \
+    python3 scan_resource_policies.py \
         --account-ids 111111111111,222222222222 \
         --role-name ReadOnlyRole \
         --search "string1,string2" \
@@ -22,9 +22,17 @@ Usage:
 
 import argparse
 import json
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 from botocore.exceptions import ClientError, BotoCoreError
+
+
+# ─── Constants ───────────────────────────────────────────────────────────────
+
+MAX_WORKERS = 5  # Default concurrency; overridden by --workers CLI arg
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -68,11 +76,17 @@ def policy_text(obj) -> str:
 
 
 def check_policy(policy: str, resource_arn: str, service: str, search_terms: list[str]) -> dict | None:
+    count_resource()
     if not policy:
         return None
     matched = [t for t in search_terms if t in policy]
     if matched:
-        return {"resource_arn": resource_arn, "service": service, "matched_terms": matched}
+        # Try to include the policy as parsed JSON; fall back to raw string
+        try:
+            policy_obj = json.loads(policy)
+        except (json.JSONDecodeError, TypeError):
+            policy_obj = policy
+        return {"resource_arn": resource_arn, "service": service, "matched_terms": matched, "policy": policy_obj}
     return None
 
 
@@ -93,25 +107,97 @@ def paginate(client, method: str, key: str, **kwargs) -> list:
     return items
 
 
+def parallel_check(items, fetch_fn, arn_fn, service, terms):
+    """
+    Fetch policies for a list of resources in parallel and check each one.
+
+    Args:
+        items: List of resources to check.
+        fetch_fn: Callable(item) -> policy string or None.
+        arn_fn: Callable(item) -> resource ARN string.
+        service: Service name for match results.
+        terms: Search terms list.
+
+    Returns:
+        List of match dicts.
+    """
+    matches = []
+
+    def _process(item):
+        pol = fetch_fn(item)
+        return check_policy(policy_text(pol), arn_fn(item), service, terms)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_process, item): item for item in items}
+        for future in as_completed(futures):
+            hit = future.result()
+            if hit:
+                matches.append(hit)
+    return matches
+
+
 def heading(title: str):
-    print(f"=== {title} ===")
+    """Legacy heading — now a no-op; progress is shown by the orchestrator."""
+    pass
+
+
+# ─── Progress tracking ──────────────────────────────────────────────────────
+
+_resource_count = 0
+_progress_state = {"current": 0, "total": 0, "label": "", "matches": 0}
+
+
+def count_resource(n: int = 1):
+    """Increment the global resource counter and refresh the progress line."""
+    global _resource_count
+    _resource_count += n
+    _refresh_progress()
+
+
+def _refresh_progress():
+    """Redraw the progress line with current state."""
+    s = _progress_state
+    if s["total"] == 0:
+        return
+    bar_len = 20
+    filled = int(bar_len * s["current"] / s["total"])
+    bar = "█" * filled + "░" * (bar_len - filled)
+    match_str = f"  ({s['matches']} match{'es' if s['matches'] != 1 else ''})" if s["matches"] else ""
+    line = f"  [{bar}] {s['current']}/{s['total']} {s['label']} | {_resource_count} resources{match_str}"
+    # Pad with spaces to overwrite any leftover characters from the previous line
+    sys.stdout.write(f"\r{line:<79}")
+    sys.stdout.flush()
+
+
+def progress(current: int, total: int, label: str, matches_so_far: int):
+    """Update progress state and redraw."""
+    _progress_state.update(current=current, total=total, label=label, matches=matches_so_far)
+    _refresh_progress()
+
+
+def progress_done(total: int, matches_so_far: int):
+    """Finish the progress line."""
+    bar = "█" * 20
+    match_str = f"  ({matches_so_far} match{'es' if matches_so_far != 1 else ''})" if matches_so_far else "  (no matches)"
+    line = f"  [{bar}] {total}/{total} Done | {_resource_count} resources{match_str}"
+    sys.stdout.write(f"\r{line:<79}\n")
+    sys.stdout.flush()
 
 
 # ─── Global scanners ────────────────────────────────────────────────────────
 
 def scan_s3(session, account_id, terms):
     heading("S3")
-    matches = []
     s3 = session.client("s3")
     resp = safe(s3.list_buckets)
-    for b in (resp or {}).get("Buckets", []):
-        name = b["BucketName"]
-        pol = safe(s3.get_bucket_policy, Bucket=name)
-        if pol:
-            hit = check_policy(policy_text(pol.get("Policy")), f"arn:aws:s3:::{name}", "S3", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    buckets = (resp or {}).get("Buckets", [])
+    return parallel_check(
+        buckets,
+        fetch_fn=lambda b: (safe(s3.get_bucket_policy, Bucket=b["Name"]) or {}).get("Policy"),
+        arn_fn=lambda b: f"arn:aws:s3:::{b['Name']}",
+        service="S3",
+        terms=terms,
+    )
 
 
 def scan_organizations(session, terms):
@@ -131,52 +217,81 @@ def scan_organizations(session, terms):
 
 def scan_iam_trust_policies(session, account_id, terms):
     heading("IAM (role trust policies)")
-    matches = []
-    for role in paginate(session.client("iam"), "list_roles", "Roles"):
-        hit = check_policy(policy_text(role.get("AssumeRolePolicyDocument")),
-                           f"arn:aws:iam::{account_id}:role/{role['RoleName']}", "IAM", terms)
-        if hit:
-            matches.append(hit)
-    return matches
+    roles = paginate(session.client("iam"), "list_roles", "Roles")
+    return parallel_check(
+        roles,
+        fetch_fn=lambda role: role.get("AssumeRolePolicyDocument"),
+        arn_fn=lambda role: f"arn:aws:iam::{account_id}:role/{role['RoleName']}",
+        service="IAM",
+        terms=terms,
+    )
 
 
 def scan_private_ca(session, terms):
     heading("AWS Private CA")
-    matches = []
     pca = session.client("acm-pca")
-    for ca in paginate(pca, "list_certificate_authorities", "CertificateAuthorities"):
-        resp = safe(pca.get_policy, ResourceArn=ca["Arn"])
-        if resp:
-            hit = check_policy(policy_text(resp.get("Policy")), ca["Arn"], "Private CA", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    cas = paginate(pca, "list_certificate_authorities", "CertificateAuthorities")
+    return parallel_check(
+        cas,
+        fetch_fn=lambda ca: (safe(pca.get_policy, ResourceArn=ca["Arn"]) or {}).get("Policy"),
+        arn_fn=lambda ca: ca["Arn"],
+        service="Private CA",
+        terms=terms,
+    )
 
 
 def scan_serverless_repo(session, terms):
     heading("Serverless Application Repository")
-    matches = []
     sar = session.client("serverlessrepo")
-    for app in paginate(sar, "list_applications", "Applications"):
-        resp = safe(sar.get_application_policy, ApplicationId=app["ApplicationId"])
-        if resp:
-            hit = check_policy(policy_text(resp.get("Statements")), app["ApplicationId"], "Serverless Application Repository", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    apps = paginate(sar, "list_applications", "Applications")
+    return parallel_check(
+        apps,
+        fetch_fn=lambda app: (safe(sar.get_application_policy, ApplicationId=app["ApplicationId"]) or {}).get("Statements"),
+        arn_fn=lambda app: app["ApplicationId"],
+        service="Serverless Application Repository",
+        terms=terms,
+    )
+
+
+GLOBAL_SCANNERS = [
+    ("S3", scan_s3),
+    ("Organizations (SCPs + RCPs)", scan_organizations),
+    ("IAM (role trust policies)", scan_iam_trust_policies),
+    ("AWS Private CA", scan_private_ca),
+    ("Serverless Application Repository", scan_serverless_repo),
+]
 
 
 def scan_global_services(session, account_id, terms, management_account):
+    print("\n  Global services:")
     matches = []
-    matches.extend(scan_s3(session, account_id, terms))
-    if management_account:
-        matches.extend(scan_organizations(session, terms))
-    else:
-        heading("Organizations (SCPs + RCPs)")
-        print("  (skipped — not management/delegated admin account)")
-    matches.extend(scan_iam_trust_policies(session, account_id, terms))
-    matches.extend(scan_private_ca(session, terms))
-    matches.extend(scan_serverless_repo(session, terms))
+    scanners = list(GLOBAL_SCANNERS)
+
+    # Replace Organizations with a skip if not management account
+    if not management_account:
+        scanners = [(name, fn) for name, fn in scanners if fn != scan_organizations]
+
+    total = len(scanners)
+    for i, (name, scanner) in enumerate(scanners, 1):
+        progress(i, total, name, len(matches))
+        # Global scanners have varying signatures
+        if scanner == scan_s3:
+            matches.extend(scanner(session, account_id, terms))
+        elif scanner == scan_iam_trust_policies:
+            matches.extend(scanner(session, account_id, terms))
+        elif scanner == scan_organizations:
+            matches.extend(scanner(session, terms))
+        elif scanner == scan_private_ca:
+            matches.extend(scanner(session, terms))
+        elif scanner == scan_serverless_repo:
+            matches.extend(scanner(session, terms))
+        else:
+            matches.extend(scanner(session, account_id, terms))
+    progress_done(total, len(matches))
+
+    if not management_account:
+        print("  (Organizations skipped — not management/delegated admin account)")
+
     return matches
 
 
@@ -184,28 +299,28 @@ def scan_global_services(session, account_id, terms, management_account):
 
 def scan_api_gateway(session, region, account_id, terms):
     heading("API Gateway")
-    matches = []
     apigw = session.client("apigateway", region_name=region)
-    for api in paginate(apigw, "get_rest_apis", "items"):
-        hit = check_policy(policy_text(api.get("policy")),
-                           f"arn:aws:apigateway:{region}::/restapis/{api['id']}", "API Gateway", terms)
-        if hit:
-            matches.append(hit)
-    return matches
+    apis = paginate(apigw, "get_rest_apis", "items")
+    return parallel_check(
+        apis,
+        fetch_fn=lambda api: api.get("policy"),
+        arn_fn=lambda api: f"arn:aws:apigateway:{region}::/restapis/{api['id']}",
+        service="API Gateway",
+        terms=terms,
+    )
 
 
 def scan_backup(session, region, account_id, terms):
     heading("Backup Vaults")
-    matches = []
     bk = session.client("backup", region_name=region)
-    for v in paginate(bk, "list_backup_vaults", "BackupVaultList"):
-        resp = safe(bk.get_backup_vault_access_policy, BackupVaultName=v["BackupVaultName"])
-        if resp:
-            hit = check_policy(policy_text(resp.get("Policy")),
-                               f"arn:aws:backup:{region}:{account_id}:backup-vault:{v['BackupVaultName']}", "Backup", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    vaults = paginate(bk, "list_backup_vaults", "BackupVaultList")
+    return parallel_check(
+        vaults,
+        fetch_fn=lambda v: (safe(bk.get_backup_vault_access_policy, BackupVaultName=v["BackupVaultName"]) or {}).get("Policy"),
+        arn_fn=lambda v: f"arn:aws:backup:{region}:{account_id}:backup-vault:{v['BackupVaultName']}",
+        service="Backup",
+        terms=terms,
+    )
 
 
 def scan_cloudtrail(session, region, account_id, terms):
@@ -266,30 +381,28 @@ def scan_codeartifact(session, region, account_id, terms):
 
 def scan_codebuild(session, region, account_id, terms):
     heading("CodeBuild")
-    matches = []
     cb = session.client("codebuild", region_name=region)
-    for project in paginate(cb, "list_projects", "projects"):
-        arn = f"arn:aws:codebuild:{region}:{account_id}:project/{project}"
-        resp = safe(cb.get_resource_policy, resourceArn=arn)
-        if resp:
-            hit = check_policy(policy_text(resp.get("policy")), arn, "CodeBuild", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    projects = paginate(cb, "list_projects", "projects")
+    return parallel_check(
+        projects,
+        fetch_fn=lambda p: (safe(cb.get_resource_policy, resourceArn=f"arn:aws:codebuild:{region}:{account_id}:project/{p}") or {}).get("policy"),
+        arn_fn=lambda p: f"arn:aws:codebuild:{region}:{account_id}:project/{p}",
+        service="CodeBuild",
+        terms=terms,
+    )
 
 
 def scan_dynamodb(session, region, account_id, terms):
     heading("DynamoDB")
-    matches = []
     ddb = session.client("dynamodb", region_name=region)
-    for table in paginate(ddb, "list_tables", "TableNames"):
-        arn = f"arn:aws:dynamodb:{region}:{account_id}:table/{table}"
-        resp = safe(ddb.get_resource_policy, ResourceArn=arn)
-        if resp:
-            hit = check_policy(policy_text(resp.get("Policy")), arn, "DynamoDB", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    tables = paginate(ddb, "list_tables", "TableNames")
+    return parallel_check(
+        tables,
+        fetch_fn=lambda t: (safe(ddb.get_resource_policy, ResourceArn=f"arn:aws:dynamodb:{region}:{account_id}:table/{t}") or {}).get("Policy"),
+        arn_fn=lambda t: f"arn:aws:dynamodb:{region}:{account_id}:table/{t}",
+        service="DynamoDB",
+        terms=terms,
+    )
 
 
 def scan_entity_resolution(session, region, account_id, terms):
@@ -330,17 +443,15 @@ def scan_eventbridge(session, region, account_id, terms):
 
 def scan_eventbridge_schemas(session, region, account_id, terms):
     heading("EventBridge Schemas")
-    matches = []
     schemas = session.client("schemas", region_name=region)
-    for reg in paginate(schemas, "list_registries", "Registries"):
-        resp = safe(schemas.get_resource_policy, RegistryName=reg["RegistryName"])
-        if resp:
-            hit = check_policy(policy_text(resp.get("Policy")),
-                               f"arn:aws:schemas:{region}:{account_id}:registry/{reg['RegistryName']}",
-                               "EventBridge Schemas", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    registries = paginate(schemas, "list_registries", "Registries")
+    return parallel_check(
+        registries,
+        fetch_fn=lambda reg: (safe(schemas.get_resource_policy, RegistryName=reg["RegistryName"]) or {}).get("Policy"),
+        arn_fn=lambda reg: f"arn:aws:schemas:{region}:{account_id}:registry/{reg['RegistryName']}",
+        service="EventBridge Schemas",
+        terms=terms,
+    )
 
 
 def scan_glue(session, region, account_id, terms):
@@ -362,99 +473,83 @@ def scan_glue(session, region, account_id, terms):
 
 def scan_kms(session, region, account_id, terms):
     heading("KMS")
-    matches = []
     kms = session.client("kms", region_name=region)
-    for k in paginate(kms, "list_keys", "Keys"):
-        resp = safe(kms.get_key_policy, KeyId=k["KeyId"], PolicyName="default")
-        if resp:
-            hit = check_policy(policy_text(resp.get("Policy")),
-                               f"arn:aws:kms:{region}:{account_id}:key/{k['KeyId']}", "KMS", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    keys = paginate(kms, "list_keys", "Keys")
+    return parallel_check(
+        keys,
+        fetch_fn=lambda k: (safe(kms.get_key_policy, KeyId=k["KeyId"], PolicyName="default") or {}).get("Policy"),
+        arn_fn=lambda k: f"arn:aws:kms:{region}:{account_id}:key/{k['KeyId']}",
+        service="KMS",
+        terms=terms,
+    )
 
 
 def scan_kinesis(session, region, account_id, terms):
     heading("Kinesis Data Streams")
-    matches = []
     kinesis = session.client("kinesis", region_name=region)
-    for s in paginate(kinesis, "list_streams", "StreamSummaries"):
-        arn = s["StreamARN"]
-        resp = safe(kinesis.get_resource_policy, ResourceARN=arn)
-        if resp:
-            hit = check_policy(policy_text(resp.get("Policy")), arn, "Kinesis", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    streams = paginate(kinesis, "list_streams", "StreamSummaries")
+    return parallel_check(
+        streams,
+        fetch_fn=lambda s: (safe(kinesis.get_resource_policy, ResourceARN=s["StreamARN"]) or {}).get("Policy"),
+        arn_fn=lambda s: s["StreamARN"],
+        service="Kinesis",
+        terms=terms,
+    )
 
 
 def scan_lambda(session, region, account_id, terms):
     heading("Lambda")
-    matches = []
     lam = session.client("lambda", region_name=region)
-    for fn in paginate(lam, "list_functions", "Functions"):
-        name = fn["FunctionName"]
-        resp = safe(lam.get_policy, FunctionName=name)
-        if resp:
-            hit = check_policy(policy_text(resp.get("Policy")),
-                               f"arn:aws:lambda:{region}:{account_id}:function:{name}", "Lambda", terms)
-            if hit:
-                matches.append(hit)
-    for layer in paginate(lam, "list_layers", "Layers"):
+    functions = paginate(lam, "list_functions", "Functions")
+    matches = parallel_check(
+        functions,
+        fetch_fn=lambda fn: (safe(lam.get_policy, FunctionName=fn["FunctionName"]) or {}).get("Policy"),
+        arn_fn=lambda fn: f"arn:aws:lambda:{region}:{account_id}:function:{fn['FunctionName']}",
+        service="Lambda",
+        terms=terms,
+    )
+    # Also check layer version policies
+    layers = paginate(lam, "list_layers", "Layers")
+    layer_versions = []
+    for layer in layers:
         ln = layer["LayerName"]
         for v in paginate(lam, "list_layer_versions", "LayerVersions", LayerName=ln):
-            resp = safe(lam.get_layer_version_policy, LayerName=ln, VersionNumber=v["Version"])
-            if resp:
-                hit = check_policy(policy_text(resp.get("Policy")),
-                                   f"arn:aws:lambda:{region}:{account_id}:layer:{ln}:{v['Version']}", "Lambda", terms)
-                if hit:
-                    matches.append(hit)
+            layer_versions.append((ln, v["Version"]))
+    matches.extend(parallel_check(
+        layer_versions,
+        fetch_fn=lambda lv: (safe(lam.get_layer_version_policy, LayerName=lv[0], VersionNumber=lv[1]) or {}).get("Policy"),
+        arn_fn=lambda lv: f"arn:aws:lambda:{region}:{account_id}:layer:{lv[0]}:{lv[1]}",
+        service="Lambda",
+        terms=terms,
+    ))
     return matches
 
 
 def scan_lex(session, region, account_id, terms):
     heading("Lex V2")
-    matches = []
     lex = session.client("lexv2-models", region_name=region)
-    for bot in paginate(lex, "list_bots", "botSummaries"):
-        arn = f"arn:aws:lex:{region}:{account_id}:bot/{bot['botId']}"
-        resp = safe(lex.describe_resource_policy, resourceArn=arn)
-        if resp:
-            hit = check_policy(policy_text(resp.get("policy")), arn, "Lex V2", terms)
-            if hit:
-                matches.append(hit)
-    return matches
-
-
-def scan_mediastore(session, region, account_id, terms):
-    heading("MediaStore")
-    matches = []
-    ms = session.client("mediastore", region_name=region)
-    for c in paginate(ms, "list_containers", "Containers"):
-        name = c["ContainerName"]
-        resp = safe(ms.get_container_policy, ContainerName=name)
-        if resp:
-            hit = check_policy(policy_text(resp.get("Policy")),
-                               f"arn:aws:mediastore:{region}:{account_id}:container/{name}", "MediaStore", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    bots = paginate(lex, "list_bots", "botSummaries")
+    return parallel_check(
+        bots,
+        fetch_fn=lambda bot: (safe(lex.describe_resource_policy, resourceArn=f"arn:aws:lex:{region}:{account_id}:bot/{bot['botId']}") or {}).get("policy"),
+        arn_fn=lambda bot: f"arn:aws:lex:{region}:{account_id}:bot/{bot['botId']}",
+        service="Lex V2",
+        terms=terms,
+    )
 
 
 def scan_opensearch(session, region, account_id, terms):
     heading("OpenSearch")
-    matches = []
     os_client = session.client("opensearch", region_name=region)
     resp = safe(os_client.list_domain_names)
-    for d in (resp or {}).get("DomainNames", []):
-        name = d["DomainName"]
-        desc = safe(os_client.describe_domain, DomainName=name)
-        if desc:
-            hit = check_policy(policy_text(desc.get("DomainStatus", {}).get("AccessPolicies")),
-                               f"arn:aws:es:{region}:{account_id}:domain/{name}", "OpenSearch", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    domains = (resp or {}).get("DomainNames", [])
+    return parallel_check(
+        domains,
+        fetch_fn=lambda d: (safe(os_client.describe_domain, DomainName=d["DomainName"]) or {}).get("DomainStatus", {}).get("AccessPolicies"),
+        arn_fn=lambda d: f"arn:aws:es:{region}:{account_id}:domain/{d['DomainName']}",
+        service="OpenSearch",
+        terms=terms,
+    )
 
 
 def scan_opensearch_serverless(session, region, account_id, terms):
@@ -487,33 +582,16 @@ def scan_opensearch_serverless(session, region, account_id, terms):
 
 def scan_s3_express(session, region, account_id, terms):
     heading("S3 Express (Directory Buckets)")
-    matches = []
     s3 = session.client("s3", region_name=region)
     resp = safe(s3.list_directory_buckets)
-    for b in (resp or {}).get("Buckets", []):
-        name = b["BucketName"]
-        pol = safe(s3.get_bucket_policy, Bucket=name)
-        if pol:
-            hit = check_policy(policy_text(pol.get("Policy")),
-                               f"arn:aws:s3express:{region}:{account_id}:bucket/{name}", "S3 Express", terms)
-            if hit:
-                matches.append(hit)
-    return matches
-
-
-def scan_glacier(session, region, account_id, terms):
-    heading("S3 Glacier")
-    matches = []
-    glacier = session.client("glacier", region_name=region)
-    for v in paginate(glacier, "list_vaults", "VaultList", accountId=account_id):
-        name = v["VaultName"]
-        resp = safe(glacier.get_vault_access_policy, accountId=account_id, vaultName=name)
-        if resp:
-            hit = check_policy(policy_text(resp.get("policy", {}).get("Policy")),
-                               f"arn:aws:glacier:{region}:{account_id}:vaults/{name}", "Glacier", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    buckets = (resp or {}).get("Buckets", [])
+    return parallel_check(
+        buckets,
+        fetch_fn=lambda b: (safe(s3.get_bucket_policy, Bucket=b["Name"]) or {}).get("Policy"),
+        arn_fn=lambda b: f"arn:aws:s3express:{region}:{account_id}:bucket/{b['Name']}",
+        service="S3 Express",
+        terms=terms,
+    )
 
 
 def scan_s3_tables(session, region, account_id, terms):
@@ -544,16 +622,15 @@ def scan_s3_tables(session, region, account_id, terms):
 
 def scan_secrets_manager(session, region, account_id, terms):
     heading("Secrets Manager")
-    matches = []
     sm = session.client("secretsmanager", region_name=region)
-    for s in paginate(sm, "list_secrets", "SecretList"):
-        arn = s["ARN"]
-        resp = safe(sm.get_resource_policy, SecretId=arn)
-        if resp:
-            hit = check_policy(policy_text(resp.get("ResourcePolicy")), arn, "Secrets Manager", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    secrets = paginate(sm, "list_secrets", "SecretList")
+    return parallel_check(
+        secrets,
+        fetch_fn=lambda s: (safe(sm.get_resource_policy, SecretId=s["ARN"]) or {}).get("ResourcePolicy"),
+        arn_fn=lambda s: s["ARN"],
+        service="Secrets Manager",
+        terms=terms,
+    )
 
 
 def scan_ses(session, region, account_id, terms):
@@ -577,76 +654,36 @@ def scan_ses(session, region, account_id, terms):
 
 def scan_sns(session, region, account_id, terms):
     heading("SNS")
-    matches = []
     sns = session.client("sns", region_name=region)
-    for t in paginate(sns, "list_topics", "Topics"):
-        arn = t["TopicArn"]
-        resp = safe(sns.get_topic_attributes, TopicArn=arn)
-        if resp:
-            hit = check_policy(policy_text(resp.get("Attributes", {}).get("Policy")), arn, "SNS", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    topics = paginate(sns, "list_topics", "Topics")
+    return parallel_check(
+        topics,
+        fetch_fn=lambda t: (safe(sns.get_topic_attributes, TopicArn=t["TopicArn"]) or {}).get("Attributes", {}).get("Policy"),
+        arn_fn=lambda t: t["TopicArn"],
+        service="SNS",
+        terms=terms,
+    )
 
 
 def scan_sqs(session, region, account_id, terms):
     heading("SQS")
-    matches = []
     sqs = session.client("sqs", region_name=region)
     resp = safe(sqs.list_queues)
-    for url in (resp or {}).get("QueueUrls", []):
+    urls = (resp or {}).get("QueueUrls", [])
+    matches = []
+
+    def _process(url):
         attr = safe(sqs.get_queue_attributes, QueueUrl=url, AttributeNames=["Policy", "QueueArn"])
         if attr:
             queue_arn = attr.get("Attributes", {}).get("QueueArn", url)
-            hit = check_policy(policy_text(attr.get("Attributes", {}).get("Policy")), queue_arn, "SQS", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+            return check_policy(policy_text(attr.get("Attributes", {}).get("Policy")), queue_arn, "SQS", terms)
+        count_resource()
+        return None
 
-
-def scan_ssm(session, region, account_id, terms):
-    heading("Systems Manager")
-    matches = []
-    ssm = session.client("ssm", region_name=region)
-    for doc in paginate(ssm, "list_documents", "DocumentIdentifiers",
-                        Filters=[{"Key": "Owner", "Values": ["Self"]}]):
-        resp = safe(ssm.describe_document_permission, Name=doc["Name"], PermissionType="Share")
-        if resp:
-            hit = check_policy(policy_text(resp), f"ssm-document:{region}:{doc['Name']}", "SSM", terms)
-            if hit:
-                matches.append(hit)
-    arn = f"arn:aws:ssm:{region}:{account_id}:opsitemgroup/default"
-    resp = safe(ssm.get_resource_policies, ResourceArn=arn)
-    for p in (resp or {}).get("Policies", []):
-        hit = check_policy(policy_text(p.get("Policy")), f"ssm-opsitemgroup:{region}:default", "SSM", terms)
-        if hit:
-            matches.append(hit)
-    return matches
-
-
-def scan_ssm_incidents(session, region, account_id, terms):
-    heading("SSM Incident Manager")
-    matches = []
-    inc = session.client("ssm-incidents", region_name=region)
-    for plan in paginate(inc, "list_response_plans", "responsePlanSummaries"):
-        arn = plan["arn"]
-        resp = safe(inc.get_resource_policies, resourceArn=arn)
-        for rp in (resp or {}).get("resourcePolicies", []):
-            hit = check_policy(policy_text(rp.get("policyDocument")), arn, "SSM Incident Manager", terms)
-            if hit:
-                matches.append(hit)
-    return matches
-
-
-def scan_ssm_contacts(session, region, account_id, terms):
-    heading("SSM Incident Manager Contacts")
-    matches = []
-    contacts = session.client("ssm-contacts", region_name=region)
-    for c in paginate(contacts, "list_contacts", "Contacts"):
-        arn = c["ContactArn"]
-        resp = safe(contacts.get_contact_policy, ContactArn=arn)
-        if resp:
-            hit = check_policy(policy_text(resp.get("Policy")), arn, "SSM Contacts", terms)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(_process, url) for url in urls]
+        for future in as_completed(futures):
+            hit = future.result()
             if hit:
                 matches.append(hit)
     return matches
@@ -654,32 +691,28 @@ def scan_ssm_contacts(session, region, account_id, terms):
 
 def scan_ecr(session, region, account_id, terms):
     heading("ECR")
-    matches = []
     ecr = session.client("ecr", region_name=region)
-    for r in paginate(ecr, "describe_repositories", "repositories"):
-        name = r["repositoryName"]
-        resp = safe(ecr.get_repository_policy, repositoryName=name)
-        if resp:
-            hit = check_policy(policy_text(resp.get("policyText")),
-                               f"arn:aws:ecr:{region}:{account_id}:repository/{name}", "ECR", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    repos = paginate(ecr, "describe_repositories", "repositories")
+    return parallel_check(
+        repos,
+        fetch_fn=lambda r: (safe(ecr.get_repository_policy, repositoryName=r["repositoryName"]) or {}).get("policyText"),
+        arn_fn=lambda r: f"arn:aws:ecr:{region}:{account_id}:repository/{r['repositoryName']}",
+        service="ECR",
+        terms=terms,
+    )
 
 
 def scan_efs(session, region, account_id, terms):
     heading("EFS")
-    matches = []
     efs = session.client("efs", region_name=region)
-    for fs in paginate(efs, "describe_file_systems", "FileSystems"):
-        fs_id = fs["FileSystemId"]
-        resp = safe(efs.describe_file_system_policy, FileSystemId=fs_id)
-        if resp:
-            hit = check_policy(policy_text(resp.get("Policy")),
-                               f"arn:aws:elasticfilesystem:{region}:{account_id}:file-system/{fs_id}", "EFS", terms)
-            if hit:
-                matches.append(hit)
-    return matches
+    filesystems = paginate(efs, "describe_file_systems", "FileSystems")
+    return parallel_check(
+        filesystems,
+        fetch_fn=lambda fs: (safe(efs.describe_file_system_policy, FileSystemId=fs["FileSystemId"]) or {}).get("Policy"),
+        arn_fn=lambda fs: f"arn:aws:elasticfilesystem:{region}:{account_id}:file-system/{fs['FileSystemId']}",
+        service="EFS",
+        terms=terms,
+    )
 
 
 def scan_redshift_serverless(session, region, account_id, terms):
@@ -715,39 +748,59 @@ def scan_rekognition(session, region, account_id, terms):
 
 def scan_vpc_endpoints(session, region, account_id, terms):
     heading("VPC Endpoints")
-    matches = []
     ec2 = session.client("ec2", region_name=region)
-    for ep in paginate(ec2, "describe_vpc_endpoints", "VpcEndpoints"):
-        vpce_id = ep["VpcEndpointId"]
-        hit = check_policy(policy_text(ep.get("PolicyDocument")),
-                           f"arn:aws:ec2:{region}:{account_id}:vpc-endpoint/{vpce_id}", "VPC Endpoints", terms)
-        if hit:
-            matches.append(hit)
-    return matches
+    endpoints = paginate(ec2, "describe_vpc_endpoints", "VpcEndpoints")
+    return parallel_check(
+        endpoints,
+        fetch_fn=lambda ep: ep.get("PolicyDocument"),
+        arn_fn=lambda ep: f"arn:aws:ec2:{region}:{account_id}:vpc-endpoint/{ep['VpcEndpointId']}",
+        service="VPC Endpoints",
+        terms=terms,
+    )
 
 
 # ─── Regional orchestrator ──────────────────────────────────────────────────
 
 REGIONAL_SCANNERS = [
-    scan_api_gateway, scan_backup, scan_cloudtrail, scan_cloudwatch_logs,
-    scan_codeartifact, scan_codebuild, scan_dynamodb, scan_entity_resolution,
-    scan_eventbridge, scan_eventbridge_schemas, scan_glue, scan_kms,
-    scan_kinesis, scan_lambda, scan_lex, scan_mediastore, scan_opensearch,
-    scan_opensearch_serverless,
-    scan_s3_express, scan_glacier, scan_s3_tables, scan_secrets_manager,
-    scan_ses, scan_sns, scan_sqs, scan_ssm, scan_ssm_incidents,
-    scan_ssm_contacts, scan_ecr, scan_efs, scan_redshift_serverless,
-    scan_rekognition, scan_vpc_endpoints,
+    ("API Gateway", scan_api_gateway),
+    ("Backup Vaults", scan_backup),
+    ("CloudTrail", scan_cloudtrail),
+    ("CloudWatch Logs", scan_cloudwatch_logs),
+    ("CodeArtifact", scan_codeartifact),
+    ("CodeBuild", scan_codebuild),
+    ("DynamoDB", scan_dynamodb),
+    ("Entity Resolution", scan_entity_resolution),
+    ("EventBridge", scan_eventbridge),
+    ("EventBridge Schemas", scan_eventbridge_schemas),
+    ("Glue", scan_glue),
+    ("KMS", scan_kms),
+    ("Kinesis", scan_kinesis),
+    ("Lambda", scan_lambda),
+    ("Lex V2", scan_lex),
+    ("OpenSearch", scan_opensearch),
+    ("OpenSearch Serverless", scan_opensearch_serverless),
+    ("S3 Express", scan_s3_express),
+    ("S3 Tables", scan_s3_tables),
+    ("Secrets Manager", scan_secrets_manager),
+    ("SES v2", scan_ses),
+    ("SNS", scan_sns),
+    ("SQS", scan_sqs),
+    ("ECR", scan_ecr),
+    ("EFS", scan_efs),
+    ("Redshift Serverless", scan_redshift_serverless),
+    ("Rekognition", scan_rekognition),
+    ("VPC Endpoints", scan_vpc_endpoints),
 ]
 
 
 def scan_regional_services(session, region, account_id, terms):
-    print(f"\n{'#' * 70}")
-    print(f"# Region: {region}")
-    print(f"{'#' * 70}")
+    print(f"\n  Region: {region}")
     matches = []
-    for scanner in REGIONAL_SCANNERS:
+    total = len(REGIONAL_SCANNERS)
+    for i, (name, scanner) in enumerate(REGIONAL_SCANNERS, 1):
+        progress(i, total, name, len(matches))
         matches.extend(scanner(session, region, account_id, terms))
+    progress_done(total, len(matches))
     return matches
 
 
@@ -783,6 +836,8 @@ def main():
     parser.add_argument("--management-account", action="store_true", help="Also scan Organization SCPs and RCPs")
     parser.add_argument("--regions", default=None, help="Comma-separated regions (default: all enabled)")
     parser.add_argument("--output", default="scan_results.json", help="Output file path (default: scan_results.json)")
+    parser.add_argument("--workers", type=int, default=5,
+                        help="Max parallel threads per service for policy fetches (default: 5)")
     args = parser.parse_args()
 
     # Validate: if one of account-ids / role-name is set, both must be
@@ -793,6 +848,10 @@ def main():
     print(f"Search strings: {terms}")
     print("=" * 70)
 
+    global MAX_WORKERS
+    MAX_WORKERS = args.workers
+
+    start_time = time.time()
     all_matches = []
     all_regions = set()
 
@@ -813,8 +872,12 @@ def main():
         all_regions.update(regions)
 
     # Summary
+    elapsed = time.time() - start_time
+    minutes, seconds = divmod(int(elapsed), 60)
+    time_str = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+
     print("\n" + "=" * 70)
-    print(f"Scan complete. {len(all_matches)} resource(s) matched.")
+    print(f"Scan complete. {len(all_matches)} resource(s) matched in {time_str}.")
     print("=" * 70)
 
     output = {

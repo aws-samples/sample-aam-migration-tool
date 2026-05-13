@@ -7,19 +7,22 @@ test resources with resource policies for services that don't support policies
 via CloudFormation.
 
 Usage:
-    python deploy_test_policies.py [--region us-east-1] [--cleanup]
+    python3 deploy_test_policies.py [--region us-east-1] [--cleanup]
 """
 
 import argparse
 import json
 import os
+import random
+import string
 import time
 
 import boto3
 from botocore.exceptions import ClientError
 
-ROLE_SUFFIX = "aws-reserved/sso.amazonaws.com/us-east-1/AWSReservedSSO_AdministratorAccess_abc123def456"
+ROLE_SUFFIX = "aws-reserved/sso.amazonaws.com/us-west-2/AWSReservedSSO_AWSAdministratorAccess_6516ec63d4add68b"
 PREFIX = "policy-scan-test"
+ORG_ID = "o-dhuoj1jzwj"
 
 
 def get_account_id(session):
@@ -31,6 +34,7 @@ def get_role_arn(account_id):
 
 
 def policy_doc(role_arn, action, resource="*"):
+    """Policy with wildcard principal + condition. Works for most services."""
     return json.dumps({
         "Version": "2012-10-17",
         "Statement": [{
@@ -44,6 +48,20 @@ def policy_doc(role_arn, action, resource="*"):
                     "aws:PrincipalArn": role_arn,
                 }
             },
+        }]
+    })
+
+
+def policy_doc_direct(role_arn, action, resource="*"):
+    """Policy with direct principal ARN. For services that reject wildcard principals."""
+    return json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AllowIdentityCenterRole",
+            "Effect": "Allow",
+            "Principal": {"AWS": role_arn},
+            "Action": action,
+            "Resource": resource,
         }]
     })
 
@@ -167,33 +185,40 @@ def setup_codeartifact(session, region, account_id, role_arn):
 
 
 def setup_codebuild(session, region, account_id, role_arn):
-    """Create a CodeBuild project with a resource policy."""
+    """Create a CodeBuild report group with a resource policy."""
     print("=== CodeBuild ===")
     cb = session.client("codebuild", region_name=region)
-    project_arn = f"arn:aws:codebuild:{region}:{account_id}:project/{PREFIX}"
-    # Create a minimal project first
     try:
-        cb.create_project(
+        resp = cb.create_report_group(
             name=PREFIX,
-            source={"type": "NO_SOURCE", "buildspec": "version: 0.2\nphases:\n  build:\n    commands:\n      - echo test"},
-            artifacts={"type": "NO_ARTIFACTS"},
-            environment={
-                "type": "LINUX_CONTAINER",
-                "image": "aws/codebuild/standard:7.0",
-                "computeType": "BUILD_GENERAL1_SMALL",
-            },
-            serviceRole=f"arn:aws:iam::{account_id}:role/policy-scan-test-lambda-role",
+            type="TEST",
+            exportConfig={"exportConfigType": "NO_EXPORT"},
         )
-        print(f"  Created project: {PREFIX}")
+        rg_arn = resp["reportGroup"]["arn"]
+        print(f"  Created report group: {rg_arn}")
     except ClientError as e:
-        print(f"  Project exists or error: {e}")
-    # CodeBuild resource policies only apply to report groups and shared projects
+        print(f"  Report group exists or error: {e}")
+        rg_arn = f"arn:aws:codebuild:{region}:{account_id}:report-group/{PREFIX}"
     try:
+        codebuild_policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "AllowIdentityCenterRole",
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Action": "codebuild:BatchGetReportGroups",
+                "Resource": rg_arn,
+                "Condition": {
+                    "StringEquals": {"aws:PrincipalOrgID": ORG_ID},
+                    "ArnEquals": {"aws:PrincipalArn": role_arn},
+                },
+            }]
+        })
         cb.put_resource_policy(
-            resourceArn=project_arn,
-            policy=policy_doc(role_arn, "codebuild:BatchGetProjects", project_arn),
+            resourceArn=rg_arn,
+            policy=codebuild_policy,
         )
-        print("  Attached project policy")
+        print("  Attached report group policy")
     except ClientError as e:
         print(f"  Skipped policy: {e}")
 
@@ -241,7 +266,7 @@ def setup_kinesis(session, region, account_id, role_arn):
         stream_arn = desc["StreamDescriptionSummary"]["StreamARN"]
         kinesis.put_resource_policy(
             ResourceARN=stream_arn,
-            Policy=policy_doc(role_arn, "kinesis:DescribeStream", stream_arn),
+            Policy=policy_doc_direct(role_arn, "kinesis:DescribeStream", stream_arn),
         )
         print("  Attached stream policy")
     except ClientError as e:
@@ -276,6 +301,7 @@ def setup_glue(session, region, account_id, role_arn):
         glue.put_resource_policy(
             PolicyInJson=policy_doc(role_arn, "glue:GetDatabase",
                                     f"arn:aws:glue:{region}:{account_id}:catalog"),
+            EnableHybrid="TRUE",
         )
         print("  Attached Glue catalog resource policy")
     except ClientError as e:
@@ -283,50 +309,15 @@ def setup_glue(session, region, account_id, role_arn):
 
 
 def setup_mediastore(session, region, account_id, role_arn):
-    """Create a MediaStore container with a resource policy."""
+    """MediaStore is discontinued — skip."""
     print("=== MediaStore ===")
-    ms = session.client("mediastore", region_name=region)
-    try:
-        ms.create_container(ContainerName=PREFIX)
-        print(f"  Created container: {PREFIX}")
-        # Wait for container to become active
-        for _ in range(30):
-            resp = ms.describe_container(ContainerName=PREFIX)
-            if resp["Container"]["Status"] == "ACTIVE":
-                break
-            wait(5)
-    except ClientError as e:
-        print(f"  Container exists or error: {e}")
-    try:
-        ms.put_container_policy(
-            ContainerName=PREFIX,
-            Policy=policy_doc(role_arn, "mediastore:DescribeContainer",
-                              f"arn:aws:mediastore:{region}:{account_id}:container/{PREFIX}"),
-        )
-        print("  Attached container policy")
-    except ClientError as e:
-        print(f"  Skipped policy: {e}")
+    print("  Skipped: MediaStore is discontinued")
 
 
 def setup_glacier(session, region, account_id, role_arn):
-    """Create a Glacier vault with an access policy."""
+    """Glacier is discontinued for new accounts — skip."""
     print("=== Glacier ===")
-    glacier = session.client("glacier", region_name=region)
-    try:
-        glacier.create_vault(accountId=account_id, vaultName=PREFIX)
-        print(f"  Created vault: {PREFIX}")
-    except ClientError as e:
-        print(f"  Vault exists or error: {e}")
-    try:
-        glacier.set_vault_access_policy(
-            accountId=account_id,
-            vaultName=PREFIX,
-            policy={"Policy": policy_doc(role_arn, "glacier:DescribeVault",
-                                         f"arn:aws:glacier:{region}:{account_id}:vaults/{PREFIX}")},
-        )
-        print("  Attached vault access policy")
-    except ClientError as e:
-        print(f"  Skipped policy: {e}")
+    print("  Skipped: Glacier is discontinued for new accounts")
 
 
 def setup_ses(session, region, account_id, role_arn):
@@ -344,7 +335,7 @@ def setup_ses(session, region, account_id, role_arn):
         ses.put_identity_policy(
             Identity=identity,
             PolicyName="test-policy",
-            Policy=policy_doc(role_arn, "ses:GetIdentityVerificationAttributes",
+            Policy=policy_doc(role_arn, "ses:SendEmail",
                               f"arn:aws:ses:{region}:{account_id}:identity/{identity}"),
         )
         print("  Attached identity policy")
@@ -356,10 +347,10 @@ def setup_vpc_endpoint(session, region, account_id, role_arn):
     """Create a VPC endpoint with a resource policy."""
     print("=== VPC Endpoints ===")
     ec2 = session.client("ec2", region_name=region)
-    # Find default VPC
-    vpcs = ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
+    # Use any available VPC
+    vpcs = ec2.describe_vpcs()
     if not vpcs["Vpcs"]:
-        print("  Skipped: no default VPC found")
+        print("  Skipped: no VPC found")
         return None
     vpc_id = vpcs["Vpcs"][0]["VpcId"]
     try:
@@ -381,26 +372,37 @@ def setup_cloudtrail(session, region, account_id, role_arn):
     """Create a CloudTrail event data store with a resource policy."""
     print("=== CloudTrail ===")
     ct = session.client("cloudtrail", region_name=region)
+    eds_arn = None
+    # Check for an existing EDS we can reuse (including pending deletion)
     try:
-        resp = ct.create_event_data_store(
-            Name=PREFIX,
-            RetentionPeriod=7,
-            MultiRegionEnabled=False,
-        )
-        eds_arn = resp["EventDataStoreArn"]
-        print(f"  Created event data store: {eds_arn}")
-    except ClientError as e:
-        print(f"  EDS exists or error: {e}")
-        # Try to find existing one
+        stores = ct.list_event_data_stores()
+        for s in stores.get("EventDataStores", []):
+            if PREFIX in s.get("Name", ""):
+                status = s.get("Status")
+                eds_arn = s["EventDataStoreArn"]
+                if status == "PENDING_DELETION":
+                    ct.restore_event_data_store(EventDataStore=eds_arn)
+                    print(f"  Restored EDS from pending deletion: {eds_arn}")
+                elif status == "ENABLED":
+                    print(f"  Reusing existing EDS: {eds_arn}")
+                break
+    except ClientError:
+        pass
+    # Create a new one if none found
+    if not eds_arn:
+        suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+        eds_name = f"{PREFIX}-{suffix}"
         try:
-            stores = ct.list_event_data_stores()
-            for s in stores.get("EventDataStores", []):
-                if PREFIX in s.get("Name", ""):
-                    eds_arn = s["EventDataStoreArn"]
-                    break
-            else:
-                return
-        except ClientError:
+            resp = ct.create_event_data_store(
+                Name=eds_name,
+                RetentionPeriod=7,
+                MultiRegionEnabled=False,
+                TerminationProtectionEnabled=False,
+            )
+            eds_arn = resp["EventDataStoreArn"]
+            print(f"  Created event data store: {eds_arn}")
+        except ClientError as e:
+            print(f"  EDS creation error: {e}")
             return
     try:
         ct.put_resource_policy(
@@ -413,65 +415,22 @@ def setup_cloudtrail(session, region, account_id, role_arn):
 
 
 def setup_ssm(session, region, account_id, role_arn):
-    """Create an SSM document and share it (resource policy equivalent)."""
+    """SSM resource policies only support account-level principals for OpsItems — skip."""
     print("=== Systems Manager ===")
-    ssm = session.client("ssm", region_name=region)
-    doc_name = f"{PREFIX}-doc"
-    try:
-        ssm.create_document(
-            Name=doc_name,
-            Content=json.dumps({
-                "schemaVersion": "2.2",
-                "description": "Policy scan test document",
-                "mainSteps": [{"action": "aws:runShellScript", "name": "test",
-                               "inputs": {"runCommand": ["echo test"]}}]
-            }),
-            DocumentType="Command",
-            DocumentFormat="JSON",
-        )
-        print(f"  Created document: {doc_name}")
-    except ClientError as e:
-        print(f"  Document exists or error: {e}")
-    # SSM OpsItemGroup resource policy
-    arn = f"arn:aws:ssm:{region}:{account_id}:opsitemgroup/default"
-    try:
-        ssm.put_resource_policy(
-            ResourceArn=arn,
-            Policy=policy_doc(role_arn, "ssm:GetOpsItem", arn),
-        )
-        print("  Attached OpsItemGroup resource policy")
-    except ClientError as e:
-        print(f"  Skipped OpsItemGroup policy: {e}")
+    print("  Skipped: resource policies only support account-level principals for OpsItems")
 
 
 def setup_entity_resolution(session, region, account_id, role_arn):
-    """Create an Entity Resolution schema mapping with a resource policy."""
+    """Attach a resource policy to the pre-existing Entity Resolution ID namespace."""
     print("=== Entity Resolution ===")
     er = session.client("entityresolution", region_name=region)
-    schema_name = PREFIX.replace("-", "")  # no hyphens allowed
-    try:
-        resp = er.create_schema_mapping(
-            schemaName=schema_name,
-            mappedInputFields=[{
-                "fieldName": "id",
-                "type": "UNIQUE_ID",
-            }],
-        )
-        schema_arn = resp["schemaArn"]
-        print(f"  Created schema mapping: {schema_arn}")
-    except ClientError as e:
-        print(f"  Schema exists or error: {e}")
-        try:
-            resp = er.get_schema_mapping(schemaName=schema_name)
-            schema_arn = resp["schemaArn"]
-        except ClientError:
-            return
+    ns_arn = "arn:aws:entityresolution:us-west-2:183068582925:idnamespace/test"
     try:
         er.put_policy(
-            arn=schema_arn,
-            policy=policy_doc(role_arn, "entityresolution:GetSchemaMapping", schema_arn),
+            arn=ns_arn,
+            policy=policy_doc(role_arn, "entityresolution:GetIdNamespace", ns_arn),
         )
-        print("  Attached schema policy")
+        print("  Attached ID namespace policy")
     except ClientError as e:
         print(f"  Skipped policy: {e}")
 
@@ -526,25 +485,58 @@ def setup_private_ca(session, region, account_id, role_arn):
     """Create a Private CA with a resource policy."""
     print("=== Private CA ===")
     pca = session.client("acm-pca", region_name=region)
+    ca_arn = None
+    # Check for existing CA we can reuse
     try:
-        resp = pca.create_certificate_authority(
-            CertificateAuthorityConfiguration={
-                "KeyAlgorithm": "RSA_2048",
-                "SigningAlgorithm": "SHA256WITHRSA",
-                "Subject": {"CommonName": f"{PREFIX}.example.com"},
-            },
-            CertificateAuthorityType="ROOT",
-        )
-        ca_arn = resp["CertificateAuthorityArn"]
-        print(f"  Created CA: {ca_arn}")
-    except ClientError as e:
-        print(f"  CA error: {e}")
-        return
-    wait(5)
+        cas = pca.list_certificate_authorities()
+        for ca in cas.get("CertificateAuthorities", []):
+            subj = ca.get("CertificateAuthorityConfiguration", {}).get("Subject", {})
+            if PREFIX in subj.get("CommonName", ""):
+                status = ca.get("Status", "")
+                ca_arn = ca["Arn"]
+                if status == "DELETED":
+                    pca.restore_certificate_authority(CertificateAuthorityArn=ca_arn)
+                    print(f"  Restored CA from deleted state: {ca_arn}")
+                    wait(5)
+                elif status in ("ACTIVE", "CREATING", "PENDING_CERTIFICATE"):
+                    print(f"  Reusing existing CA: {ca_arn}")
+                break
+    except ClientError:
+        pass
+    if not ca_arn:
+        try:
+            resp = pca.create_certificate_authority(
+                CertificateAuthorityConfiguration={
+                    "KeyAlgorithm": "RSA_2048",
+                    "SigningAlgorithm": "SHA256WITHRSA",
+                    "Subject": {"CommonName": f"{PREFIX}.example.com"},
+                },
+                CertificateAuthorityType="ROOT",
+            )
+            ca_arn = resp["CertificateAuthorityArn"]
+            print(f"  Created CA: {ca_arn}")
+            wait(5)
+        except ClientError as e:
+            print(f"  CA error: {e}")
+            return
     try:
+        pca_policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "AllowIdentityCenterRole",
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Action": "acm-pca:DescribeCertificateAuthority",
+                "Resource": ca_arn,
+                "Condition": {
+                    "StringEquals": {"aws:PrincipalOrgID": ORG_ID},
+                    "ArnEquals": {"aws:PrincipalArn": role_arn},
+                },
+            }]
+        })
         pca.put_policy(
             ResourceArn=ca_arn,
-            Policy=policy_doc(role_arn, "acm-pca:DescribeCertificateAuthority", ca_arn),
+            Policy=pca_policy,
         )
         print("  Attached CA policy")
     except ClientError as e:
@@ -552,44 +544,14 @@ def setup_private_ca(session, region, account_id, role_arn):
 
 
 def setup_ssm_incidents(session, region, account_id, role_arn):
-    """Create an SSM Incident Manager response plan with a resource policy."""
+    """SSM Incident Manager is being deprecated — skip."""
     print("=== SSM Incident Manager ===")
-    inc = session.client("ssm-incidents", region_name=region)
-    try:
-        resp = inc.create_response_plan(
-            name=PREFIX,
-            incidentTemplate={
-                "title": "Policy scan test incident",
-                "impact": 5,
-            },
-        )
-        rp_arn = resp["arn"]
-        print(f"  Created response plan: {rp_arn}")
-    except ClientError as e:
-        print(f"  Response plan exists or error: {e}")
-        try:
-            plans = inc.list_response_plans()
-            for p in plans.get("responsePlanSummaries", []):
-                if PREFIX in p["arn"]:
-                    rp_arn = p["arn"]
-                    break
-            else:
-                return
-        except ClientError:
-            return
-    try:
-        inc.put_resource_policy(
-            resourceArn=rp_arn,
-            policy=policy_doc(role_arn, "ssm-incidents:GetResponsePlan", rp_arn),
-        )
-        print("  Attached response plan policy")
-    except ClientError as e:
-        print(f"  Skipped policy: {e}")
+    print("  Skipped: service is being deprecated")
 
 
 # ─── Cleanup ─────────────────────────────────────────────────────────────────
 
-def cleanup(session, region, account_id):
+def cleanup(session, region, account_id, skip_cfn=False):
     """Delete all test resources created by this script."""
     print("\n=== Cleaning up non-CFN resources ===\n")
 
@@ -614,8 +576,8 @@ def cleanup(session, region, account_id):
     # CodeBuild
     try:
         cb = session.client("codebuild", region_name=region)
-        cb.delete_project(name=PREFIX)
-        print(f"  Deleted CodeBuild project: {PREFIX}")
+        cb.delete_report_group(arn=f"arn:aws:codebuild:{region}:{account_id}:report-group/{PREFIX}", deleteReports=True)
+        print(f"  Deleted CodeBuild report group: {PREFIX}")
     except ClientError as e:
         print(f"  CodeBuild cleanup: {e}")
 
@@ -651,21 +613,9 @@ def cleanup(session, region, account_id):
     except ClientError as e:
         print(f"  Glue cleanup: {e}")
 
-    # MediaStore
-    try:
-        ms = session.client("mediastore", region_name=region)
-        ms.delete_container(ContainerName=PREFIX)
-        print(f"  Deleted MediaStore container: {PREFIX}")
-    except ClientError as e:
-        print(f"  MediaStore cleanup: {e}")
+    # MediaStore — discontinued, nothing to clean up
 
-    # Glacier
-    try:
-        glacier = session.client("glacier", region_name=region)
-        glacier.delete_vault(accountId=account_id, vaultName=PREFIX)
-        print(f"  Deleted Glacier vault: {PREFIX}")
-    except ClientError as e:
-        print(f"  Glacier cleanup: {e}")
+    # Glacier — discontinued, nothing to clean up
 
     # SES
     try:
@@ -675,15 +625,17 @@ def cleanup(session, region, account_id):
     except ClientError as e:
         print(f"  SES cleanup: {e}")
 
-    # VPC Endpoints
+    # VPC Endpoints (find by S3 gateway type with our policy)
     try:
         ec2 = session.client("ec2", region_name=region)
-        eps = ec2.describe_vpc_endpoints(Filters=[{"Name": "tag:Name", "Values": [PREFIX]}])
-        # Also find by checking all gateway endpoints
-        all_eps = ec2.describe_vpc_endpoints()
+        all_eps = ec2.describe_vpc_endpoints(
+            Filters=[{"Name": "service-name", "Values": [f"com.amazonaws.{region}.s3"]}]
+        )
         for ep in all_eps.get("VpcEndpoints", []):
-            # Delete ones we likely created (recent, gateway type to S3)
-            pass
+            pol = json.dumps(ep.get("PolicyDocument", {}))
+            if ROLE_SUFFIX in pol:
+                ec2.delete_vpc_endpoints(VpcEndpointIds=[ep["VpcEndpointId"]])
+                print(f"  Deleted VPC endpoint: {ep['VpcEndpointId']}")
     except ClientError as e:
         print(f"  VPC Endpoint cleanup: {e}")
 
@@ -692,27 +644,19 @@ def cleanup(session, region, account_id):
         ct = session.client("cloudtrail", region_name=region)
         stores = ct.list_event_data_stores()
         for s in stores.get("EventDataStores", []):
-            if PREFIX in s.get("Name", ""):
+            if PREFIX in s.get("Name", "") and s.get("Status") == "ENABLED":
+                ct.update_event_data_store(
+                    EventDataStore=s["EventDataStoreArn"],
+                    TerminationProtectionEnabled=False,
+                )
                 ct.delete_event_data_store(EventDataStore=s["EventDataStoreArn"])
                 print(f"  Deleted CloudTrail EDS: {s['EventDataStoreArn']}")
     except ClientError as e:
         print(f"  CloudTrail cleanup: {e}")
 
-    # SSM
-    try:
-        ssm = session.client("ssm", region_name=region)
-        ssm.delete_document(Name=f"{PREFIX}-doc")
-        print(f"  Deleted SSM document: {PREFIX}-doc")
-    except ClientError as e:
-        print(f"  SSM cleanup: {e}")
+    # SSM — skipped, no resources to clean up
 
-    # Entity Resolution
-    try:
-        er = session.client("entityresolution", region_name=region)
-        er.delete_schema_mapping(schemaName=PREFIX.replace("-", ""))
-        print(f"  Deleted Entity Resolution schema: {PREFIX.replace('-', '')}")
-    except ClientError as e:
-        print(f"  Entity Resolution cleanup: {e}")
+    # Entity Resolution — using pre-existing ID namespace, don't delete it
 
     # Lex V2
     try:
@@ -730,16 +674,16 @@ def cleanup(session, region, account_id):
         cas = pca.list_certificate_authorities()
         for ca in cas.get("CertificateAuthorities", []):
             subj = ca.get("CertificateAuthorityConfiguration", {}).get("Subject", {})
+            status = ca.get("Status", "")
             if PREFIX in subj.get("CommonName", ""):
-                pca.update_certificate_authority(
-                    CertificateAuthorityArn=ca["Arn"],
-                    Status="DISABLED",
-                )
-                pca.delete_certificate_authority(
-                    CertificateAuthorityArn=ca["Arn"],
-                    PermanentDeletionTimeInDays=7,
-                )
-                print(f"  Deleted Private CA: {ca['Arn']}")
+                if status in ("ACTIVE", "DISABLED"):
+                    pca.delete_certificate_authority(
+                        CertificateAuthorityArn=ca["Arn"],
+                        PermanentDeletionTimeInDays=7,
+                    )
+                    print(f"  Deleted Private CA: {ca['Arn']}")
+                else:
+                    print(f"  Skipped Private CA (status={status}): {ca['Arn']}")
     except ClientError as e:
         print(f"  Private CA cleanup: {e}")
 
@@ -755,7 +699,8 @@ def cleanup(session, region, account_id):
         print(f"  SSM Incidents cleanup: {e}")
 
     # CloudFormation stack (last — some SDK resources depend on CFN resources)
-    delete_cfn_stack(session, region)
+    if not skip_cfn:
+        delete_cfn_stack(session, region)
 
     print("\nCleanup complete.")
 
@@ -766,6 +711,7 @@ def main():
     parser = argparse.ArgumentParser(description="Deploy test resource policies for non-CFN services.")
     parser.add_argument("--region", default="us-east-1", help="AWS region (default: us-east-1)")
     parser.add_argument("--cleanup", action="store_true", help="Delete all test resources instead of creating them")
+    parser.add_argument("--skip-cfn", action="store_true", help="Skip CloudFormation stack deployment, only deploy SDK resources")
     args = parser.parse_args()
 
     session = boto3.Session()
@@ -779,11 +725,14 @@ def main():
     print("=" * 70)
 
     if args.cleanup:
-        cleanup(session, region, account_id)
+        cleanup(session, region, account_id, skip_cfn=args.skip_cfn)
         return
 
-    # Deploy CloudFormation stack first
-    deploy_cfn_stack(session, region, role_arn)
+    # Deploy CloudFormation stack first (unless skipped)
+    if not args.skip_cfn:
+        deploy_cfn_stack(session, region, role_arn)
+    else:
+        print("Skipping CloudFormation stack deployment")
 
     # Then deploy non-CFN resources
     setup_api_gateway(session, region, account_id, role_arn)
@@ -807,9 +756,9 @@ def main():
     print("\n" + "=" * 70)
     print("All test resources deployed.")
     print("Run the scanner to verify:")
-    print(f'  python scan_resource_policies.py --search "{role_arn}" --regions {region}')
+    print(f'  python3 scan_resource_policies.py --search "{role_arn}" --regions {region}')
     print("\nTo clean up:")
-    print(f"  python deploy_test_policies.py --region {region} --cleanup")
+    print(f"  python3 deploy_test_policies.py --region {region} --cleanup")
 
 
 if __name__ == "__main__":
