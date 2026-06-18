@@ -11,13 +11,31 @@ Usage:
     python3 scan_resource_policies.py --search "string1,string2"
 
     # Multi-account — assume a role in each target account
-    python3 scan_resource_policies.py \
-        --account-ids 111111111111,222222222222 \
-        --role-name ReadOnlyRole \
-        --search "string1,string2" \
-        [--management-account] \
-        [--regions us-east-1,us-west-2] \
+    python3 scan_resource_policies.py \\
+        --account-ids 111111111111,222222222222 \\
+        --role-name ReadOnlyRole \\
+        --search "string1,string2" \\
+        [--management-account] \\
+        [--regions us-east-1,us-west-2] \\
+        [--services "S3,Lambda,KMS"] \\
+        [--exclude-services "Rekognition,Lex V2"] \\
+        [--workers 10] \\
         [--output scan_results.json]
+
+    # List available service names for --services / --exclude-services
+    python3 scan_resource_policies.py --list-services
+
+Options:
+    --search              Comma-separated list of strings to search for (required)
+    --account-ids         Comma-separated AWS account IDs to scan (requires --role-name)
+    --role-name           Role name to assume in each target account
+    --management-account  Also scan Organization SCPs and RCPs
+    --regions             Comma-separated regions (default: all enabled)
+    --services            Comma-separated services to scan (default: all)
+    --exclude-services    Comma-separated services to skip
+    --list-services       Print available service names and exit
+    --workers             Max parallel threads per service (default: 5)
+    --output              Output file path (default: scan_results.json)
 """
 
 import argparse
@@ -262,7 +280,17 @@ GLOBAL_SCANNERS = [
 ]
 
 
-def scan_global_services(session, account_id, terms, management_account):
+def _filter_scanners(scanners, service_filter, exclude_filter):
+    """Filter a list of (name, fn) tuples based on include/exclude sets."""
+    if service_filter:
+        scanners = [(name, fn) for name, fn in scanners if name.lower() in service_filter]
+    if exclude_filter:
+        scanners = [(name, fn) for name, fn in scanners if name.lower() not in exclude_filter]
+    return scanners
+
+
+def scan_global_services(session, account_id, terms, management_account,
+                         service_filter=None, exclude_filter=None):
     print("\n  Global services:")
     matches = []
     scanners = list(GLOBAL_SCANNERS)
@@ -270,6 +298,8 @@ def scan_global_services(session, account_id, terms, management_account):
     # Replace Organizations with a skip if not management account
     if not management_account:
         scanners = [(name, fn) for name, fn in scanners if fn != scan_organizations]
+
+    scanners = _filter_scanners(scanners, service_filter, exclude_filter)
 
     total = len(scanners)
     for i, (name, scanner) in enumerate(scanners, 1):
@@ -793,11 +823,13 @@ REGIONAL_SCANNERS = [
 ]
 
 
-def scan_regional_services(session, region, account_id, terms):
+def scan_regional_services(session, region, account_id, terms,
+                           service_filter=None, exclude_filter=None):
     print(f"\n  Region: {region}")
+    scanners = _filter_scanners(REGIONAL_SCANNERS, service_filter, exclude_filter)
     matches = []
-    total = len(REGIONAL_SCANNERS)
-    for i, (name, scanner) in enumerate(REGIONAL_SCANNERS, 1):
+    total = len(scanners)
+    for i, (name, scanner) in enumerate(scanners, 1):
         progress(i, total, name, len(matches))
         matches.extend(scanner(session, region, account_id, terms))
     progress_done(total, len(matches))
@@ -806,15 +838,18 @@ def scan_regional_services(session, region, account_id, terms):
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
-def scan_account(session, account_id, terms, regions_arg, management_account):
+def scan_account(session, account_id, terms, regions_arg, management_account,
+                 service_filter=None, exclude_filter=None):
     """Run all scanners for a single account. Returns list of match dicts."""
     regions = get_regions(session, regions_arg)
     print(f"\n  Scanning regions: {', '.join(regions)}")
 
     matches = []
-    matches.extend(scan_global_services(session, account_id, terms, management_account))
+    matches.extend(scan_global_services(session, account_id, terms, management_account,
+                                        service_filter, exclude_filter))
     for region in regions:
-        matches.extend(scan_regional_services(session, region, account_id, terms))
+        matches.extend(scan_regional_services(session, region, account_id, terms,
+                                              service_filter, exclude_filter))
 
     # Tag each match with the account ID
     for m in matches:
@@ -838,7 +873,22 @@ def main():
     parser.add_argument("--output", default="scan_results.json", help="Output file path (default: scan_results.json)")
     parser.add_argument("--workers", type=int, default=5,
                         help="Max parallel threads per service for policy fetches (default: 5)")
+    parser.add_argument("--services", default=None,
+                        help="Comma-separated list of services to scan (default: all). "
+                             "Use --list-services to see available names.")
+    parser.add_argument("--exclude-services", default=None,
+                        help="Comma-separated list of services to skip")
+    parser.add_argument("--list-services", action="store_true",
+                        help="Print available service names and exit")
     args = parser.parse_args()
+
+    # Handle --list-services
+    all_service_names = [name for name, _ in GLOBAL_SCANNERS] + [name for name, _ in REGIONAL_SCANNERS]
+    if args.list_services:
+        print("Available services:")
+        for name in all_service_names:
+            print(f"  {name}")
+        return
 
     # Validate: if one of account-ids / role-name is set, both must be
     if bool(args.account_ids) != bool(args.role_name):
@@ -851,6 +901,14 @@ def main():
     global MAX_WORKERS
     MAX_WORKERS = args.workers
 
+    # Build service filter
+    service_filter = None
+    if args.services:
+        service_filter = {s.strip().lower() for s in args.services.split(",")}
+    exclude_filter = set()
+    if args.exclude_services:
+        exclude_filter = {s.strip().lower() for s in args.exclude_services.split(",")}
+
     start_time = time.time()
     all_matches = []
     all_regions = set()
@@ -861,13 +919,15 @@ def main():
         print(f"Multi-account mode: {len(account_ids)} account(s)")
         for acct in account_ids:
             session = assume_role(acct, args.role_name)
-            matches, regions = scan_account(session, acct, terms, args.regions, args.management_account)
+            matches, regions = scan_account(session, acct, terms, args.regions, args.management_account,
+                                            service_filter, exclude_filter)
             all_matches.extend(matches)
             all_regions.update(regions)
     else:
         # Single-account mode: use current credentials
         session, account_id = get_session_info()
-        matches, regions = scan_account(session, account_id, terms, args.regions, args.management_account)
+        matches, regions = scan_account(session, account_id, terms, args.regions, args.management_account,
+                                        service_filter, exclude_filter)
         all_matches.extend(matches)
         all_regions.update(regions)
 
