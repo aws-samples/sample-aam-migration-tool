@@ -15,7 +15,7 @@ import { formatAbsolute, formatAge, formatBytes } from "../utils/time";
 // Cache overview + clear. Lets the user see what's cached (age, size, summary)
 // and decide what to clear. Cache files persist across server restarts; this
 // is the only thing that removes them.
-export default function CacheManager() {
+export default function CacheManager({ active }: { active: boolean }) {
   const [entries, setEntries] = useState<CacheEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -31,7 +31,12 @@ export default function CacheManager() {
       .finally(() => setLoading(false));
   }
 
-  useEffect(refresh, []);
+  // The page stays mounted across tab switches, so refresh each time it becomes
+  // visible to reflect cache changes from recent scans/discovery.
+  useEffect(() => {
+    if (active) refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active]);
 
   async function doClear() {
     if (!confirm) return;

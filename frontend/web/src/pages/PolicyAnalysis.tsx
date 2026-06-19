@@ -37,6 +37,10 @@ interface ScanData {
 }
 
 const POLL_MS = 1000;
+// Persist the running job id so switching tabs (which unmounts this page) — or
+// even a browser refresh — doesn't lose track of an in-flight scan. The job
+// runs on the backend; we just re-attach and resume polling.
+const JOB_KEY = "truffle.policyScanJob";
 
 export default function PolicyAnalysis() {
   const [search, setSearch] = useState("");
@@ -64,10 +68,19 @@ export default function PolicyAnalysis() {
         setCachedAt(r.cached_at);
       }
     });
-    // Stop polling if the component unmounts mid-scan.
+    // Re-attach to an in-flight scan if one was running when we last left.
+    const saved = localStorage.getItem(JOB_KEY);
+    if (saved) {
+      setRunning(true);
+      setProgress({ completed_units: 0, total_units: 0, skipped_units: 0, message: "reconnecting…" });
+      startPolling(saved, true);
+    }
+    // Stop the local timer if the component unmounts (tab switch). The backend
+    // job keeps running; we re-attach on the next mount.
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function stopPolling() {
@@ -75,6 +88,39 @@ export default function PolicyAnalysis() {
       clearInterval(pollRef.current);
       pollRef.current = null;
     }
+  }
+
+  // One poll of a job's status. ``isReattach`` suppresses the error toast when
+  // a re-attached job is simply gone (e.g. server restarted).
+  async function tick(jobId: string, isReattach: boolean) {
+    try {
+      const job = await api.policyStatus(jobId);
+      setProgress(job.progress);
+      if (job.status === "done" && job.result?.data) {
+        stopPolling();
+        localStorage.removeItem(JOB_KEY);
+        setResult(job.result.data as ScanData);
+        setCachedAt(job.result.cached_at);
+        setRunning(false);
+      } else if (job.status === "error") {
+        stopPolling();
+        localStorage.removeItem(JOB_KEY);
+        setError(job.error || "Scan failed");
+        setRunning(false);
+      }
+    } catch (e) {
+      // 404 after a server restart, etc. Re-running resumes from checkpoint.
+      stopPolling();
+      localStorage.removeItem(JOB_KEY);
+      setRunning(false);
+      if (!isReattach) setError((e as Error).message);
+    }
+  }
+
+  function startPolling(jobId: string, isReattach: boolean) {
+    stopPolling();
+    tick(jobId, isReattach); // immediate poll so the bar fills without a 1s wait
+    pollRef.current = setInterval(() => tick(jobId, isReattach), POLL_MS);
   }
 
   async function runScan() {
@@ -89,28 +135,8 @@ export default function PolicyAnalysis() {
         regions: regions ? regions.split(",").map((x) => x.trim()).filter(Boolean) : [],
         management_account: mgmt,
       });
-      // Poll for progress and the final result.
-      pollRef.current = setInterval(async () => {
-        try {
-          const job = await api.policyStatus(job_id);
-          setProgress(job.progress);
-          if (job.status === "done" && job.result?.data) {
-            stopPolling();
-            setResult(job.result.data as ScanData);
-            setCachedAt(job.result.cached_at);
-            setRunning(false);
-          } else if (job.status === "error") {
-            stopPolling();
-            setError(job.error || "Scan failed");
-            setRunning(false);
-          }
-        } catch (e) {
-          // 404 after a server restart, etc. Re-running will resume.
-          stopPolling();
-          setError((e as Error).message);
-          setRunning(false);
-        }
-      }, POLL_MS);
+      localStorage.setItem(JOB_KEY, job_id);
+      startPolling(job_id, false);
     } catch (e) {
       setError((e as Error).message);
       setRunning(false);

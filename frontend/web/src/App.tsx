@@ -9,20 +9,27 @@ import CacheManager from "./pages/CacheManager";
 
 type PageId = "policy-analysis" | "iam-federation" | "idc" | "cache";
 
-const PAGES: Record<PageId, { label: string; render: () => JSX.Element }> = {
-  "policy-analysis": { label: "Policy Analysis", render: () => <PolicyAnalysis /> },
-  "iam-federation": { label: "IAM Federation → AAM", render: () => <IamFederation /> },
-  idc: { label: "IdC → AAM", render: () => <Idc /> },
-  cache: { label: "Cache", render: () => <CacheManager /> },
+const LABELS: Record<PageId, string> = {
+  "policy-analysis": "Policy Analysis",
+  "iam-federation": "IAM Federation → AAM",
+  idc: "IdC → AAM",
+  cache: "Cache",
 };
 
 const NAV_ITEMS: SideNavigationProps.Item[] = [
-  { type: "link", text: PAGES["policy-analysis"].label, href: "#policy-analysis" },
-  { type: "link", text: PAGES["iam-federation"].label, href: "#iam-federation" },
-  { type: "link", text: PAGES.idc.label, href: "#idc" },
+  { type: "link", text: LABELS["policy-analysis"], href: "#policy-analysis" },
+  { type: "link", text: LABELS["iam-federation"], href: "#iam-federation" },
+  { type: "link", text: LABELS.idc, href: "#idc" },
   { type: "divider" },
-  { type: "link", text: PAGES.cache.label, href: "#cache" },
+  { type: "link", text: LABELS.cache, href: "#cache" },
 ];
+
+// Keep every page mounted and toggle visibility instead of unmounting on tab
+// switch. This preserves each tab's state (form inputs, selections, a running
+// scan's live polling) rather than discarding it every time the user navigates.
+function Pane({ visible, children }: { visible: boolean; children: React.ReactNode }) {
+  return <div style={{ display: visible ? "block" : "none" }}>{children}</div>;
+}
 
 export default function App() {
   const [active, setActive] = useState<PageId>("policy-analysis");
@@ -31,13 +38,7 @@ export default function App() {
     <>
       <TopNavigation
         identity={{ href: "#", title: "Truffle — AAM Migration Console" }}
-        utilities={[
-          {
-            type: "button",
-            text: "Local mode",
-            iconName: "status-info",
-          },
-        ]}
+        utilities={[{ type: "button", text: "Local mode", iconName: "status-info" }]}
       />
       <AppLayout
         toolsHide
@@ -48,12 +49,28 @@ export default function App() {
             onFollow={(e) => {
               e.preventDefault();
               const id = e.detail.href.replace("#", "") as PageId;
-              if (PAGES[id]) setActive(id);
+              if (LABELS[id]) setActive(id);
             }}
             items={NAV_ITEMS}
           />
         }
-        content={PAGES[active].render()}
+        content={
+          <>
+            <Pane visible={active === "policy-analysis"}>
+              <PolicyAnalysis />
+            </Pane>
+            <Pane visible={active === "iam-federation"}>
+              <IamFederation />
+            </Pane>
+            <Pane visible={active === "idc"}>
+              <Idc />
+            </Pane>
+            <Pane visible={active === "cache"}>
+              {/* Refresh when shown so cache age/size reflect recent scans. */}
+              <CacheManager active={active === "cache"} />
+            </Pane>
+          </>
+        }
       />
     </>
   );
