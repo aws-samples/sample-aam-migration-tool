@@ -1,0 +1,5 @@
+# Truffle frontend — kept intentionally minimal per design tenets.
+# Flask is the only web dependency; boto3 is already required by the utilities.
+Flask>=3.0,<4.0
+boto3>=1.34
+PyYAML>=6.0

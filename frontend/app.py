@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""
+Truffle local migration console — Flask entry point.
+
+Serves a JSON API under /api and the built Cloudscape/React frontend (from
+web/dist) for everything else. Runs locally only; uses the local AWS
+credential chain.
+
+Run:
+    python3 app.py            # serve API (+ built UI if web/dist exists)
+
+During frontend development, run the Vite dev server separately (see
+web/README) — it proxies /api here.
+"""
+
+import os
+
+from flask import Flask, jsonify, request, send_from_directory
+
+from backend import aws_session, cache, config, iam_federation, idc, jobs, policy_analysis
+
+# The Vite build outputs here. Absent until `npm run build` is run in web/.
+WEB_DIST = os.path.join(config.FRONTEND_DIR, "web", "dist")
+
+app = Flask(__name__, static_folder=None)
+
+
+# ─── Shared helpers ──────────────────────────────────────────────────────────
+
+def _json_error(message: str, status: int = 400):
+    return jsonify({"error": message}), status
+
+
+# ─── Meta / credentials ──────────────────────────────────────────────────────
+
+@app.get("/api/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
+@app.get("/api/profiles")
+def profiles():
+    """List named AWS profiles from the local credential chain."""
+    return jsonify({"profiles": aws_session.list_profiles()})
+
+
+@app.get("/api/whoami")
+def whoami():
+    """Resolve caller identity for a profile (read-only STS call)."""
+    profile = request.args.get("profile") or None
+    return jsonify(aws_session.whoami(profile))
+
+
+# ─── Cache management ────────────────────────────────────────────────────────
+
+@app.get("/api/cache")
+def cache_overview():
+    """Overview of all local cache files (age, size, summary) for the UI."""
+    return jsonify(cache.overview())
+
+
+@app.post("/api/cache/clear")
+def cache_clear():
+    """Clear one cache file (by key) or all of them when no key is given."""
+    body = request.get_json(silent=True) or {}
+    try:
+        return jsonify(cache.clear(body.get("key")))
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+
+# ─── Policy Analysis (wired) ─────────────────────────────────────────────────
+
+@app.get("/api/policy-analysis/services")
+def policy_services():
+    return jsonify({"services": policy_analysis.list_services()})
+
+
+@app.get("/api/policy-analysis/result")
+def policy_result():
+    return jsonify(policy_analysis.get_cached() or {})
+
+
+@app.post("/api/policy-analysis/scan")
+def policy_scan():
+    """Start a scan job; returns a job_id to poll for progress and results."""
+    body = request.get_json(silent=True) or {}
+    search = body.get("search_terms") or []
+    if isinstance(search, str):
+        search = [t.strip() for t in search.split(",") if t.strip()]
+    if not search:
+        return _json_error("search_terms is required")
+    params = {
+        "search_terms": search,
+        "profiles": body.get("profiles") or None,
+        "regions": body.get("regions") or None,
+        "services": body.get("services") or None,
+        "management_account": bool(body.get("management_account")),
+        "workers": int(body.get("workers", 5)),
+        "account_workers": int(body.get("account_workers", 4)),
+    }
+    job_id = jobs.start_scan(params)
+    return jsonify({"job_id": job_id})
+
+
+@app.get("/api/policy-analysis/status")
+def policy_status():
+    """Poll a scan job's progress and (when finished) its result."""
+    job_id = request.args.get("job_id")
+    if not job_id:
+        return _json_error("job_id is required")
+    job = jobs.get(job_id)
+    if job is None:
+        # Unknown job — likely the server restarted. The caller can re-run; the
+        # scan checkpoint will resume any completed work.
+        return _json_error("Unknown job. Re-run to resume from the last checkpoint.", 404)
+    # While running, augment with the scanner's fast-moving live activity
+    # (current service + resources scanned this run) so the UI shows steady
+    # movement between the coarser per-unit progress ticks.
+    if job.get("status") == "running" and job.get("type") == "policy-scan":
+        snap = policy_analysis.live_snapshot()
+        baseline = job["progress"].get("resource_baseline", snap["resource_count_total"])
+        job["progress"] = {
+            **job["progress"],
+            "activity": snap["activity"],
+            "resources": max(0, snap["resource_count_total"] - baseline),
+        }
+    return jsonify(job)
+
+
+# ─── IAM Federation -> AAM (skeleton) ────────────────────────────────────────
+
+@app.get("/api/iam-federation/state")
+def iam_state():
+    return jsonify(iam_federation.get_state() or {})
+
+
+@app.post("/api/iam-federation/entitlements")
+def iam_import_entitlements():
+    body = request.get_json(silent=True) or {}
+    entitlements = body.get("entitlements")
+    if entitlements is None:
+        return _json_error("entitlements is required")
+    return jsonify(iam_federation.import_entitlements(entitlements))
+
+
+@app.post("/api/iam-federation/migrate")
+def iam_migrate():
+    body = request.get_json(silent=True) or {}
+    try:
+        return jsonify(iam_federation.migrate_roles(
+            role_arns=body.get("role_arns") or [],
+            profile=body.get("profile") or None,
+        ))
+    except NotImplementedError as exc:
+        return _json_error(str(exc), 501)
+
+
+@app.get("/api/iam-federation/log")
+def iam_log():
+    return jsonify(iam_federation.get_migration_log() or {})
+
+
+# ─── IdC -> AAM (skeleton) ───────────────────────────────────────────────────
+
+@app.get("/api/idc/state")
+def idc_state():
+    return jsonify(idc.get_state() or {})
+
+
+@app.post("/api/idc/discover")
+def idc_discover():
+    body = request.get_json(silent=True) or {}
+    profile = body.get("profile")
+    if not profile:
+        return _json_error("profile is required (IdC management or delegated admin account)")
+    try:
+        return jsonify(idc.run_discovery(profile))
+    except Exception as exc:  # noqa: BLE001
+        return _json_error(str(exc), 500)
+
+
+@app.post("/api/idc/generate-cfn")
+def idc_generate_cfn():
+    body = request.get_json(silent=True) or {}
+    try:
+        return jsonify(idc.generate_cloudformation(body.get("selections") or {}))
+    except NotImplementedError as exc:
+        return _json_error(str(exc), 501)
+
+
+# ─── Static frontend (built React app) ───────────────────────────────────────
+
+@app.get("/", defaults={"path": ""})
+@app.get("/<path:path>")
+def serve_frontend(path: str):
+    """Serve the built SPA, falling back to index.html for client routing."""
+    if not os.path.isdir(WEB_DIST):
+        return (
+            "<h1>Truffle backend is running.</h1>"
+            "<p>The frontend has not been built yet. From <code>frontend/web</code> run "
+            "<code>npm install</code> then <code>npm run dev</code> (development) "
+            "or <code>npm run build</code> (to serve from here).</p>",
+            200,
+        )
+    target = os.path.join(WEB_DIST, path)
+    if path and os.path.isfile(target):
+        return send_from_directory(WEB_DIST, path)
+    return send_from_directory(WEB_DIST, "index.html")
+
+
+if __name__ == "__main__":
+    config.ensure_cache_dir()
+    app.run(host="127.0.0.1", port=5000, debug=True)

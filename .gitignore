@@ -1,0 +1,23 @@
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# ─── Node / frontend build ───────────────────────────────────────────────────
+node_modules/
+dist/
+*.tsbuildinfo
+
+# ─── Local cache / runtime output ────────────────────────────────────────────
+# The console writes scan results, discovery dumps, and checkpoints here.
+frontend/cache/*
+!frontend/cache/.gitignore
+
+# ─── OS / editor ─────────────────────────────────────────────────────────────
+.DS_Store
+*.swp
+.idea/
+.vscode/
