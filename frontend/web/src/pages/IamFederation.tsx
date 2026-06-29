@@ -1,123 +1,468 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Alert from "@cloudscape-design/components/alert";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import Container from "@cloudscape-design/components/container";
 import ContentLayout from "@cloudscape-design/components/content-layout";
-import FormField from "@cloudscape-design/components/form-field";
 import Header from "@cloudscape-design/components/header";
+import Modal from "@cloudscape-design/components/modal";
+import ProgressBar from "@cloudscape-design/components/progress-bar";
+import RadioGroup from "@cloudscape-design/components/radio-group";
 import SpaceBetween from "@cloudscape-design/components/space-between";
+import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Table from "@cloudscape-design/components/table";
-import Textarea from "@cloudscape-design/components/textarea";
-import { AuthMethodSelect, INITIAL_AUTH_STATE, type AuthState } from "../components/AuthMethodSelect";
+import { api, type CacheWrapper, type JobProgress } from "../api/client";
+import { AuthMethodSelect, INITIAL_AUTH_STATE, parseAccountIds, type AuthState } from "../components/AuthMethodSelect";
 import { exportToCsv } from "../utils/csv";
+import { formatAbsolute, formatAge } from "../utils/time";
 
-// SKELETON: this page lays out the intended IAM Federation -> AAM workflow.
-// Inputs render but no migration is performed yet.
+interface Provider {
+  arn: string;
+  name: string;
+  account_id: string;
+  label: string;
+  is_identity_center: boolean;
+}
+
+interface RolePolicy {
+  policy_name: string;
+  policy_type: string;
+  policy_arn?: string;
+}
+
+interface FederatedRole {
+  role_name: string;
+  role_arn: string;
+  account_id: string;
+  label: string;
+  trust_summary: string;
+  policies: RolePolicy[];
+  error?: string;
+}
+
+interface MigrateResult {
+  role_arn: string;
+  role_name: string;
+  status: "success" | "skipped" | "error";
+  error?: string;
+  reason?: string;
+  mode?: string;
+  timestamp?: string;
+}
+
+const POLL_MS = 1000;
+const DISCOVER_JOB_KEY = "truffle.iamDiscoverJob";
+
+type MigrateMode = "ADD" | "REPLACE";
+
 export default function IamFederation() {
   const [auth, setAuth] = useState<AuthState>(INITIAL_AUTH_STATE);
+  const [error, setError] = useState<string | null>(null);
 
-  // Placeholder items — populated once entitlement import is implemented.
-  const roles: { arn: string; role: string; accounts: string; groups: string }[] = [];
+  // Step 1: Providers
+  const [providers, setProviders] = useState<Provider[]>([]);
+  const [loadingProviders, setLoadingProviders] = useState(false);
+  const [selectedIdp, setSelectedIdp] = useState<string>("");
 
-  function handleExport() {
+  // Step 2: Discovery
+  const [discovering, setDiscovering] = useState(false);
+  const [discoverProgress, setDiscoverProgress] = useState<JobProgress | null>(null);
+  const [roles, setRoles] = useState<FederatedRole[]>([]);
+  const [cachedAt, setCachedAt] = useState<string | undefined>();
+  const [selectedRoles, setSelectedRoles] = useState<FederatedRole[]>([]);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Step 3: Migrate
+  const [migrateMode, setMigrateMode] = useState<MigrateMode>("ADD");
+  const [migrating, setMigrating] = useState(false);
+  const [migrateResults, setMigrateResults] = useState<MigrateResult[]>([]);
+
+  // Step 4: IaC
+  const [iacLoading, setIacLoading] = useState(false);
+  const [iacResult, setIacResult] = useState<{ cloudformation: { content: string; path: string }; terraform: { content: string; path: string } } | null>(null);
+  const [iacModal, setIacModal] = useState<"cloudformation" | "terraform" | null>(null);
+
+  // Load cached state on mount
+  useEffect(() => {
+    api.iamState().then((r: CacheWrapper) => {
+      if (r?.data) {
+        const data = r.data as { roles?: FederatedRole[]; idp_arn?: string };
+        if (data.roles) setRoles(data.roles.filter((r) => !r.error));
+        if (data.idp_arn) setSelectedIdp(data.idp_arn);
+        setCachedAt(r.cached_at);
+      }
+    });
+    // Re-attach to a running discovery job
+    const saved = localStorage.getItem(DISCOVER_JOB_KEY);
+    if (saved) {
+      setDiscovering(true);
+      setDiscoverProgress({ completed_units: 0, total_units: 0, skipped_units: 0, message: "reconnecting…" });
+      startPolling(saved, true);
+    }
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ─── Auth payload helper ────────────────────────────────────────────────────
+  function authPayload(): Record<string, unknown> {
+    if (auth.operatingMode === "single") {
+      return { auth_method: "profiles" };
+    }
+    if (auth.authMethod === "assume_role") {
+      return {
+        auth_method: "assume_role",
+        account_ids: parseAccountIds(auth.accountIds),
+        role_name: auth.roleName.trim(),
+      };
+    }
+    return { auth_method: "profiles", profiles: auth.profiles.map((p) => p.value) };
+  }
+
+  // ─── Step 1: List providers ─────────────────────────────────────────────────
+  async function loadProviders() {
+    setLoadingProviders(true);
+    setError(null);
+    try {
+      const res = await api.iamProviders(authPayload());
+      setProviders(res.providers);
+      // Auto-select the first non-IDC provider if there's only one
+      const nonIdc = res.providers.filter((p) => !p.is_identity_center);
+      if (nonIdc.length === 1) setSelectedIdp(nonIdc[0].arn);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoadingProviders(false);
+    }
+  }
+
+  // ─── Step 2: Discover roles ─────────────────────────────────────────────────
+  function stopPolling() {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+  }
+
+  async function tick(jobId: string, isReattach: boolean) {
+    try {
+      const job = await api.iamDiscoverStatus(jobId);
+      setDiscoverProgress(job.progress);
+      if (job.status === "done" && job.result?.data) {
+        stopPolling(); localStorage.removeItem(DISCOVER_JOB_KEY);
+        const data = job.result.data as { roles?: FederatedRole[] };
+        setRoles((data.roles || []).filter((r) => !r.error));
+        setCachedAt(job.result.cached_at);
+        setDiscovering(false);
+      } else if (job.status === "error") {
+        stopPolling(); localStorage.removeItem(DISCOVER_JOB_KEY);
+        setError(job.error || "Discovery failed"); setDiscovering(false);
+      }
+    } catch (e) {
+      stopPolling(); localStorage.removeItem(DISCOVER_JOB_KEY); setDiscovering(false);
+      if (!isReattach) setError((e as Error).message);
+    }
+  }
+
+  function startPolling(jobId: string, isReattach: boolean) {
+    stopPolling();
+    tick(jobId, isReattach);
+    pollRef.current = setInterval(() => tick(jobId, isReattach), POLL_MS);
+  }
+
+  async function runDiscovery() {
+    setError(null); setDiscovering(true);
+    setDiscoverProgress({ completed_units: 0, total_units: 0, skipped_units: 0, message: "starting" });
+    try {
+      const { job_id } = await api.iamDiscover({ ...authPayload(), idp_arn: selectedIdp });
+      localStorage.setItem(DISCOVER_JOB_KEY, job_id);
+      startPolling(job_id, false);
+    } catch (e) {
+      setError((e as Error).message); setDiscovering(false);
+    }
+  }
+
+  // ─── Step 3: Migrate ────────────────────────────────────────────────────────
+  async function runMigration() {
+    setError(null); setMigrating(true); setMigrateResults([]);
+    try {
+      const res = await api.iamMigrate({
+        ...authPayload(),
+        role_arns: selectedRoles.map((r) => r.role_arn),
+        mode: migrateMode,
+        idp_arn: selectedIdp,
+      });
+      setMigrateResults(res.results as MigrateResult[]);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setMigrating(false);
+    }
+  }
+
+  // ─── Step 4: Generate IaC ──────────────────────────────────────────────────
+  async function generateIac() {
+    setError(null); setIacLoading(true);
+    try {
+      const res = await api.iamGenerateIac({
+        role_arns: selectedRoles.length ? selectedRoles.map((r) => r.role_arn) : undefined,
+      });
+      setIacResult(res);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setIacLoading(false);
+    }
+  }
+
+  // ─── CSV export ─────────────────────────────────────────────────────────────
+  function handleExportRoles() {
     if (!roles.length) return;
-    exportToCsv("iam_federation_roles.csv", roles, [
-      { key: "role", header: "Role" },
-      { key: "arn", header: "ARN" },
-      { key: "accounts", header: "Account(s)" },
-      { key: "groups", header: "Mapped groups" },
+    const rows = roles.flatMap((r) =>
+      r.policies.length
+        ? r.policies.map((p) => ({
+            role_name: r.role_name,
+            role_arn: r.role_arn,
+            account_id: r.account_id,
+            policy_name: p.policy_name,
+            policy_type: p.policy_type,
+            trust_summary: r.trust_summary,
+          }))
+        : [{
+            role_name: r.role_name,
+            role_arn: r.role_arn,
+            account_id: r.account_id,
+            policy_name: "(none)",
+            policy_type: "N/A",
+            trust_summary: r.trust_summary,
+          }]
+    );
+    exportToCsv("iam_federation_roles.csv", rows, [
+      { key: "role_name", header: "Role Name" },
+      { key: "role_arn", header: "Role ARN" },
+      { key: "account_id", header: "Account" },
+      { key: "policy_name", header: "Policy Name" },
+      { key: "policy_type", header: "Policy Type" },
+      { key: "trust_summary", header: "Trust Policy" },
     ]);
   }
+
+  function handleExportResults() {
+    if (!migrateResults.length) return;
+    exportToCsv("iam_federation_migration_results.csv", migrateResults.map((r) => ({
+      role_name: r.role_name,
+      role_arn: r.role_arn,
+      status: r.status,
+      mode: r.mode ?? "",
+      error: r.error ?? r.reason ?? "",
+    })), [
+      { key: "role_name", header: "Role Name" },
+      { key: "role_arn", header: "Role ARN" },
+      { key: "status", header: "Status" },
+      { key: "mode", header: "Mode" },
+      { key: "error", header: "Error / Reason" },
+    ]);
+  }
+
+  const discoverPct = discoverProgress && discoverProgress.total_units > 0
+    ? Math.round((discoverProgress.completed_units / discoverProgress.total_units) * 100)
+    : 0;
 
   return (
     <ContentLayout
       header={
-        <Header
-          variant="h1"
-          description="Migrate SAML federated roles to AAM by adding the AAM service principal to their trust policies."
-        >
+        <Header variant="h1" description="Migrate SAML federated roles to AAM by adding the AAM service principal to their trust policies.">
           IAM Federation → AAM
         </Header>
       }
     >
       <SpaceBetween size="l">
-        <Alert type="info" header="Skeleton">
-          This workflow is an outline. Entitlement import, role discovery, and trust-policy
-          migration are not implemented yet.
-        </Alert>
+        {error && <Alert type="error" header="Error" dismissible onDismiss={() => setError(null)}>{error}</Alert>}
 
+        {/* Credentials */}
         <Container header={<Header variant="h2">Credentials</Header>}>
-          <AuthMethodSelect state={auth} onChange={setAuth} profileMode="multi" />
+          <AuthMethodSelect state={auth} onChange={setAuth} disabled={discovering || migrating} profileMode="multi" />
         </Container>
 
-        {/* Step 1 — provide entitlements/assignments */}
+        {/* Step 1 — discover SAML providers */}
         <Container
           header={
-            <Header variant="h2" description="Step 1 — provide the entitlements/assignments for the account(s) being migrated.">
-              Input entitlements
+            <Header variant="h2" description="Step 1 — discover SAML identity providers and select which one to evaluate.">
+              Identity Providers
             </Header>
           }
         >
           <SpaceBetween size="m">
-            <FormField label="Entitlements / assignments (JSON)">
-              <Textarea
-                value=""
-                onChange={() => {}}
-                placeholder='{ "assignments": [ ... ] }'
-                rows={8}
-                disabled
+            <Button variant="primary" loading={loadingProviders} onClick={loadProviders} disabled={discovering}>
+              List providers
+            </Button>
+            {providers.length > 0 && (
+              <RadioGroup
+                value={selectedIdp}
+                onChange={({ detail }) => setSelectedIdp(detail.value)}
+                items={providers.map((p) => ({
+                  value: p.arn,
+                  label: `${p.name}${p.is_identity_center ? " [Identity Center — auto-created]" : ""}`,
+                  description: `${p.account_id} — ${p.arn}`,
+                }))}
               />
-            </FormField>
-            <Button disabled>Import entitlements</Button>
+            )}
           </SpaceBetween>
         </Container>
 
-        {/* Step 2 — select federated roles to migrate */}
+        {/* Step 2 — discover federated roles */}
         <Container
           header={
             <Header
               variant="h2"
-              description="Step 2 — select which federated roles to migrate."
+              description="Step 2 — discover IAM roles with SAML trust policies referencing the selected provider."
+              counter={roles.length ? `(${roles.length})` : undefined}
               actions={
-                <Button iconName="download" onClick={handleExport} disabled={!roles.length}>
-                  Export CSV
-                </Button>
+                <Button iconName="download" onClick={handleExportRoles} disabled={!roles.length}>Export CSV</Button>
               }
             >
-              Federated roles
+              Federated Roles
             </Header>
           }
         >
-          <Table
-            variant="embedded"
-            resizableColumns
-            selectionType="multi"
-            items={roles}
-            trackBy="arn"
-            empty={<Box textAlign="center">Import entitlements to populate roles.</Box>}
-            columnDefinitions={[
-              { id: "role", header: "Role", cell: (r) => r.role, minWidth: 150 },
-              { id: "arn", header: "ARN", cell: (r) => r.arn, minWidth: 200 },
-              { id: "accounts", header: "Account(s)", cell: (r) => r.accounts, minWidth: 120 },
-              { id: "groups", header: "Mapped groups", cell: (r) => r.groups, minWidth: 150 },
-            ]}
-          />
+          <SpaceBetween size="m">
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button variant="primary" loading={discovering} disabled={!selectedIdp} onClick={runDiscovery}>
+                Discover roles
+              </Button>
+              {cachedAt && (
+                <StatusIndicator type="info">
+                  Last discovery {formatAge(cachedAt)} ({formatAbsolute(cachedAt)})
+                </StatusIndicator>
+              )}
+            </SpaceBetween>
+
+            {discovering && discoverProgress && (
+              <ProgressBar
+                value={discoverPct}
+                additionalInfo={(() => {
+                  const parts: string[] = [];
+                  if ((discoverProgress as any).activity) parts.push((discoverProgress as any).activity);
+                  const scanned = (discoverProgress as any).roles_scanned;
+                  const total = (discoverProgress as any).roles_total;
+                  if (typeof scanned === "number" && scanned > 0) {
+                    parts.push(`${scanned.toLocaleString()}${total ? ` / ${total.toLocaleString()}` : ""} roles scanned`);
+                  }
+                  return parts.length ? parts.join(" · ") : undefined;
+                })()}
+                description={discoverProgress.total_units > 0
+                  ? `${discoverProgress.completed_units} / ${discoverProgress.total_units} account(s)`
+                  : discoverProgress.message}
+                label="Discovering"
+              />
+            )}
+
+            <Table
+              variant="embedded"
+              resizableColumns
+              selectionType="multi"
+              selectedItems={selectedRoles}
+              onSelectionChange={({ detail }) => setSelectedRoles(detail.selectedItems)}
+              items={roles}
+              trackBy="role_arn"
+              empty={<Box textAlign="center">Discover roles to populate this table.</Box>}
+              columnDefinitions={[
+                { id: "role", header: "Role Name", cell: (r) => r.role_name, minWidth: 150 },
+                { id: "arn", header: "ARN", cell: (r) => r.role_arn, minWidth: 200 },
+                { id: "account", header: "Account", cell: (r) => r.account_id, minWidth: 120 },
+                { id: "policies", header: "Policies", cell: (r) => r.policies.map((p) => p.policy_name).join(", ") || "(none)", minWidth: 200 },
+                { id: "trust", header: "Trust Policy", cell: (r) => r.trust_summary, minWidth: 180 },
+              ]}
+            />
+          </SpaceBetween>
         </Container>
 
-        {/* Step 3 — migrate */}
+        {/* Step 3 — migrate trust policies */}
         <Container
           header={
-            <Header variant="h2" description="Step 3 — update trust policies to add sts:AssumeRole for the AAM service principal. Results are logged per role.">
+            <Header
+              variant="h2"
+              description="Step 3 — update trust policies on selected roles to add the AAM service principal."
+              actions={
+                <Button iconName="download" onClick={handleExportResults} disabled={!migrateResults.length}>Export CSV</Button>
+              }
+            >
               Migrate
             </Header>
           }
         >
-          <Button variant="primary" disabled>
-            Migrate selected roles
-          </Button>
+          <SpaceBetween size="m">
+            <RadioGroup
+              value={migrateMode}
+              onChange={({ detail }) => setMigrateMode(detail.value as MigrateMode)}
+              items={[
+                { value: "ADD", label: "ADD", description: "Keep existing SAML trust statement, append the new AAM statement." },
+                { value: "REPLACE", label: "REPLACE", description: "Remove the SAML trust statement, replace with the new AAM statement." },
+              ]}
+            />
+            <Button variant="primary" loading={migrating} disabled={!selectedRoles.length} onClick={runMigration}>
+              Migrate selected roles ({selectedRoles.length})
+            </Button>
+
+            {migrateResults.length > 0 && (
+              <Table
+                variant="embedded"
+                resizableColumns
+                items={migrateResults}
+                trackBy="role_arn"
+                columnDefinitions={[
+                  { id: "role", header: "Role", cell: (r) => r.role_name, minWidth: 150 },
+                  { id: "arn", header: "ARN", cell: (r) => r.role_arn, minWidth: 200 },
+                  {
+                    id: "status", header: "Status", minWidth: 100,
+                    cell: (r) => (
+                      <StatusIndicator type={r.status === "success" ? "success" : r.status === "skipped" ? "info" : "error"}>
+                        {r.status}
+                      </StatusIndicator>
+                    ),
+                  },
+                  { id: "detail", header: "Detail", cell: (r) => r.error || r.reason || r.mode || "", minWidth: 150 },
+                ]}
+              />
+            )}
+          </SpaceBetween>
+        </Container>
+
+        {/* Step 4 — generate IaC templates */}
+        <Container
+          header={
+            <Header variant="h2" description="Step 4 — generate CloudFormation and Terraform templates from the discovered roles.">
+              Generate IaC
+            </Header>
+          }
+        >
+          <SpaceBetween size="m">
+            <Button variant="primary" loading={iacLoading} disabled={!roles.length} onClick={generateIac}>
+              Generate templates
+            </Button>
+            {iacResult && (
+              <SpaceBetween direction="horizontal" size="xs">
+                <Button onClick={() => setIacModal("cloudformation")}>View CloudFormation</Button>
+                <Button onClick={() => setIacModal("terraform")}>View Terraform</Button>
+                <StatusIndicator type="success">{iacResult.cloudformation.path}</StatusIndicator>
+              </SpaceBetween>
+            )}
+          </SpaceBetween>
         </Container>
       </SpaceBetween>
+
+      {/* IaC template modal */}
+      <Modal
+        visible={!!iacModal}
+        size="max"
+        onDismiss={() => setIacModal(null)}
+        header={iacModal === "cloudformation" ? "CloudFormation Template" : "Terraform Configuration"}
+        footer={<Box float="right"><Button variant="primary" onClick={() => setIacModal(null)}>Close</Button></Box>}
+      >
+        {iacResult && iacModal && (
+          <Box variant="code">
+            <pre style={{ margin: 0, maxHeight: "70vh", overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+              {iacModal === "cloudformation" ? iacResult.cloudformation.content : iacResult.terraform.content}
+            </pre>
+          </Box>
+        )}
+      </Modal>
     </ContentLayout>
   );
 }

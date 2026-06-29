@@ -84,18 +84,31 @@ export const api = {
   policyStatus: (jobId: string) =>
     request<JobStatus>(`/api/policy-analysis/status?job_id=${encodeURIComponent(jobId)}`),
 
-  // IAM Federation -> AAM (skeleton)
-  iamState: () => request<CacheWrapper>("/api/iam-federation/state"),
-  iamImportEntitlements: (entitlements: unknown) =>
-    request<CacheWrapper>("/api/iam-federation/entitlements", {
-      method: "POST",
-      body: JSON.stringify({ entitlements }),
-    }),
-  iamMigrate: (payload: unknown) =>
-    request<unknown>("/api/iam-federation/migrate", {
+  // IAM Federation -> AAM (wired)
+  iamProviders: (payload: unknown) =>
+    request<{ providers: { arn: string; name: string; account_id: string; label: string; is_identity_center: boolean }[] }>(
+      "/api/iam-federation/providers",
+      { method: "POST", body: JSON.stringify(payload) }
+    ),
+  iamDiscover: (payload: unknown) =>
+    request<{ job_id: string }>("/api/iam-federation/discover", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  iamDiscoverStatus: (jobId: string) =>
+    request<JobStatus>(`/api/iam-federation/discover/status?job_id=${encodeURIComponent(jobId)}`),
+  iamState: () => request<CacheWrapper>("/api/iam-federation/state"),
+  iamMigrate: (payload: unknown) =>
+    request<{ total: number; results: unknown[]; summary: { total: number; success: number; skipped: number; error: number; mode: string } }>(
+      "/api/iam-federation/migrate",
+      { method: "POST", body: JSON.stringify(payload) }
+    ),
+  iamGenerateIac: (payload: unknown) =>
+    request<{ roles_count: number; cloudformation: { path: string; content: string }; terraform: { path: string; content: string } }>(
+      "/api/iam-federation/generate-iac",
+      { method: "POST", body: JSON.stringify(payload) }
+    ),
+  iamLog: () => request<CacheWrapper>("/api/iam-federation/log"),
 
   // IdC -> AAM (skeleton)
   idcState: () => request<CacheWrapper>("/api/idc/state"),

@@ -132,36 +132,73 @@ def policy_status():
     return jsonify(job)
 
 
-# ─── IAM Federation -> AAM (skeleton) ────────────────────────────────────────
+# ─── IAM Federation -> AAM (wired) ───────────────────────────────────────────
+
+@app.post("/api/iam-federation/providers")
+def iam_providers():
+    """List SAML providers across target accounts."""
+    body = request.get_json(silent=True) or {}
+    try:
+        return jsonify(iam_federation.list_providers(body))
+    except Exception as exc:
+        return _json_error(str(exc), 500)
+
+
+@app.post("/api/iam-federation/discover")
+def iam_discover():
+    """Start a role discovery job; returns a job_id to poll."""
+    body = request.get_json(silent=True) or {}
+    if not body.get("idp_arn"):
+        return _json_error("idp_arn is required")
+    job_id = jobs.start_iam_discover(body)
+    return jsonify({"job_id": job_id})
+
+
+@app.get("/api/iam-federation/discover/status")
+def iam_discover_status():
+    """Poll a discovery job's progress."""
+    job_id = request.args.get("job_id")
+    if not job_id:
+        return _json_error("job_id is required")
+    job = jobs.get(job_id)
+    if job is None:
+        return _json_error("Unknown job.", 404)
+    return jsonify(job)
+
 
 @app.get("/api/iam-federation/state")
 def iam_state():
+    """Return cached discovery results."""
     return jsonify(iam_federation.get_state() or {})
-
-
-@app.post("/api/iam-federation/entitlements")
-def iam_import_entitlements():
-    body = request.get_json(silent=True) or {}
-    entitlements = body.get("entitlements")
-    if entitlements is None:
-        return _json_error("entitlements is required")
-    return jsonify(iam_federation.import_entitlements(entitlements))
 
 
 @app.post("/api/iam-federation/migrate")
 def iam_migrate():
+    """Migrate selected roles — update trust policies."""
+    body = request.get_json(silent=True) or {}
+    role_arns = body.get("role_arns") or []
+    if not role_arns:
+        return _json_error("role_arns is required")
+    try:
+        result = iam_federation.migrate_roles(body)
+        return jsonify(result)
+    except Exception as exc:
+        return _json_error(str(exc), 500)
+
+
+@app.post("/api/iam-federation/generate-iac")
+def iam_generate_iac():
+    """Generate CloudFormation + Terraform templates from cached discovery."""
     body = request.get_json(silent=True) or {}
     try:
-        return jsonify(iam_federation.migrate_roles(
-            role_arns=body.get("role_arns") or [],
-            profile=body.get("profile") or None,
-        ))
-    except NotImplementedError as exc:
-        return _json_error(str(exc), 501)
+        return jsonify(iam_federation.generate_iac(body))
+    except Exception as exc:
+        return _json_error(str(exc), 500)
 
 
 @app.get("/api/iam-federation/log")
 def iam_log():
+    """Return the migration log (per-role success/failure)."""
     return jsonify(iam_federation.get_migration_log() or {})
 
 

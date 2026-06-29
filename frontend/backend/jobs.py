@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import policy_analysis
+from . import iam_federation
 
 _JOBS: dict[str, dict] = {}
 _LOCK = threading.Lock()
@@ -80,3 +81,49 @@ def get(job_id: str) -> Optional[dict]:
     with _LOCK:
         job = _JOBS.get(job_id)
         return dict(job) if job else None
+
+
+# ─── IAM Federation discovery job ────────────────────────────────────────────
+
+def start_iam_discover(params: dict) -> str:
+    """Create an IAM federation discovery job, start it, return the id."""
+    job_id = uuid.uuid4().hex[:12]
+    with _LOCK:
+        _JOBS[job_id] = {
+            "id": job_id,
+            "type": "iam-discover",
+            "status": "running",
+            "progress": {
+                "completed_units": 0,
+                "total_units": 0,
+                "skipped_units": 0,
+                "message": "starting",
+            },
+            "started_at": _now(),
+            "finished_at": None,
+            "error": None,
+            "result": None,
+        }
+    thread = threading.Thread(target=_run_iam_discover, args=(job_id, params), daemon=True)
+    thread.start()
+    return job_id
+
+
+def _run_iam_discover(job_id: str, params: dict) -> None:
+    try:
+        result = iam_federation.discover_roles(
+            params, on_progress=lambda u: _update_progress(job_id, u)
+        )
+        with _LOCK:
+            job = _JOBS.get(job_id)
+            if job:
+                job["status"] = "done"
+                job["result"] = result
+                job["finished_at"] = _now()
+    except Exception as exc:
+        with _LOCK:
+            job = _JOBS.get(job_id)
+            if job:
+                job["status"] = "error"
+                job["error"] = str(exc)
+                job["finished_at"] = _now()
