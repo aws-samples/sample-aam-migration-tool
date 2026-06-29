@@ -27,6 +27,41 @@ def build_session(profile: Optional[str] = None) -> boto3.Session:
     return boto3.Session()
 
 
+def build_assumed_session(
+    account_id: str,
+    role_name: str,
+    base_profile: Optional[str] = None,
+    region: Optional[str] = None,
+    external_id: Optional[str] = None,
+) -> boto3.Session:
+    """
+    Build a boto3 session by assuming ``role_name`` in ``account_id``.
+
+    This is the "assume role" authentication path: rather than relying on a
+    distinct named profile per account, the caller supplies a list of account
+    IDs and a single role name to assume in each. The AssumeRole call itself is
+    made with ``base_profile`` (or the default credential chain when omitted),
+    and the returned session carries the resulting temporary credentials.
+
+    Read-only here only in that it returns a session; the scan that uses it
+    performs read/describe/list calls. Raises on AssumeRole failure so the
+    caller can report the account as un-scannable.
+    """
+    base = build_session(base_profile)
+    sts = base.client("sts")
+    role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+    kwargs = {"RoleArn": role_arn, "RoleSessionName": "truffle-policy-scan"}
+    if external_id:
+        kwargs["ExternalId"] = external_id
+    creds = sts.assume_role(**kwargs)["Credentials"]
+    return boto3.Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+        region_name=region,
+    )
+
+
 def whoami(profile: Optional[str] = None) -> dict:
     """
     Resolve the caller identity for a profile.

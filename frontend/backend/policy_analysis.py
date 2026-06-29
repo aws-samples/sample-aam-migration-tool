@@ -27,7 +27,7 @@ from threading import Lock
 from typing import Callable, Optional
 
 from . import cache, checkpoint, config
-from .aws_session import build_session
+from .aws_session import build_assumed_session, build_session
 
 # ─── Import the existing scanner module by path ──────────────────────────────
 # It lives outside this package, so load it explicitly rather than via a normal
@@ -73,8 +73,12 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
     Run a resumable, progress-reporting resource-policy scan.
 
     Args:
-        params: dict with keys search_terms (required), profiles, regions,
-            services, management_account, workers, account_workers.
+        params: dict with keys search_terms (required), auth_method
+            ("profiles" | "assume_role"), and the inputs for the chosen method:
+              * profiles  — list of local credential profiles, OR
+              * account_ids + role_name (+ optional assume_from_profile) — a
+                list of account IDs and a single role to assume in each.
+            Plus regions, services, management_account, workers, account_workers.
         on_progress: optional callback invoked with progress snapshots
             ({completed_units, total_units, skipped_units, message, ...}).
 
@@ -91,7 +95,35 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
     if not search_terms:
         raise ValueError("At least one search term is required.")
 
-    profiles = params.get("profiles") or [None]
+    # ── Resolve scan targets from the chosen authentication method ───────────
+    # Two mutually-exclusive ways to enumerate the accounts to scan:
+    #   * "profiles"     — one local credential profile per account.
+    #   * "assume_role"  — a list of account IDs + a single role name assumed in
+    #                      each (using the default chain, or an optional base
+    #                      profile, to make the AssumeRole call).
+    # A target is normalized to a dict the planning loop can act on uniformly.
+    auth_method = params.get("auth_method") or "profiles"
+    targets: list[dict] = []
+    if auth_method == "assume_role":
+        account_ids = [a for a in (params.get("account_ids") or []) if a]
+        role_name = (params.get("role_name") or "").strip()
+        base_profile = params.get("assume_from_profile") or None
+        if not role_name:
+            raise ValueError("A role name is required for assume-role authentication.")
+        if not account_ids:
+            raise ValueError("At least one account ID is required for assume-role authentication.")
+        for acct in account_ids:
+            targets.append({
+                "mode": "assume_role",
+                "label": acct,
+                "account_id": acct,
+                "role_name": role_name,
+                "base_profile": base_profile,
+            })
+    else:
+        for profile in (params.get("profiles") or [None]):
+            targets.append({"mode": "profile", "label": profile or "(default)", "profile": profile})
+
     regions_list = params.get("regions") or None
     services = params.get("services") or None
     management_account = bool(params.get("management_account"))
@@ -122,20 +154,46 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
                     "message": msg,
                 })
 
-    # ── Phase 1: plan — resolve account_id + regions per profile ─────────────
+    # ── Phase 1: plan — resolve account_id + regions per target ──────────────
     # Doing this up front gives a stable denominator for the progress bar.
-    plan = []  # (profile, account_id, session, [(scope, region), ...])
+    plan = []  # (label, account_id, session, [(scope, region), ...])
     per_profile: list[dict] = []
-    for profile in profiles:
+
+    # For assume_role mode, resolve the base credentials' account once so we can
+    # skip AssumeRole when a target account is the same as the caller account.
+    # This avoids the common failure of trying to assume a role in your own
+    # account which may not be configured for self-assumption.
+    _base_account_id: Optional[str] = None
+    _base_session: Optional[object] = None
+    if auth_method == "assume_role":
         try:
-            session = build_session(profile)
-            account_id = session.client("sts").get_caller_identity()["Account"]
+            _base_session = build_session(targets[0].get("base_profile") if targets else None)
+            _base_account_id = _base_session.client("sts").get_caller_identity()["Account"]  # type: ignore[union-attr]
+        except Exception:
+            _base_account_id = None
+            _base_session = None
+
+    for tgt in targets:
+        try:
+            if tgt["mode"] == "assume_role":
+                # If the target account matches the caller's own account, reuse
+                # the base session directly rather than assuming into ourselves.
+                if _base_account_id and tgt["account_id"] == _base_account_id and _base_session:
+                    session = _base_session  # type: ignore[assignment]
+                else:
+                    session = build_assumed_session(
+                        tgt["account_id"], tgt["role_name"], tgt["base_profile"]
+                    )
+                account_id = tgt["account_id"]
+            else:
+                session = build_session(tgt["profile"])
+                account_id = session.client("sts").get_caller_identity()["Account"]
             regions = scanner.get_regions(session, regions_arg)
             units = [("global", None)] + [("region", r) for r in regions]
-            plan.append((profile, account_id, session, units))
+            plan.append((tgt["label"], account_id, session, units))
         except Exception as exc:  # planning failure — account can't be scanned
             per_profile.append({
-                "profile": profile or "(default)",
+                "profile": tgt["label"],
                 "status": "error",
                 "error": str(exc),
             })
@@ -159,8 +217,18 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
     # ── Phase 2: scan units, accounts in parallel ────────────────────────────
     def scan_one_account(profile, account_id, session, units) -> dict:
         nonlocal completed, skipped
+        label = profile  # already normalized to a display label in the plan
         acct_matches: list[dict] = []
         unit_errors: list[str] = []
+
+        # Resolve the organization ID once per account (best-effort) so we can
+        # build proper ARNs for SCP/RCP matches.
+        org_id = "o-unknown"
+        if management_account:
+            try:
+                org_id = session.client("organizations").describe_organization()["Organization"]["Id"]
+            except Exception:
+                pass
         for scope, region in units:
             if scope == "global":
                 unit_key = f"{account_id}::global"
@@ -191,7 +259,22 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
                         service_filter, set(),
                     )
                 for m in matches:
-                    m["profile"] = profile or "(default)"
+                    m["profile"] = label
+                    # Ensure every match carries the account_id. The scanner
+                    # does not populate this itself.
+                    if "account_id" not in m or not m["account_id"]:
+                        m["account_id"] = account_id
+                    # The Organizations scanner uses a short form like
+                    # "SCP:p-abc123" rather than a real ARN. Expand it to
+                    # the full Organizations policy ARN.
+                    arn = m.get("resource_arn", "")
+                    if arn.startswith("SCP:") or arn.startswith("RCP:"):
+                        prefix, policy_id = arn.split(":", 1)
+                        m["resource_arn"] = (
+                            f"arn:aws:organizations::{account_id}:policy/{org_id}/"
+                            f"{'service_control_policy' if prefix == 'SCP' else 'resource_control_policy'}"
+                            f"/{policy_id}"
+                        )
                 # Checkpoint this completed unit before moving on.
                 checkpoint.save_unit(ck_key, params, unit_key, {
                     "account_id": account_id,
@@ -211,7 +294,7 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
                     completed += 1
                 emit(f"Failed {unit_key}")
         return {
-            "profile": profile or "(default)",
+            "profile": label,
             "account_id": account_id,
             "matches": acct_matches,
             "errors": unit_errors,
@@ -236,8 +319,8 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
                     unit_error_count += len(res["errors"])
                 per_profile.append(entry)
 
-    # Keep per-profile order stable relative to the requested profiles.
-    order = {(p or "(default)"): i for i, p in enumerate(profiles)}
+    # Keep per-profile order stable relative to the requested targets.
+    order = {t["label"]: i for i, t in enumerate(targets)}
     per_profile.sort(key=lambda e: order.get(e["profile"], len(order)))
 
     fully_successful = planning_errors == 0 and unit_error_count == 0
@@ -247,7 +330,8 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
 
     payload = {
         "search_terms": search_terms,
-        "profiles": [p or "(default)" for p in profiles],
+        "auth_method": auth_method,
+        "profiles": [t["label"] for t in targets],
         "per_profile": per_profile,
         "services_filter": services or "all",
         "regions_scanned": sorted(regions_scanned),

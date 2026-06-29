@@ -17,9 +17,17 @@ const LABELS: Record<PageId, string> = {
 };
 
 const NAV_ITEMS: SideNavigationProps.Item[] = [
-  { type: "link", text: LABELS["policy-analysis"], href: "#policy-analysis" },
   { type: "link", text: LABELS["iam-federation"], href: "#iam-federation" },
-  { type: "link", text: LABELS.idc, href: "#idc" },
+  {
+    // Policy Analysis lives under the IdC → AAM flow: it is only required for
+    // that migration use-case, so it is grouped beneath it rather than being a
+    // standalone top-level tool.
+    type: "expandable-link-group",
+    text: LABELS.idc,
+    href: "#idc",
+    defaultExpanded: true,
+    items: [{ type: "link", text: LABELS["policy-analysis"], href: "#policy-analysis" }],
+  },
   { type: "divider" },
   { type: "link", text: LABELS.cache, href: "#cache" },
 ];
@@ -32,7 +40,7 @@ function Pane({ visible, children }: { visible: boolean; children: React.ReactNo
 }
 
 export default function App() {
-  const [active, setActive] = useState<PageId>("policy-analysis");
+  const [active, setActive] = useState<PageId>("idc");
 
   return (
     <>

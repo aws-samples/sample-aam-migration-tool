@@ -1,3 +1,4 @@
+import { useState } from "react";
 import Alert from "@cloudscape-design/components/alert";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
@@ -8,10 +9,27 @@ import Header from "@cloudscape-design/components/header";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Table from "@cloudscape-design/components/table";
 import Textarea from "@cloudscape-design/components/textarea";
+import { AuthMethodSelect, INITIAL_AUTH_STATE, type AuthState } from "../components/AuthMethodSelect";
+import { exportToCsv } from "../utils/csv";
 
 // SKELETON: this page lays out the intended IAM Federation -> AAM workflow.
 // Inputs render but no migration is performed yet.
 export default function IamFederation() {
+  const [auth, setAuth] = useState<AuthState>(INITIAL_AUTH_STATE);
+
+  // Placeholder items — populated once entitlement import is implemented.
+  const roles: { arn: string; role: string; accounts: string; groups: string }[] = [];
+
+  function handleExport() {
+    if (!roles.length) return;
+    exportToCsv("iam_federation_roles.csv", roles, [
+      { key: "role", header: "Role" },
+      { key: "arn", header: "ARN" },
+      { key: "accounts", header: "Account(s)" },
+      { key: "groups", header: "Mapped groups" },
+    ]);
+  }
+
   return (
     <ContentLayout
       header={
@@ -28,6 +46,10 @@ export default function IamFederation() {
           This workflow is an outline. Entitlement import, role discovery, and trust-policy
           migration are not implemented yet.
         </Alert>
+
+        <Container header={<Header variant="h2">Credentials</Header>}>
+          <AuthMethodSelect state={auth} onChange={setAuth} profileMode="multi" />
+        </Container>
 
         {/* Step 1 — provide entitlements/assignments */}
         <Container
@@ -54,22 +76,31 @@ export default function IamFederation() {
         {/* Step 2 — select federated roles to migrate */}
         <Container
           header={
-            <Header variant="h2" description="Step 2 — select which federated roles to migrate.">
+            <Header
+              variant="h2"
+              description="Step 2 — select which federated roles to migrate."
+              actions={
+                <Button iconName="download" onClick={handleExport} disabled={!roles.length}>
+                  Export CSV
+                </Button>
+              }
+            >
               Federated roles
             </Header>
           }
         >
           <Table
             variant="embedded"
+            resizableColumns
             selectionType="multi"
-            items={[]}
+            items={roles}
             trackBy="arn"
             empty={<Box textAlign="center">Import entitlements to populate roles.</Box>}
             columnDefinitions={[
-              { id: "role", header: "Role", cell: () => "" },
-              { id: "arn", header: "ARN", cell: () => "" },
-              { id: "accounts", header: "Account(s)", cell: () => "" },
-              { id: "groups", header: "Mapped groups", cell: () => "" },
+              { id: "role", header: "Role", cell: (r) => r.role, minWidth: 150 },
+              { id: "arn", header: "ARN", cell: (r) => r.arn, minWidth: 200 },
+              { id: "accounts", header: "Account(s)", cell: (r) => r.accounts, minWidth: 120 },
+              { id: "groups", header: "Mapped groups", cell: (r) => r.groups, minWidth: 150 },
             ]}
           />
         </Container>

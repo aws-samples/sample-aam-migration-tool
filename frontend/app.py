@@ -92,7 +92,11 @@ def policy_scan():
         return _json_error("search_terms is required")
     params = {
         "search_terms": search,
+        "auth_method": body.get("auth_method") or "profiles",
         "profiles": body.get("profiles") or None,
+        "account_ids": body.get("account_ids") or None,
+        "role_name": body.get("role_name") or None,
+        "assume_from_profile": body.get("assume_from_profile") or None,
         "regions": body.get("regions") or None,
         "services": body.get("services") or None,
         "management_account": bool(body.get("management_account")),

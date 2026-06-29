@@ -10,6 +10,7 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Table from "@cloudscape-design/components/table";
 import { api, type CacheEntry } from "../api/client";
+import { exportToCsv } from "../utils/csv";
 import { formatAbsolute, formatAge, formatBytes } from "../utils/time";
 
 // Cache overview + clear. Lets the user see what's cached (age, size, summary)
@@ -52,6 +53,23 @@ export default function CacheManager({ active }: { active: boolean }) {
 
   const anyCached = entries.some((e) => e.exists);
 
+  function handleExport() {
+    if (!entries.length) return;
+    exportToCsv("cache_overview.csv", entries.map((e) => ({
+      label: e.label,
+      status: e.exists ? "Cached" : "Empty",
+      summary: e.summary,
+      age: formatAge(e.cached_at),
+      size: formatBytes(e.size_bytes),
+    })), [
+      { key: "label", header: "Cache" },
+      { key: "status", header: "Status" },
+      { key: "summary", header: "Contents" },
+      { key: "age", header: "Age" },
+      { key: "size", header: "Size" },
+    ]);
+  }
+
   return (
     <ContentLayout
       header={
@@ -60,6 +78,9 @@ export default function CacheManager({ active }: { active: boolean }) {
           description="Local cache of scan results and discovery dumps. These files persist across restarts and are re-read on load. Clearing forces fresh data on the next run."
           actions={
             <SpaceBetween direction="horizontal" size="xs">
+              <Button iconName="download" onClick={handleExport} disabled={!entries.length}>
+                Export CSV
+              </Button>
               <Button iconName="refresh" onClick={refresh}>
                 Refresh
               </Button>
@@ -87,15 +108,17 @@ export default function CacheManager({ active }: { active: boolean }) {
         <Container>
           <Table
             variant="embedded"
+            resizableColumns
             loading={loading}
             items={entries}
             trackBy="key"
             empty={<Box textAlign="center">No cache files.</Box>}
             columnDefinitions={[
-              { id: "label", header: "Cache", cell: (e) => e.label },
+              { id: "label", header: "Cache", cell: (e) => e.label, minWidth: 150 },
               {
                 id: "status",
                 header: "Status",
+                minWidth: 100,
                 cell: (e) =>
                   e.exists ? (
                     <StatusIndicator type="success">Cached</StatusIndicator>
@@ -103,18 +126,20 @@ export default function CacheManager({ active }: { active: boolean }) {
                     <StatusIndicator type="stopped">Empty</StatusIndicator>
                   ),
               },
-              { id: "summary", header: "Contents", cell: (e) => e.summary },
+              { id: "summary", header: "Contents", cell: (e) => e.summary, minWidth: 150 },
               {
                 id: "age",
                 header: "Age",
+                minWidth: 100,
                 cell: (e) => (
                   <span title={formatAbsolute(e.cached_at)}>{formatAge(e.cached_at)}</span>
                 ),
               },
-              { id: "size", header: "Size", cell: (e) => formatBytes(e.size_bytes) },
+              { id: "size", header: "Size", cell: (e) => formatBytes(e.size_bytes), minWidth: 80 },
               {
                 id: "actions",
                 header: "",
+                minWidth: 80,
                 cell: (e) => (
                   <Button
                     variant="inline-link"
