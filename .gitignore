@@ -21,3 +21,34 @@ frontend/cache/*
 *.swp
 .idea/
 .vscode/
+
+# ─── IdC-to-AAM tool: extra Python caches ────────────────────────────────────
+env/
+*$py.class
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+
+# ─── IdC-to-AAM tool: test / coverage artifacts ──────────────────────────────
+.coverage
+coverage.xml
+htmlcov/
+build/
+
+# ─── IdC-to-AAM tool: generated outputs ──────────────────────────────────────
+inventory_*.json
+migration_plan_*.xlsx
+mapping_*.xlsx
+mapping_*.csv
+mapping_*.json
+audit_*.csv
+# Generated IaC (CloudFormation templates with real ARNs / entitlements)
+Identity Center to AAM/output/
+output/
+
+# ─── IdC-to-AAM tool: all generated Excel outputs + Office lock files ─────────
+# Every .xlsx the tool touches is generated (migration plans, mapping reports)
+# and contains customer-specific data — never commit them.
+*.xlsx
+~$*
