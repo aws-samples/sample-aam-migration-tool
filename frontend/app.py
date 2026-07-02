@@ -202,32 +202,62 @@ def iam_log():
     return jsonify(iam_federation.get_migration_log() or {})
 
 
-# ─── IdC -> AAM (skeleton) ───────────────────────────────────────────────────
+# ─── IdC -> AAM (wired) ──────────────────────────────────────────────────────
 
 @app.get("/api/idc/state")
 def idc_state():
+    """Return cached inventory results."""
     return jsonify(idc.get_state() or {})
 
 
 @app.post("/api/idc/discover")
 def idc_discover():
+    """Start an IdC inventory job; returns a job_id to poll."""
     body = request.get_json(silent=True) or {}
-    profile = body.get("profile")
-    if not profile:
-        return _json_error("profile is required (IdC management or delegated admin account)")
+    job_id = jobs.start_idc_discover(body)
+    return jsonify({"job_id": job_id})
+
+
+@app.get("/api/idc/discover/status")
+def idc_discover_status():
+    """Poll an IdC discovery job's progress."""
+    job_id = request.args.get("job_id")
+    if not job_id:
+        return _json_error("job_id is required")
+    job = jobs.get(job_id)
+    if job is None:
+        return _json_error("Unknown job.", 404)
+    return jsonify(job)
+
+
+@app.post("/api/idc/generate-iac")
+def idc_generate_iac():
+    """Generate CloudFormation template(s) from cached inventory."""
+    body = request.get_json(silent=True) or {}
     try:
-        return jsonify(idc.run_discovery(profile))
+        return jsonify(idc.generate_iac(body))
     except Exception as exc:  # noqa: BLE001
         return _json_error(str(exc), 500)
 
 
-@app.post("/api/idc/generate-cfn")
-def idc_generate_cfn():
+@app.post("/api/idc/apply")
+def idc_apply():
+    """Start a job to create roles + entitlements directly via API."""
     body = request.get_json(silent=True) or {}
-    try:
-        return jsonify(idc.generate_cloudformation(body.get("selections") or {}))
-    except NotImplementedError as exc:
-        return _json_error(str(exc), 501)
+    job_id = jobs.start_idc_apply(body)
+    return jsonify({"job_id": job_id})
+
+
+@app.get("/api/idc/apply/status")
+def idc_apply_status():
+    """Poll an IdC apply job's progress."""
+    job_id = request.args.get("job_id")
+    if not job_id:
+        return _json_error("job_id is required")
+    job = jobs.get(job_id)
+    if job is None:
+        return _json_error("Unknown job.", 404)
+    return jsonify(job)
 
 
 # ─── Static frontend (built React app) ───────────────────────────────────────

@@ -127,3 +127,103 @@ def _run_iam_discover(job_id: str, params: dict) -> None:
                 job["status"] = "error"
                 job["error"] = str(exc)
                 job["finished_at"] = _now()
+
+
+# ─── IdC discovery job ───────────────────────────────────────────────────────
+
+def start_idc_discover(params: dict) -> str:
+    """Create an IdC inventory job, start it, return the id."""
+    from . import idc
+
+    job_id = uuid.uuid4().hex[:12]
+    with _LOCK:
+        _JOBS[job_id] = {
+            "id": job_id,
+            "type": "idc-discover",
+            "status": "running",
+            "progress": {
+                "completed_units": 0,
+                "total_units": 0,
+                "skipped_units": 0,
+                "message": "starting",
+            },
+            "started_at": _now(),
+            "finished_at": None,
+            "error": None,
+            "result": None,
+        }
+    thread = threading.Thread(target=_run_idc_discover, args=(job_id, params), daemon=True)
+    thread.start()
+    return job_id
+
+
+def _run_idc_discover(job_id: str, params: dict) -> None:
+    from . import idc
+
+    try:
+        result = idc.run_inventory(
+            params, on_progress=lambda u: _update_progress(job_id, u)
+        )
+        with _LOCK:
+            job = _JOBS.get(job_id)
+            if job:
+                job["status"] = "done"
+                job["result"] = result
+                job["finished_at"] = _now()
+    except Exception as exc:
+        with _LOCK:
+            job = _JOBS.get(job_id)
+            if job:
+                job["status"] = "error"
+                job["error"] = str(exc)
+                job["finished_at"] = _now()
+
+
+# ─── IdC apply job ───────────────────────────────────────────────────────────
+
+def start_idc_apply(params: dict) -> str:
+    """Create an IdC apply job (create roles + entitlements), start it, return id."""
+    from . import idc
+
+    job_id = uuid.uuid4().hex[:12]
+    with _LOCK:
+        _JOBS[job_id] = {
+            "id": job_id,
+            "type": "idc-apply",
+            "status": "running",
+            "progress": {
+                "completed_units": 0,
+                "total_units": 0,
+                "skipped_units": 0,
+                "message": "starting",
+            },
+            "started_at": _now(),
+            "finished_at": None,
+            "error": None,
+            "result": None,
+        }
+    thread = threading.Thread(target=_run_idc_apply, args=(job_id, params), daemon=True)
+    thread.start()
+    return job_id
+
+
+def _run_idc_apply(job_id: str, params: dict) -> None:
+    from . import idc
+
+    try:
+        result = idc.apply_roles(
+            params, on_progress=lambda u: _update_progress(job_id, u)
+        )
+        with _LOCK:
+            job = _JOBS.get(job_id)
+            if job:
+                job["status"] = "done"
+                job["result"] = result
+                job["finished_at"] = _now()
+    except Exception as exc:
+        with _LOCK:
+            job = _JOBS.get(job_id)
+            if job:
+                job["status"] = "error"
+                job["error"] = str(exc)
+                job["finished_at"] = _now()

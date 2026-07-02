@@ -171,7 +171,7 @@ export default function PolicyAnalysis() {
   return (
     <ContentLayout
       header={
-        <Header variant="h1" description="Scan resource-based policies across accounts for one or more search strings. Uses your local AWS credential chain. Interrupted scans resume from a local checkpoint.">
+        <Header variant="h1" description="Scan resource-based policies (S3, KMS, SQS, SNS, Lambda, etc.), IAM trust policies, and Organization policies (SCPs/RCPs) across one or more accounts for specific strings — such as a principal ARN, account ID, or service name. Use this to identify policies that reference your Identity Center reserved roles before migrating to AAM.">
           Policy Analysis
         </Header>
       }

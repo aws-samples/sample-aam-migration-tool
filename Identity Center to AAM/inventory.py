@@ -224,19 +224,29 @@ class InventoryModule:
         instance_arn: str,
         ps_arn: str,
         identity_store_id: str,
+        filter_account_ids: list[str] | None = None,
     ) -> list[AccountAssignmentRecord]:
-        accounts: list[str] = []
-        try:
-            for page in _paginate(
-                self.sso_admin,
-                "list_accounts_for_provisioned_permission_set",
-                InstanceArn=instance_arn,
-                PermissionSetArn=ps_arn,
-            ):
-                accounts.extend(page.get("AccountIds", []))
-        except (ClientError, BotoCoreError) as exc:  # noqa: BLE001
-            self.audit.log_failure("inventory_assignments", ps_arn, exc)
-            return []
+        """List assignments for a permission set.
+
+        When ``filter_account_ids`` is provided (single/multi mode), only the
+        specified accounts are queried — skipping the ListAccountsForProvisioned
+        call entirely. When None (org mode), all provisioned accounts are queried.
+        """
+        if filter_account_ids is not None:
+            accounts = filter_account_ids
+        else:
+            accounts = []
+            try:
+                for page in _paginate(
+                    self.sso_admin,
+                    "list_accounts_for_provisioned_permission_set",
+                    InstanceArn=instance_arn,
+                    PermissionSetArn=ps_arn,
+                ):
+                    accounts.extend(page.get("AccountIds", []))
+            except (ClientError, BotoCoreError) as exc:  # noqa: BLE001
+                self.audit.log_failure("inventory_assignments", ps_arn, exc)
+                return []
 
         results: list[AccountAssignmentRecord] = []
         # Resolve display names lazily and cache them per-run.
@@ -318,12 +328,57 @@ class InventoryModule:
 
     # ── Orchestration ────────────────────────────────────────────────────────
 
+    def list_permission_sets_for_account(self, instance_arn: str, account_id: str) -> list[str]:
+        """List only permission sets provisioned to a specific account.
+
+        Uses ListPermissionSetsProvisionedToAccount — far more efficient than
+        listing all permission sets and then filtering when you only care about
+        one or a few accounts.
+        """
+        arns: list[str] = []
+        for page in _paginate(
+            self.sso_admin,
+            "list_permission_sets_provisioned_to_account",
+            InstanceArn=instance_arn,
+            AccountId=account_id,
+        ):
+            arns.extend(page.get("PermissionSets", []))
+        return arns
+
     def run(self) -> Inventory:
         instance_arn, identity_store_id = self.discover_idc_instance()
         self.audit.log_success("discover_idc_instance", instance_arn, identity_store_id=identity_store_id)
 
-        ps_arns = self.list_permission_sets(instance_arn)
-        self.audit.log_success("list_permission_sets", instance_arn, count=len(ps_arns))
+        account_scope = self.cfg.account_scope  # "single" | "multi" | "org"
+        target_account_ids: list[str] = []
+
+        if account_scope == "single":
+            # Single-account: use the hub account ID as the sole target.
+            target_account_ids = [self.hub.account_id]
+        elif account_scope == "multi":
+            # Multi-account: use the explicit list of account IDs from config.
+            target_account_ids = list(self.cfg.account_ids)
+
+        # ── Determine permission sets to describe ────────────────────────────
+        if account_scope in ("single", "multi"):
+            # Optimized path: only list permission sets provisioned to the
+            # target account(s). Avoids scanning the entire IdC instance.
+            ps_arns_set: set[str] = set()
+            for acct in target_account_ids:
+                ps_arns_set.update(
+                    self.list_permission_sets_for_account(instance_arn, acct)
+                )
+            ps_arns = sorted(ps_arns_set)
+            self.audit.log_success(
+                "list_permission_sets_for_accounts",
+                instance_arn,
+                count=len(ps_arns),
+                accounts=len(target_account_ids),
+            )
+        else:
+            # Org mode: list ALL permission sets (existing behavior).
+            ps_arns = self.list_permission_sets(instance_arn)
+            self.audit.log_success("list_permission_sets", instance_arn, count=len(ps_arns))
 
         records: list[PermissionSetRecord] = []
         assignments: list[AccountAssignmentRecord] = []
@@ -360,6 +415,7 @@ class InventoryModule:
                     instance_arn,
                     arn,
                     identity_store_id,
+                    target_account_ids if account_scope in ("single", "multi") else None,
                 ): arn
                 for arn in ps_arns
             }

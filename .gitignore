@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 .env
+*.whl
 
 # ─── Node / frontend build ───────────────────────────────────────────────────
 node_modules/

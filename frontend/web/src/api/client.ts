@@ -110,11 +110,25 @@ export const api = {
     ),
   iamLog: () => request<CacheWrapper>("/api/iam-federation/log"),
 
-  // IdC -> AAM (skeleton)
+  // IdC -> AAM (wired)
   idcState: () => request<CacheWrapper>("/api/idc/state"),
-  idcDiscover: (profile: string) =>
-    request<CacheWrapper>("/api/idc/discover", {
+  idcDiscover: (payload: unknown) =>
+    request<{ job_id: string }>("/api/idc/discover", {
       method: "POST",
-      body: JSON.stringify({ profile }),
+      body: JSON.stringify(payload),
     }),
+  idcDiscoverStatus: (jobId: string) =>
+    request<JobStatus>(`/api/idc/discover/status?job_id=${encodeURIComponent(jobId)}`),
+  idcGenerateIac: (payload: unknown) =>
+    request<{ roles_count: number; entitlements_count: number; templates: Record<string, { path: string; content: string }>; accounts: string[]; role_map: Record<string, string> }>(
+      "/api/idc/generate-iac",
+      { method: "POST", body: JSON.stringify(payload) }
+    ),
+  idcApply: (payload: unknown) =>
+    request<{ job_id: string }>("/api/idc/apply", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  idcApplyStatus: (jobId: string) =>
+    request<JobStatus>(`/api/idc/apply/status?job_id=${encodeURIComponent(jobId)}`),
 };

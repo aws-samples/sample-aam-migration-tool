@@ -174,7 +174,7 @@ Run `python idc_to_aam.py --help` for the live list.
 ### Account targeting
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--account-scope {single,multi}` | `single` | `single`: operate only in the hub account with current credentials. `multi`: assume a role into each target account. |
+| `--account-scope {single,multi,org}` | `single` | `single`: operate only in the hub account with current credentials. `multi`: assume a role into each specified target account. `org`: scan all accounts provisioned in the IdC instance (may be throttled in large orgs). |
 | `--account-ids` | — | Comma-separated target account IDs. **Required for `multi`.** |
 | `--role-name` | — | Name of the IAM role to assume in each target account. **Required for `multi`.** |
 

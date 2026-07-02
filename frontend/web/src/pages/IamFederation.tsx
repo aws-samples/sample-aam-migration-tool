@@ -4,13 +4,16 @@ import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import Container from "@cloudscape-design/components/container";
 import ContentLayout from "@cloudscape-design/components/content-layout";
+import FormField from "@cloudscape-design/components/form-field";
 import Header from "@cloudscape-design/components/header";
+import Input from "@cloudscape-design/components/input";
 import Modal from "@cloudscape-design/components/modal";
 import ProgressBar from "@cloudscape-design/components/progress-bar";
 import RadioGroup from "@cloudscape-design/components/radio-group";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Table from "@cloudscape-design/components/table";
+import Textarea from "@cloudscape-design/components/textarea";
 import { api, type CacheWrapper, type JobProgress } from "../api/client";
 import { AuthMethodSelect, INITIAL_AUTH_STATE, parseAccountIds, type AuthState } from "../components/AuthMethodSelect";
 import { exportToCsv } from "../utils/csv";
@@ -72,7 +75,12 @@ export default function IamFederation() {
   const [selectedRoles, setSelectedRoles] = useState<FederatedRole[]>([]);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Step 3: Migrate
+  // Step 3: Entitlement mapping
+  const [groupPattern, setGroupPattern] = useState("{principal}_{account}_{role}");
+  const [groupNamesRaw, setGroupNamesRaw] = useState("");
+  const [entitlementMappings, setEntitlementMappings] = useState<{ group: string; principal: string; account: string; role: string; matchedRoleArn: string; matchedRoleName: string }[]>([]);
+
+  // Step 4: Migrate
   const [migrateMode, setMigrateMode] = useState<MigrateMode>("ADD");
   const [migrating, setMigrating] = useState(false);
   const [migrateResults, setMigrateResults] = useState<MigrateResult[]>([]);
@@ -267,7 +275,7 @@ export default function IamFederation() {
   return (
     <ContentLayout
       header={
-        <Header variant="h1" description="Migrate SAML federated roles to AAM by adding the AAM service principal to their trust policies.">
+        <Header variant="h1" description="Migrate SAML-federated IAM roles to AAM. This tool discovers roles that trust your SAML identity provider, then updates their trust policies to add the AAM service principal — enabling AAM to assume those roles on behalf of your users. Choose ADD mode to keep the existing SAML trust alongside AAM, or REPLACE mode to remove the SAML trust entirely.">
           IAM Federation → AAM
         </Header>
       }
@@ -373,12 +381,128 @@ export default function IamFederation() {
           </SpaceBetween>
         </Container>
 
-        {/* Step 3 — migrate trust policies */}
+        {/* Step 3 — Entitlement mapping */}
         <Container
           header={
             <Header
               variant="h2"
-              description="Step 3 — update trust policies on selected roles to add the AAM service principal."
+              description="Step 3 — define how your IdP group names map to AAM entitlements. Provide group names (paste or upload a file) and establish the naming pattern. The parsed {role} value is matched to the federated roles discovered in Step 2."
+              counter={entitlementMappings.length ? `(${entitlementMappings.length} parsed)` : undefined}
+            >
+              Entitlement Mapping
+            </Header>
+          }
+        >
+          <SpaceBetween size="m">
+            <FormField
+              label="Group name pattern"
+              description="Define the format of your IdP group names using placeholders: {principal}, {account}, {role}. The {role} component will be matched to the IAM role names discovered in Step 2."
+              constraintText="Example: if your groups are named 'admins_123456789012_PowerUser', the pattern is '{principal}_{account}_{role}'"
+            >
+              <Input
+                value={groupPattern}
+                onChange={({ detail }) => setGroupPattern(detail.value)}
+                placeholder="{principal}_{account}_{role}"
+              />
+            </FormField>
+
+            <FormField
+              label="Group names"
+              description="Paste your IdP group names (one per line or comma-separated), or upload a text/CSV file."
+            >
+              <SpaceBetween size="xs">
+                <Textarea
+                  value={groupNamesRaw}
+                  onChange={({ detail }) => setGroupNamesRaw(detail.value)}
+                  placeholder={"admins_111111111111_PowerUser\ndevs_222222222222_ReadOnly\nengineers_111111111111_Admin"}
+                  rows={6}
+                />
+                <Button iconName="upload" onClick={() => {
+                  const input = document.createElement("input");
+                  input.type = "file";
+                  input.accept = ".csv,.txt";
+                  input.onchange = (e) => {
+                    const file = (e.target as HTMLInputElement).files?.[0];
+                    if (!file) return;
+                    const reader = new FileReader();
+                    reader.onload = (ev) => {
+                      const text = ev.target?.result as string;
+                      setGroupNamesRaw(text);
+                    };
+                    reader.readAsText(file);
+                  };
+                  input.click();
+                }}>Upload file</Button>
+              </SpaceBetween>
+            </FormField>
+
+            <Button variant="primary" onClick={() => {
+              // Parse group names using the pattern
+              const groups = groupNamesRaw.split(/[\n,]+/).map((g) => g.trim()).filter(Boolean);
+              // Build a regex from the pattern — detect separator from pattern
+              const escaped = groupPattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              const regexStr = escaped
+                .replace("\\{principal\\}", "(?<principal>.+?)")
+                .replace("\\{account\\}", "(?<account>\\d+)")
+                .replace("\\{role\\}", "(?<role>.+)");
+              const regex = new RegExp(`^${regexStr}$`);
+              const parsed = groups.map((g) => {
+                const match = g.match(regex);
+                if (match?.groups) {
+                  const roleParsed = match.groups.role || "";
+                  // Match to discovered federated roles from Step 2
+                  const matchedRole = roles.find((r) => r.role_name === roleParsed || r.role_name.toLowerCase() === roleParsed.toLowerCase());
+                  return {
+                    group: g,
+                    principal: match.groups.principal || "",
+                    account: match.groups.account || "",
+                    role: roleParsed,
+                    matchedRoleArn: matchedRole?.role_arn || "",
+                    matchedRoleName: matchedRole?.role_name || "(no match in Step 2)",
+                  };
+                }
+                return { group: g, principal: "(parse error)", account: "(parse error)", role: "(parse error)", matchedRoleArn: "", matchedRoleName: "(parse error)" };
+              });
+              setEntitlementMappings(parsed);
+            }}>
+              Parse group names
+            </Button>
+
+            {entitlementMappings.length > 0 && (
+              <SpaceBetween size="s">
+                {entitlementMappings.some((m) => m.matchedRoleName === "(no match in Step 2)") && (
+                  <Alert type="warning">
+                    Some parsed role names could not be matched to discovered federated roles from Step 2. Ensure the {"{role}"} component in your pattern matches the IAM role name exactly.
+                  </Alert>
+                )}
+                <Table
+                  variant="embedded"
+                  resizableColumns
+                  items={entitlementMappings}
+                  trackBy="group"
+                  columnDefinitions={[
+                    { id: "group", header: "Group Name", cell: (m) => m.group, minWidth: 200 },
+                    { id: "principal", header: "Principal", cell: (m) => m.principal, minWidth: 120 },
+                    { id: "account", header: "Account", cell: (m) => m.account, minWidth: 120 },
+                    { id: "role", header: "Parsed Role", cell: (m) => m.role, minWidth: 130 },
+                    { id: "matched", header: "Matched IAM Role", cell: (m) => (
+                      <StatusIndicator type={m.matchedRoleArn ? "success" : "warning"}>
+                        {m.matchedRoleName}
+                      </StatusIndicator>
+                    ), minWidth: 180 },
+                  ]}
+                />
+              </SpaceBetween>
+            )}
+          </SpaceBetween>
+        </Container>
+
+        {/* Step 4 — migrate trust policies */}
+        <Container
+          header={
+            <Header
+              variant="h2"
+              description="Step 4 — update trust policies on selected roles to add the AAM service principal."
               actions={
                 <Button iconName="download" onClick={handleExportResults} disabled={!migrateResults.length}>Export CSV</Button>
               }
@@ -424,10 +548,10 @@ export default function IamFederation() {
           </SpaceBetween>
         </Container>
 
-        {/* Step 4 — generate IaC templates */}
+        {/* Step 5 — generate IaC templates */}
         <Container
           header={
-            <Header variant="h2" description="Step 4 — generate CloudFormation and Terraform templates from the discovered roles.">
+            <Header variant="h2" description="Step 5 — generate CloudFormation and Terraform templates from the discovered roles.">
               Generate IaC
             </Header>
           }

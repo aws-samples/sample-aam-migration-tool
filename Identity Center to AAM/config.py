@@ -128,11 +128,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # Account targeting
     p.add_argument(
         "--account-scope",
-        choices=["single", "multi"],
+        choices=["single", "multi", "org"],
         default="single",
         help=(
-            "Run against a single account (the hub, using current credentials) "
-            "or multiple accounts (assume-role into each target). Default: single."
+            "Run against a single account (the hub, using current credentials), "
+            "multiple specified accounts (assume-role into each target), or the "
+            "entire organization (scans all provisioned accounts). Default: single."
         ),
     )
     p.add_argument(
@@ -441,9 +442,9 @@ def validate(cfg: Config) -> None:
         )
 
     # Account scope validation (Req 1.1, 1.6-1.9).
-    if cfg.account_scope not in ("single", "multi"):
+    if cfg.account_scope not in ("single", "multi", "org"):
         raise ConfigError(
-            f"--account-scope must be 'single' or 'multi', got {cfg.account_scope!r}"
+            f"--account-scope must be 'single', 'multi', or 'org', got {cfg.account_scope!r}"
         )
     if cfg.account_scope == "multi":
         # multi requires both target account IDs and an assume-role role name.

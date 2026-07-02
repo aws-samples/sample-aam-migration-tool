@@ -6,7 +6,7 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import Textarea from "@cloudscape-design/components/textarea";
 import { ProfileMultiSelect, ProfileSingleSelect, type MultiOption, type SelectOption } from "./ProfileSelect";
 
-export type OperatingMode = "single" | "multi";
+export type OperatingMode = "single" | "multi" | "org";
 export type AuthMethod = "profiles" | "assume_role";
 
 export interface AuthState {
@@ -56,7 +56,7 @@ export function AuthMethodSelect({ state, onChange, disabled, profileMode = "mul
     <SpaceBetween size="m">
       <FormField
         label="Operating mode"
-        description="Choose whether to target a single account or multiple accounts."
+        description="Choose whether to target a single account, multiple accounts, or the entire organization."
       >
         <RadioGroup
           value={state.operatingMode}
@@ -73,7 +73,14 @@ export function AuthMethodSelect({ state, onChange, disabled, profileMode = "mul
               value: "multi",
               label: "Multi-account",
               description:
-                "Operate against multiple accounts using named profiles or cross-account role assumption.",
+                "Operate against multiple specified accounts using named profiles or cross-account role assumption.",
+              disabled,
+            },
+            {
+              value: "org",
+              label: "Entire organization",
+              description:
+                "Scan all accounts provisioned in your Identity Center instance. This may take significantly longer and is subject to API rate limits in large organizations.",
               disabled,
             },
           ]}
@@ -86,6 +93,72 @@ export function AuthMethodSelect({ state, onChange, disabled, profileMode = "mul
           default profile, or instance metadata). Ensure these credentials have the
           necessary read permissions for the target account.
         </Alert>
+      ) : state.operatingMode === "org" ? (
+        <>
+          <Alert type="warning">
+            <b>Organization-wide scan.</b> This will query all accounts provisioned in your
+            Identity Center instance. In large organizations this may take significantly longer
+            and is subject to API rate limits. Consider using multi-account mode with specific
+            account IDs for faster, targeted scans.
+          </Alert>
+          <FormField
+            label="Account authentication"
+            description="Choose how target accounts are authenticated for role creation (generate-iac mode does not require this)."
+          >
+            <RadioGroup
+              value={state.authMethod}
+              onChange={({ detail }) => update({ authMethod: detail.value as AuthMethod })}
+              items={[
+                {
+                  value: "profiles",
+                  label: "AWS credential profiles",
+                  description: "Use a local named profile for the IdC management account.",
+                  disabled,
+                },
+                {
+                  value: "assume_role",
+                  label: "Assume a role across accounts",
+                  description:
+                    "Your default credentials perform the AssumeRole calls. "
+                    + "Your default credentials must have permission to call sts:AssumeRole for the specified role in each target account.",
+                  disabled,
+                },
+              ]}
+            />
+          </FormField>
+          {state.authMethod === "profiles" ? (
+            profileMode === "multi" ? (
+              <FormField
+                label="AWS profiles"
+                description="Profile for the IdC management/delegated-admin account."
+              >
+                <ProfileMultiSelect
+                  selected={state.profiles}
+                  onChange={(profiles) => update({ profiles })}
+                />
+              </FormField>
+            ) : (
+              <FormField label="AWS profile">
+                <ProfileSingleSelect
+                  selected={state.singleProfile}
+                  onChange={(singleProfile) => update({ singleProfile })}
+                />
+              </FormField>
+            )
+          ) : (
+            <FormField
+              label="Role name"
+              description="Name (not ARN) of the role to assume in each spoke account (for apply mode)."
+            >
+              <Input
+                value={state.roleName}
+                onChange={({ detail }) => update({ roleName: detail.value })}
+                placeholder="OrganizationAccountAccessRole"
+                disabled={disabled}
+              />
+            </FormField>
+          )}
+        </>
       ) : (
         <>
           <FormField
