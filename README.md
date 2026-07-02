@@ -84,12 +84,152 @@ The toolkit provides three integrated tools accessible from a single browser-bas
 | Prerequisite | Required for | Notes |
 |-------------|-------------|-------|
 | AWS credentials (local) | All tools | Environment variables, named profiles, or `aws login` |
-| IAM read permissions | Policy Analysis, IAM Fed discovery, IdC discovery | `iam:List*`, `iam:Get*`, `sts:GetCallerIdentity` |
-| IdC read permissions | IdC discovery | `sso:List*`, `sso:Describe*`, `sso:Get*`, `identitystore:Describe*` |
-| IAM write permissions | IAM Fed migration, IdC apply mode | `iam:UpdateAssumeRolePolicy` (Fed), `iam:CreateRole`, `iam:AttachRolePolicy`, `iam:PutRolePolicy` (IdC) |
+| Python 3.11+ | All tools | Required for the backend |
+| Node.js 18+ | Frontend build | Required for the Cloudscape UI |
+| Custom boto3 wheels | AAM entitlement creation (apply mode) | Preview SDK — included in repo root. Not needed for generate-iac mode. |
 | AAM application | IdC entitlements | Create this manually before using the tool. The tool never creates applications. |
-| Custom boto3 wheels | AAM entitlement creation (apply mode) | Preview SDK — see installation below. Not needed for generate-iac mode. |
-| Cross-account role | Multi-account scanning | A role in each target account that your credentials can assume |
+| Cross-account role | Multi-account scanning/apply | A role in each target account that your credentials can assume |
+
+---
+
+## IAM Permissions Required
+
+### All tools (base)
+
+```
+sts:GetCallerIdentity
+sts:AssumeRole
+```
+
+### Policy Analysis
+
+```
+# Global services
+s3:ListAllMyBuckets
+s3:GetBucketPolicy
+s3:ListDirectoryBuckets
+iam:ListRoles
+iam:GetRole
+organizations:ListPolicies
+organizations:DescribePolicy
+organizations:DescribeOrganization
+acm-pca:ListCertificateAuthorities
+acm-pca:GetPolicy
+serverlessrepo:ListApplications
+serverlessrepo:GetApplicationPolicy
+
+# Regional services
+ec2:DescribeRegions
+ec2:DescribeVpcEndpoints
+apigateway:GET (GetRestApis, GetRestApi)
+backup:ListBackupVaults
+backup:GetBackupVaultAccessPolicy
+cloudtrail:ListEventDataStores
+cloudtrail:ListChannels
+cloudtrail:ListDashboards
+cloudtrail:GetResourcePolicy
+logs:DescribeResourcePolicies
+codeartifact:ListDomains
+codeartifact:GetDomainPermissionsPolicy
+codeartifact:ListRepositoriesInDomain
+codeartifact:GetRepositoryPermissionsPolicy
+codebuild:ListProjects
+codebuild:GetResourcePolicy
+dynamodb:ListTables
+dynamodb:GetResourcePolicy
+entityresolution:ListIdMappingWorkflows
+entityresolution:ListIdNamespaces
+entityresolution:ListMatchingWorkflows
+entityresolution:ListSchemaMapping
+entityresolution:GetPolicy
+events:ListEventBuses
+events:DescribeEventBus
+schemas:ListRegistries
+schemas:GetResourcePolicy
+glue:GetResourcePolicy
+glue:GetResourcePolicies
+kms:ListKeys
+kms:GetKeyPolicy
+kinesis:ListStreams
+kinesis:GetResourcePolicy
+lambda:ListFunctions
+lambda:GetPolicy
+lambda:ListLayers
+lambda:ListLayerVersions
+lambda:GetLayerVersionPolicy
+lexv2-models:ListBots
+lexv2-models:DescribeResourcePolicy
+opensearch:ListDomainNames
+opensearch:DescribeDomain
+opensearchserverless:ListAccessPolicies
+opensearchserverless:GetAccessPolicy
+s3tables:ListTableBuckets
+s3tables:GetTableBucketPolicy
+secretsmanager:ListSecrets
+secretsmanager:GetResourcePolicy
+ses:ListIdentityPolicies
+ses:GetIdentityPolicies
+sesv2:ListEmailIdentities
+sns:ListTopics
+sns:GetTopicAttributes
+sqs:ListQueues
+sqs:GetQueueAttributes
+ecr:DescribeRepositories
+ecr:GetRepositoryPolicy
+efs:DescribeFileSystems
+efs:DescribeFileSystemPolicy
+redshift-serverless:ListNamespaces
+redshift-serverless:GetNamespace
+rekognition:ListDatasets
+rekognition:DescribeDataset
+```
+
+### IAM Federation → AAM
+
+```
+# Discovery (read-only)
+iam:ListSAMLProviders
+iam:ListRoles
+iam:GetRole
+iam:ListAttachedRolePolicies
+iam:ListRolePolicies
+
+# Migration (write)
+iam:UpdateAssumeRolePolicy
+```
+
+### IdC → AAM
+
+```
+# Discovery (read-only)
+sso:ListInstances
+sso:ListPermissionSets
+sso:ListPermissionSetsProvisionedToAccount
+sso:DescribePermissionSet
+sso:GetInlinePolicyForPermissionSet
+sso:GetPermissionsBoundaryForPermissionSet
+sso:ListManagedPoliciesInPermissionSet
+sso:ListCustomerManagedPolicyReferencesInPermissionSet
+sso:ListAccountsForProvisionedPermissionSet
+sso:ListAccountAssignments
+identitystore:DescribeUser
+identitystore:DescribeGroup
+
+# Apply mode — role creation (write)
+iam:CreateRole
+iam:AttachRolePolicy
+iam:PutRolePolicy
+iam:PutRolePermissionsBoundary
+iam:TagRole
+iam:CreatePolicy
+iam:GetRole
+iam:GetPolicy
+
+# Apply mode — AAM entitlements (write)
+account-access:CreateEntitlement
+account-access:ListEntitlements
+account-access:GetApplication
+```
 
 ---
 
