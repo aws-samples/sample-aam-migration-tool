@@ -356,8 +356,8 @@ class InventoryModule:
             # Single-account: use the hub account ID as the sole target.
             target_account_ids = [self.hub.account_id]
         elif account_scope == "multi":
-            # Multi-account: use the explicit list of account IDs from config.
-            target_account_ids = list(self.cfg.account_ids)
+            # Multi-account: use target_account_ids if specified, fall back to account_ids.
+            target_account_ids = list(self.cfg.target_account_ids or self.cfg.account_ids)
 
         # ── Determine permission sets to describe ────────────────────────────
         if account_scope in ("single", "multi"):

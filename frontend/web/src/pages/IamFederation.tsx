@@ -84,6 +84,8 @@ export default function IamFederation() {
   const [migrateMode, setMigrateMode] = useState<MigrateMode>("ADD");
   const [migrating, setMigrating] = useState(false);
   const [migrateResults, setMigrateResults] = useState<MigrateResult[]>([]);
+  const [aamAppArn, setAamAppArn] = useState("");
+  const [entitlementResults, setEntitlementResults] = useState<{ group: string; principal: string; account: string; role: string; role_arn: string; status: string; error?: string }[]>([]);
 
   // Step 4: IaC
   const [iacLoading, setIacLoading] = useState(false);
@@ -186,17 +188,28 @@ export default function IamFederation() {
     }
   }
 
-  // ─── Step 3: Migrate ────────────────────────────────────────────────────────
+  // ─── Step 4: Migrate ────────────────────────────────────────────────────────
   async function runMigration() {
-    setError(null); setMigrating(true); setMigrateResults([]);
+    setError(null); setMigrating(true); setMigrateResults([]); setEntitlementResults([]);
     try {
-      const res = await api.iamMigrate({
+      const payload: Record<string, unknown> = {
         ...authPayload(),
         role_arns: selectedRoles.map((r) => r.role_arn),
         mode: migrateMode,
         idp_arn: selectedIdp,
-      });
+      };
+      // Include entitlement mappings and AAM ARN if provided
+      if (aamAppArn.trim()) {
+        payload.aam_application_arn = aamAppArn.trim();
+      }
+      if (entitlementMappings.length > 0 && aamAppArn.trim()) {
+        payload.entitlement_mappings = entitlementMappings.filter((m) => m.matchedRoleArn);
+      }
+      const res = await api.iamMigrate(payload);
       setMigrateResults(res.results as MigrateResult[]);
+      if ((res as any).entitlement_results) {
+        setEntitlementResults((res as any).entitlement_results);
+      }
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -497,17 +510,17 @@ export default function IamFederation() {
           </SpaceBetween>
         </Container>
 
-        {/* Step 4 — migrate trust policies */}
+        {/* Step 4 — migrate trust policies + create entitlements */}
         <Container
           header={
             <Header
               variant="h2"
-              description="Step 4 — update trust policies on selected roles to add the AAM service principal."
+              description="Step 4 — update trust policies on selected roles to add the AAM service principal, then create AAM entitlements from the mappings defined in Step 3. If no entitlements are provided, only the trust policy is updated."
               actions={
                 <Button iconName="download" onClick={handleExportResults} disabled={!migrateResults.length}>Export CSV</Button>
               }
             >
-              Migrate
+              Migrate &amp; Create Entitlements
             </Header>
           }
         >
@@ -520,30 +533,85 @@ export default function IamFederation() {
                 { value: "REPLACE", label: "REPLACE", description: "Remove the SAML trust statement, replace with the new AAM statement." },
               ]}
             />
+
+            <FormField
+              label="AAM Application ARN"
+              description="Required for entitlement creation. If left empty, only trust policies will be updated (no entitlements created)."
+            >
+              <Input
+                value={aamAppArn}
+                onChange={({ detail }) => setAamAppArn(detail.value)}
+                placeholder="arn:aws:account-access:us-west-2:123456789012:application/app-id"
+              />
+            </FormField>
+
+            {entitlementMappings.length > 0 && aamAppArn.trim() && (
+              <Alert type="info">
+                <b>{entitlementMappings.filter((m) => m.matchedRoleArn).length}</b> entitlement(s) will be created after trust policy migration (from Step 3 mappings with matched roles).
+              </Alert>
+            )}
+            {!aamAppArn.trim() && (
+              <Alert type="info">
+                No AAM application ARN provided. Only trust policies will be updated — no entitlements will be created.
+              </Alert>
+            )}
+
             <Button variant="primary" loading={migrating} disabled={!selectedRoles.length} onClick={runMigration}>
-              Migrate selected roles ({selectedRoles.length})
+              {aamAppArn.trim() && entitlementMappings.filter((m) => m.matchedRoleArn).length > 0
+                ? `Migrate ${selectedRoles.length} role(s) + create ${entitlementMappings.filter((m) => m.matchedRoleArn).length} entitlement(s)`
+                : `Migrate ${selectedRoles.length} role(s)`}
             </Button>
 
             {migrateResults.length > 0 && (
-              <Table
-                variant="embedded"
-                resizableColumns
-                items={migrateResults}
-                trackBy="role_arn"
-                columnDefinitions={[
-                  { id: "role", header: "Role", cell: (r) => r.role_name, minWidth: 150 },
-                  { id: "arn", header: "ARN", cell: (r) => r.role_arn, minWidth: 200 },
-                  {
-                    id: "status", header: "Status", minWidth: 100,
-                    cell: (r) => (
-                      <StatusIndicator type={r.status === "success" ? "success" : r.status === "skipped" ? "info" : "error"}>
-                        {r.status}
-                      </StatusIndicator>
-                    ),
-                  },
-                  { id: "detail", header: "Detail", cell: (r) => r.error || r.reason || r.mode || "", minWidth: 150 },
-                ]}
-              />
+              <SpaceBetween size="s">
+                <Header variant="h3">Trust Policy Results</Header>
+                <Table
+                  variant="embedded"
+                  resizableColumns
+                  items={migrateResults}
+                  trackBy="role_arn"
+                  columnDefinitions={[
+                    { id: "role", header: "Role", cell: (r) => r.role_name, minWidth: 150 },
+                    { id: "arn", header: "ARN", cell: (r) => r.role_arn, minWidth: 200 },
+                    {
+                      id: "status", header: "Status", minWidth: 100,
+                      cell: (r) => (
+                        <StatusIndicator type={r.status === "success" ? "success" : r.status === "skipped" ? "info" : "error"}>
+                          {r.status}
+                        </StatusIndicator>
+                      ),
+                    },
+                    { id: "detail", header: "Detail", cell: (r) => r.error || r.reason || r.mode || "No errors", minWidth: 150 },
+                  ]}
+                />
+              </SpaceBetween>
+            )}
+
+            {entitlementResults.length > 0 && (
+              <SpaceBetween size="s">
+                <Header variant="h3">Entitlement Results</Header>
+                <Table
+                  variant="embedded"
+                  resizableColumns
+                  items={entitlementResults}
+                  trackBy="group"
+                  columnDefinitions={[
+                    { id: "group", header: "Group", cell: (e) => e.group, minWidth: 180 },
+                    { id: "principal", header: "Principal", cell: (e) => e.principal, minWidth: 120 },
+                    { id: "account", header: "Account", cell: (e) => e.account, minWidth: 120 },
+                    { id: "role", header: "Role", cell: (e) => e.role, minWidth: 130 },
+                    {
+                      id: "status", header: "Status", minWidth: 110,
+                      cell: (e) => (
+                        <StatusIndicator type={e.status === "created" ? "success" : e.status === "already exists" ? "info" : e.status === "skipped" ? "stopped" : "error"}>
+                          {e.status}
+                        </StatusIndicator>
+                      ),
+                    },
+                    { id: "error", header: "Detail", cell: (e) => e.error || "No errors", minWidth: 150 },
+                  ]}
+                />
+              </SpaceBetween>
             )}
           </SpaceBetween>
         </Container>

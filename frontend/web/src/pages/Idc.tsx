@@ -80,6 +80,7 @@ export default function Idc() {
   const [applyProgress, setApplyProgress] = useState<JobProgress | null>(null);
   const [applyResults, setApplyResults] = useState<{ role_name: string; role_arn: string; account_id: string; permission_set: string; status: string; error?: string; entitlement_status?: string }[]>([]);
   const applyPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [applyCreds, setApplyCreds] = useState<"same" | "different">("same");
 
   // Migration plan (editable role name mapping)
   const [roleMappings, setRoleMappings] = useState<{ key: string; psArn: string; psName: string; roleName: string; principal: string; accountId: string }[]>([]);
@@ -128,7 +129,21 @@ export default function Idc() {
 
   function applyPayload(): Record<string, unknown> {
     const base = discoverPayload();
-    return { ...base, role_name_template: "AAM-{name}", role_path: rolePath };
+    const payload: Record<string, unknown> = { ...base, role_name_template: "AAM-{name}", role_path: rolePath };
+
+    // For single-account with "different" credentials, override auth
+    if (accountScope === "single" && applyCreds === "different") {
+      if (auth.authMethod === "assume_role") {
+        payload.auth_method = "assume_role";
+        payload.role_name = auth.roleName.trim();
+        payload.account_ids = parseAccountIds(targetAccountIds);
+      } else {
+        payload.auth_method = "profiles";
+        payload.profiles = auth.profiles.map((p) => p.value);
+      }
+    }
+    // For multi/org, the auth is already set in discoverPayload from the UI state
+    return payload;
   }
 
   // Filter assignments based on selected permission sets
@@ -708,23 +723,57 @@ export default function Idc() {
                     Existing roles with the same name will be skipped (idempotent).
                   </Alert>
                   {accountScope !== "single" && (
-                    <Container header={<Header variant="h3" description="Credentials for creating roles in target accounts. Since changes span multiple accounts, specify how to authenticate into each.">Apply Credentials</Header>}>
+                    <Container header={<Header variant="h3" description="Credentials for creating roles in target accounts. Since changes span multiple accounts, specify how to authenticate into each.">Target Account Credentials</Header>}>
                       <SpaceBetween size="m">
                         <RadioGroup
                           value={auth.authMethod}
                           onChange={({ detail }) => setAuth({ ...auth, authMethod: detail.value as "profiles" | "assume_role" })}
                           items={[
-                            { value: "profiles", label: "AWS credential profiles", description: "Use a named profile for each target account.", disabled: applying },
+                            { value: "profiles", label: "AWS credential profiles", description: "Use a named profile for each target account. The profile's account is resolved automatically via GetCallerIdentity.", disabled: applying },
                             { value: "assume_role", label: "Assume a common role", description: "Assume a single role name in each target account using your default credentials.", disabled: applying },
                           ]}
                         />
                         {auth.authMethod === "profiles" ? (
-                          <FormField label="AWS profiles" description="One or more profiles — each corresponding to a target account.">
+                          <FormField label="AWS profiles" description="One or more profiles — each will be resolved to its account ID automatically.">
                             <ProfileMultiSelect selected={auth.profiles} onChange={(profiles) => setAuth({ ...auth, profiles })} />
                           </FormField>
                         ) : (
                           <FormField label="Role name" description="Name (not ARN) of the role to assume in each target account. Your default credentials must have sts:AssumeRole permission.">
                             <Input value={auth.roleName} onChange={({ detail }) => setAuth({ ...auth, roleName: detail.value })} placeholder="OrganizationAccountAccessRole" disabled={applying} />
+                          </FormField>
+                        )}
+                      </SpaceBetween>
+                    </Container>
+                  )}
+                  {accountScope === "single" && (
+                    <Container header={<Header variant="h3" description="Credentials for creating roles in the target account.">Target Account Credentials</Header>}>
+                      <SpaceBetween size="m">
+                        <RadioGroup
+                          value={applyCreds}
+                          onChange={({ detail }) => setApplyCreds(detail.value as "same" | "different")}
+                          items={[
+                            { value: "same", label: "Use same credentials", description: "Use the same credentials used for IdC discovery (your default credential chain).", disabled: applying },
+                            { value: "different", label: "Specify different credentials", description: "Use a different profile or role for creating roles in the target account.", disabled: applying },
+                          ]}
+                        />
+                        {applyCreds === "different" && (
+                          <RadioGroup
+                            value={auth.authMethod}
+                            onChange={({ detail }) => setAuth({ ...auth, authMethod: detail.value as "profiles" | "assume_role" })}
+                            items={[
+                              { value: "profiles", label: "AWS credential profile", disabled: applying },
+                              { value: "assume_role", label: "Assume a role", disabled: applying },
+                            ]}
+                          />
+                        )}
+                        {applyCreds === "different" && auth.authMethod === "profiles" && (
+                          <FormField label="AWS profile" description="Profile with permissions to create roles in the target account.">
+                            <ProfileMultiSelect selected={auth.profiles} onChange={(profiles) => setAuth({ ...auth, profiles })} />
+                          </FormField>
+                        )}
+                        {applyCreds === "different" && auth.authMethod === "assume_role" && (
+                          <FormField label="Role name" description="Role to assume in the target account.">
+                            <Input value={auth.roleName} onChange={({ detail }) => setAuth({ ...auth, roleName: detail.value })} placeholder="AdminRole" disabled={applying} />
                           </FormField>
                         )}
                       </SpaceBetween>

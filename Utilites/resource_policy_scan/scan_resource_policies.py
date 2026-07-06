@@ -93,7 +93,7 @@ def policy_text(obj) -> str:
     return str(obj)
 
 
-def check_policy(policy: str, resource_arn: str, service: str, search_terms: list[str]) -> dict | None:
+def check_policy(policy: str, resource_arn: str, service: str, search_terms: list[str], account_id: str = "") -> dict | None:
     count_resource()
     if not policy:
         return None
@@ -104,7 +104,7 @@ def check_policy(policy: str, resource_arn: str, service: str, search_terms: lis
             policy_obj = json.loads(policy)
         except (json.JSONDecodeError, TypeError):
             policy_obj = policy
-        return {"resource_arn": resource_arn, "service": service, "matched_terms": matched, "policy": policy_obj}
+        return {"resource_arn": resource_arn, "service": service, "matched_terms": matched, "policy": policy_obj, "account_id": account_id}
     return None
 
 
@@ -125,7 +125,7 @@ def paginate(client, method: str, key: str, **kwargs) -> list:
     return items
 
 
-def parallel_check(items, fetch_fn, arn_fn, service, terms):
+def parallel_check(items, fetch_fn, arn_fn, service, terms, account_id=""):
     """
     Fetch policies for a list of resources in parallel and check each one.
 
@@ -135,6 +135,7 @@ def parallel_check(items, fetch_fn, arn_fn, service, terms):
         arn_fn: Callable(item) -> resource ARN string.
         service: Service name for match results.
         terms: Search terms list.
+        account_id: Account ID to include in match results.
 
     Returns:
         List of match dicts.
@@ -143,7 +144,7 @@ def parallel_check(items, fetch_fn, arn_fn, service, terms):
 
     def _process(item):
         pol = fetch_fn(item)
-        return check_policy(policy_text(pol), arn_fn(item), service, terms)
+        return check_policy(policy_text(pol), arn_fn(item), service, terms, account_id)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(_process, item): item for item in items}
@@ -214,20 +215,29 @@ def scan_s3(session, account_id, terms):
         fetch_fn=lambda b: (safe(s3.get_bucket_policy, Bucket=b["Name"]) or {}).get("Policy"),
         arn_fn=lambda b: f"arn:aws:s3:::{b['Name']}",
         service="S3",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
-def scan_organizations(session, terms):
+def scan_organizations(session, account_id, terms):
     heading("Organizations (SCPs + RCPs)")
     matches = []
     org = session.client("organizations")
+
+    # Resolve org ID for proper ARN construction
+    org_id = "o-unknown"
+    try:
+        org_id = org.describe_organization()["Organization"]["Id"]
+    except Exception:
+        pass
+
     for ptype in ("SERVICE_CONTROL_POLICY", "RESOURCE_CONTROL_POLICY"):
-        label = "SCP" if "SERVICE" in ptype else "RCP"
+        policy_type_path = "service_control_policy" if "SERVICE" in ptype else "resource_control_policy"
         for p in paginate(org, "list_policies", "Policies", Filter=ptype):
             resp = safe(org.describe_policy, PolicyId=p["Id"])
             if resp:
-                hit = check_policy(policy_text(resp["Policy"].get("Content")), f"{label}:{p['Id']}", "Organizations", terms)
+                full_arn = f"arn:aws:organizations::{account_id}:policy/{org_id}/{policy_type_path}/{p['Id']}"
+                hit = check_policy(policy_text(resp["Policy"].get("Content")), full_arn, "Organizations", terms, account_id)
                 if hit:
                     matches.append(hit)
     return matches
@@ -241,7 +251,7 @@ def scan_iam_trust_policies(session, account_id, terms):
         fetch_fn=lambda role: role.get("AssumeRolePolicyDocument"),
         arn_fn=lambda role: f"arn:aws:iam::{account_id}:role/{role['RoleName']}",
         service="IAM",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -310,7 +320,7 @@ def scan_global_services(session, account_id, terms, management_account,
         elif scanner == scan_iam_trust_policies:
             matches.extend(scanner(session, account_id, terms))
         elif scanner == scan_organizations:
-            matches.extend(scanner(session, terms))
+            matches.extend(scanner(session, account_id, terms))
         elif scanner == scan_private_ca:
             matches.extend(scanner(session, terms))
         elif scanner == scan_serverless_repo:
@@ -336,7 +346,7 @@ def scan_api_gateway(session, region, account_id, terms):
         fetch_fn=lambda api: api.get("policy"),
         arn_fn=lambda api: f"arn:aws:apigateway:{region}::/restapis/{api['id']}",
         service="API Gateway",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -349,7 +359,7 @@ def scan_backup(session, region, account_id, terms):
         fetch_fn=lambda v: (safe(bk.get_backup_vault_access_policy, BackupVaultName=v["BackupVaultName"]) or {}).get("Policy"),
         arn_fn=lambda v: f"arn:aws:backup:{region}:{account_id}:backup-vault:{v['BackupVaultName']}",
         service="Backup",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -418,7 +428,7 @@ def scan_codebuild(session, region, account_id, terms):
         fetch_fn=lambda p: (safe(cb.get_resource_policy, resourceArn=f"arn:aws:codebuild:{region}:{account_id}:project/{p}") or {}).get("policy"),
         arn_fn=lambda p: f"arn:aws:codebuild:{region}:{account_id}:project/{p}",
         service="CodeBuild",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -431,7 +441,7 @@ def scan_dynamodb(session, region, account_id, terms):
         fetch_fn=lambda t: (safe(ddb.get_resource_policy, ResourceArn=f"arn:aws:dynamodb:{region}:{account_id}:table/{t}") or {}).get("Policy"),
         arn_fn=lambda t: f"arn:aws:dynamodb:{region}:{account_id}:table/{t}",
         service="DynamoDB",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -480,7 +490,7 @@ def scan_eventbridge_schemas(session, region, account_id, terms):
         fetch_fn=lambda reg: (safe(schemas.get_resource_policy, RegistryName=reg["RegistryName"]) or {}).get("Policy"),
         arn_fn=lambda reg: f"arn:aws:schemas:{region}:{account_id}:registry/{reg['RegistryName']}",
         service="EventBridge Schemas",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -510,7 +520,7 @@ def scan_kms(session, region, account_id, terms):
         fetch_fn=lambda k: (safe(kms.get_key_policy, KeyId=k["KeyId"], PolicyName="default") or {}).get("Policy"),
         arn_fn=lambda k: f"arn:aws:kms:{region}:{account_id}:key/{k['KeyId']}",
         service="KMS",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -523,7 +533,7 @@ def scan_kinesis(session, region, account_id, terms):
         fetch_fn=lambda s: (safe(kinesis.get_resource_policy, ResourceARN=s["StreamARN"]) or {}).get("Policy"),
         arn_fn=lambda s: s["StreamARN"],
         service="Kinesis",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -536,7 +546,7 @@ def scan_lambda(session, region, account_id, terms):
         fetch_fn=lambda fn: (safe(lam.get_policy, FunctionName=fn["FunctionName"]) or {}).get("Policy"),
         arn_fn=lambda fn: f"arn:aws:lambda:{region}:{account_id}:function:{fn['FunctionName']}",
         service="Lambda",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
     # Also check layer version policies
     layers = paginate(lam, "list_layers", "Layers")
@@ -550,7 +560,7 @@ def scan_lambda(session, region, account_id, terms):
         fetch_fn=lambda lv: (safe(lam.get_layer_version_policy, LayerName=lv[0], VersionNumber=lv[1]) or {}).get("Policy"),
         arn_fn=lambda lv: f"arn:aws:lambda:{region}:{account_id}:layer:{lv[0]}:{lv[1]}",
         service="Lambda",
-        terms=terms,
+        terms=terms, account_id=account_id,
     ))
     return matches
 
@@ -564,7 +574,7 @@ def scan_lex(session, region, account_id, terms):
         fetch_fn=lambda bot: (safe(lex.describe_resource_policy, resourceArn=f"arn:aws:lex:{region}:{account_id}:bot/{bot['botId']}") or {}).get("policy"),
         arn_fn=lambda bot: f"arn:aws:lex:{region}:{account_id}:bot/{bot['botId']}",
         service="Lex V2",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -578,7 +588,7 @@ def scan_opensearch(session, region, account_id, terms):
         fetch_fn=lambda d: (safe(os_client.describe_domain, DomainName=d["DomainName"]) or {}).get("DomainStatus", {}).get("AccessPolicies"),
         arn_fn=lambda d: f"arn:aws:es:{region}:{account_id}:domain/{d['DomainName']}",
         service="OpenSearch",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -620,7 +630,7 @@ def scan_s3_express(session, region, account_id, terms):
         fetch_fn=lambda b: (safe(s3.get_bucket_policy, Bucket=b["Name"]) or {}).get("Policy"),
         arn_fn=lambda b: f"arn:aws:s3express:{region}:{account_id}:bucket/{b['Name']}",
         service="S3 Express",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -659,7 +669,7 @@ def scan_secrets_manager(session, region, account_id, terms):
         fetch_fn=lambda s: (safe(sm.get_resource_policy, SecretId=s["ARN"]) or {}).get("ResourcePolicy"),
         arn_fn=lambda s: s["ARN"],
         service="Secrets Manager",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -691,7 +701,7 @@ def scan_sns(session, region, account_id, terms):
         fetch_fn=lambda t: (safe(sns.get_topic_attributes, TopicArn=t["TopicArn"]) or {}).get("Attributes", {}).get("Policy"),
         arn_fn=lambda t: t["TopicArn"],
         service="SNS",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -728,7 +738,7 @@ def scan_ecr(session, region, account_id, terms):
         fetch_fn=lambda r: (safe(ecr.get_repository_policy, repositoryName=r["repositoryName"]) or {}).get("policyText"),
         arn_fn=lambda r: f"arn:aws:ecr:{region}:{account_id}:repository/{r['repositoryName']}",
         service="ECR",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -741,7 +751,7 @@ def scan_efs(session, region, account_id, terms):
         fetch_fn=lambda fs: (safe(efs.describe_file_system_policy, FileSystemId=fs["FileSystemId"]) or {}).get("Policy"),
         arn_fn=lambda fs: f"arn:aws:elasticfilesystem:{region}:{account_id}:file-system/{fs['FileSystemId']}",
         service="EFS",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 
@@ -785,7 +795,7 @@ def scan_vpc_endpoints(session, region, account_id, terms):
         fetch_fn=lambda ep: ep.get("PolicyDocument"),
         arn_fn=lambda ep: f"arn:aws:ec2:{region}:{account_id}:vpc-endpoint/{ep['VpcEndpointId']}",
         service="VPC Endpoints",
-        terms=terms,
+        terms=terms, account_id=account_id,
     )
 
 

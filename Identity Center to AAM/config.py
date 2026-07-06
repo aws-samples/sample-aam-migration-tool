@@ -41,8 +41,9 @@ _OUT_OF_SCOPE_REDIRECTS = {
 @dataclass(frozen=True)
 class Config:
     # Account targeting
-    account_scope: str  # "single" | "multi"
+    account_scope: str  # "single" | "multi" | "org"
     account_ids: tuple[str, ...]
+    target_account_ids: tuple[str, ...]  # Filters discovery scope (separate from assume-role targets)
     role_name: str | None
     # Mode
     auto_approve: bool
@@ -138,7 +139,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--account-ids",
-        help="Comma-separated list of target AWS account IDs (required for --account-scope multi).",
+        help=(
+            "Comma-separated AWS account IDs for role creation (assume-role targets). "
+            "Required for --account-scope multi when creating roles in spoke accounts."
+        ),
+    )
+    p.add_argument(
+        "--target-account-ids",
+        help=(
+            "Comma-separated account IDs to filter discovery scope. Only permission "
+            "sets and assignments for these accounts will be inventoried. "
+            "Defaults to --account-ids if not specified. For single-account scope, "
+            "defaults to the hub account."
+        ),
     )
     p.add_argument(
         "--role-name",
@@ -365,6 +378,7 @@ def parse_args(argv: Sequence[str]) -> Config:
     cfg = Config(
         account_scope=ns.account_scope,
         account_ids=tuple(_split_csv(ns.account_ids)),
+        target_account_ids=tuple(_split_csv(getattr(ns, "target_account_ids", None))),
         role_name=ns.role_name,
         auto_approve=bool(ns.auto_approve),
         role_creation_mode=ns.role_creation_mode,

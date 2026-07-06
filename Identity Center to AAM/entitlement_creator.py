@@ -61,11 +61,13 @@ class EntitlementCreator:
                 "region_name": getattr(cfg, "aam_region", None) or cfg.region,
                 "config": boto_config(cfg.workers),
             }
-            # AAM is a preview service; allow overriding the endpoint since the
-            # default account-access.<region>.amazonaws.com may not resolve.
-            # Preview endpoints look like account-access-preview.<region>.api.aws.
-            if getattr(cfg, "aam_endpoint_url", None):
-                client_kwargs["endpoint_url"] = cfg.aam_endpoint_url
+            # AAM is in preview — the GA endpoint doesn't exist yet.
+            # Default to the preview endpoint; remove this once GA lands.
+            aam_endpoint = getattr(cfg, "aam_endpoint_url", None)
+            if not aam_endpoint:
+                aam_region = client_kwargs["region_name"]
+                aam_endpoint = f"https://account-access-preview.{aam_region}.api.aws"
+            client_kwargs["endpoint_url"] = aam_endpoint
             aam_client = hub.session.client("accountaccess", **client_kwargs)
         self.aam = aam_client
 

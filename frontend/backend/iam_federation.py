@@ -20,6 +20,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from threading import Lock
 from typing import Callable, Optional
 
 from . import cache, config
@@ -32,6 +33,8 @@ _EVAL_PATH = os.path.join(_SCRIPT_DIR, "AAM_role_evaluation.py")
 _IAC_PATH = os.path.join(_SCRIPT_DIR, "generate_iac_templates.py")
 
 ProgressCb = Callable[[dict], None]
+
+MAX_WORKERS = 5
 
 
 def _load_eval():
@@ -185,17 +188,15 @@ def discover_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> di
             roles_total += len(role_names)
             emit(f"Scanning {len(role_names)} roles in {label} ({account_id})", f"Listing roles in {account_id}")
 
-            # Filter to SAML-federated roles
-            for role_name in role_names:
-                roles_scanned += 1
-                if roles_scanned % 10 == 0:
-                    emit(f"Scanning roles in {label} ({account_id})", f"Inspecting {role_name}")
+            # Filter to SAML-federated roles (parallel)
+            _scan_lock = Lock()
 
-                role = iam_resource.Role(role_name)
-                role = iam_resource.Role(role_name)
-                trust_doc = role.assume_role_policy_document
+            def inspect_role(rn: str) -> Optional[dict]:
+                nonlocal roles_scanned
+                r = iam_resource.Role(rn)
+                trust_doc = r.assume_role_policy_document
                 if not trust_doc:
-                    continue
+                    return None
 
                 for stmt in trust_doc.get("Statement", []):
                     principal = stmt.get("Principal", {})
@@ -203,10 +204,9 @@ def discover_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> di
                     if isinstance(federated, str):
                         federated = [federated]
                     if idp_arn in federated:
-                        # Get policies for this role
                         attached = []
                         att_paginator = iam_client.get_paginator("list_attached_role_policies")
-                        for att_page in att_paginator.paginate(RoleName=role_name):
+                        for att_page in att_paginator.paginate(RoleName=rn):
                             for p in att_page.get("AttachedPolicies", []):
                                 policy_type = (
                                     "AWS Managed"
@@ -221,14 +221,13 @@ def discover_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> di
 
                         inline = []
                         inl_paginator = iam_client.get_paginator("list_role_policies")
-                        for inl_page in inl_paginator.paginate(RoleName=role_name):
+                        for inl_page in inl_paginator.paginate(RoleName=rn):
                             for pname in inl_page.get("PolicyNames", []):
                                 inline.append({
                                     "policy_name": pname,
                                     "policy_type": "Inline",
                                 })
 
-                        # Trust policy summary
                         trust_summary = []
                         for s in trust_doc.get("Statement", []):
                             fed = s.get("Principal", {}).get("Federated", "")
@@ -238,17 +237,32 @@ def discover_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> di
                                 provider_name = fed.split("/")[-1] if "/" in fed else fed
                                 trust_summary.append(f"Federated:{provider_name}")
 
-                        all_roles.append({
-                            "role_name": role_name,
-                            "role_arn": f"arn:aws:iam::{account_id}:role/{role_name}",
+                        return {
+                            "role_name": rn,
+                            "role_arn": f"arn:aws:iam::{account_id}:role/{rn}",
                             "account_id": account_id,
                             "label": label,
                             "idp_arn": idp_arn,
                             "trust_policy_document": trust_doc,
                             "trust_summary": "; ".join(trust_summary),
                             "policies": attached + inline,
-                        })
-                        break  # found the statement, no need to check more
+                        }
+                return None
+
+            workers = int(params.get("workers", MAX_WORKERS))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(inspect_role, rn): rn for rn in role_names}
+                for fut in as_completed(futures):
+                    with _scan_lock:
+                        roles_scanned += 1
+                        if roles_scanned % 10 == 0:
+                            emit(f"Scanning roles in {label} ({account_id})", f"Inspected {roles_scanned}/{roles_total} roles")
+                    try:
+                        result = fut.result()
+                        if result:
+                            all_roles.append(result)
+                    except Exception:
+                        pass
 
         except Exception as exc:
             all_roles.append({
@@ -340,56 +354,48 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
             if r.get("role_arn"):
                 cached_roles[r["role_arn"]] = r
 
-    for role_arn in role_arns:
-        # Parse account from ARN: arn:aws:iam::ACCOUNT:role/NAME
+    _migrate_lock = Lock()
+    workers = int(params.get("workers", MAX_WORKERS))
+
+    def migrate_one_role(role_arn: str) -> dict:
+        nonlocal completed
         parts = role_arn.split(":")
         account_id = parts[4] if len(parts) >= 5 else ""
         role_name = role_arn.split("/")[-1]
 
         session = session_map.get(account_id)
         if not session:
-            # Fallback: use first session (single-account mode)
             if sessions:
                 session = sessions[0][1]
             else:
-                results.append({
+                return {
                     "role_arn": role_arn,
                     "role_name": role_name,
                     "status": "error",
                     "error": f"No session available for account {account_id}",
                     "timestamp": _now(),
-                })
-                completed += 1
-                emit(f"Failed {role_name}")
-                continue
+                }
 
         try:
-            iam_client = session.client("iam")
+            iam_cl = session.client("iam")
 
-            # Get current trust policy
-            role_resp = iam_client.get_role(RoleName=role_name)
+            role_resp = iam_cl.get_role(RoleName=role_name)
             trust_doc = role_resp["Role"]["AssumeRolePolicyDocument"]
 
-            # Check if already migrated
             existing_sids = {s.get("Sid") for s in trust_doc.get("Statement", [])}
             if NEW_TRUST_STATEMENT["Sid"] in existing_sids:
-                results.append({
+                return {
                     "role_arn": role_arn,
                     "role_name": role_name,
                     "status": "skipped",
                     "reason": "Already has AAM trust statement",
                     "timestamp": _now(),
-                })
-                completed += 1
-                emit(f"Skipped {role_name} (already migrated)")
-                continue
+                }
 
-            # Build new trust policy
             if mode == "ADD":
                 new_doc = dict(trust_doc)
                 new_doc["Statement"] = list(trust_doc["Statement"]) + [NEW_TRUST_STATEMENT]
             else:
-                # REPLACE: remove IDP statements, add new
                 kept = []
                 for stmt in trust_doc["Statement"]:
                     federated = stmt.get("Principal", {}).get("Federated", "")
@@ -401,33 +407,37 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
                 new_doc = dict(trust_doc)
                 new_doc["Statement"] = kept
 
-            # Update the trust policy
-            iam_client.update_assume_role_policy(
+            iam_cl.update_assume_role_policy(
                 RoleName=role_name,
                 PolicyDocument=json.dumps(new_doc),
             )
 
-            results.append({
+            return {
                 "role_arn": role_arn,
                 "role_name": role_name,
                 "status": "success",
                 "mode": mode,
                 "timestamp": _now(),
                 "previous_trust_policy": trust_doc,
-            })
-            completed += 1
-            emit(f"Migrated {role_name}")
+            }
 
         except Exception as exc:
-            results.append({
+            return {
                 "role_arn": role_arn,
                 "role_name": role_name,
                 "status": "error",
                 "error": str(exc),
                 "timestamp": _now(),
-            })
-            completed += 1
-            emit(f"Failed {role_name}")
+            }
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(migrate_one_role, arn): arn for arn in role_arns}
+        for fut in as_completed(futures):
+            result = fut.result()
+            results.append(result)
+            with _migrate_lock:
+                completed += 1
+                emit(f"{result['status'].title()}: {result['role_name']}")
 
     # Append to migration log
     log = cache.read_cache(config.IAM_FEDERATION_MIGRATION_LOG)
@@ -449,10 +459,108 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
     }
     cache.write_cache(config.IAM_FEDERATION_MIGRATION_LOG, log_payload)
 
+    # ── Phase 2: Create AAM entitlements (if mappings provided) ──────────────
+    # Uses the entitlement mappings from the UI's Step 3 (group pattern parsing).
+    # Each mapping has: principal (group/user name), account, role (matched to
+    # a federated role ARN). We create one entitlement per mapping.
+    entitlement_results: list[dict] = []
+    aam_application_arn = params.get("aam_application_arn")
+    entitlement_mappings = params.get("entitlement_mappings") or []
+
+    if aam_application_arn and entitlement_mappings:
+        sessions = _resolve_sessions(params)
+        # Use the first session (hub) for AAM calls
+        hub_session = sessions[0][1] if sessions else build_session(None)
+
+        aam_region = params.get("aam_region") or "us-east-1"
+        aam_endpoint_url = f"https://account-access-preview.{aam_region}.api.aws"
+
+        try:
+            aam_client = hub_session.client(
+                "accountaccess",
+                region_name=aam_region,
+                endpoint_url=aam_endpoint_url,
+            )
+        except Exception as exc:
+            for m in entitlement_mappings:
+                entitlement_results.append({
+                    "group": m.get("group", ""),
+                    "principal": m.get("principal", ""),
+                    "account": m.get("account", ""),
+                    "role": m.get("role", ""),
+                    "role_arn": m.get("matchedRoleArn", ""),
+                    "status": "error",
+                    "error": f"AAM client unavailable: {exc}",
+                })
+            aam_client = None
+
+        if aam_client:
+            for m in entitlement_mappings:
+                role_arn = m.get("matchedRoleArn", "")
+                principal_id = m.get("principal", "")
+                # Default to groupId; if user specifies principal_type, honor it
+                principal_type = m.get("principal_type", "GROUP")
+
+                if not role_arn:
+                    entitlement_results.append({
+                        "group": m.get("group", ""),
+                        "principal": principal_id,
+                        "account": m.get("account", ""),
+                        "role": m.get("role", ""),
+                        "role_arn": "",
+                        "status": "skipped",
+                        "error": "No matched role ARN",
+                    })
+                    continue
+
+                principal_block: dict = {}
+                if principal_type == "USER":
+                    principal_block["userId"] = principal_id
+                else:
+                    principal_block["groupId"] = principal_id
+
+                try:
+                    resp = aam_client.create_entitlement(
+                        applicationArn=aam_application_arn,
+                        entitlement={
+                            "principalRole": {
+                                "principal": {"identityCenter": principal_block},
+                                "roleArn": role_arn,
+                            }
+                        },
+                    )
+                    entitlement_results.append({
+                        "group": m.get("group", ""),
+                        "principal": principal_id,
+                        "account": m.get("account", ""),
+                        "role": m.get("role", ""),
+                        "role_arn": role_arn,
+                        "entitlement_id": resp.get("entitlementId", ""),
+                        "status": "created",
+                    })
+                except Exception as exc:
+                    error_str = str(exc)
+                    status = "already exists" if "Conflict" in error_str or "AlreadyExists" in error_str else "error"
+                    entitlement_results.append({
+                        "group": m.get("group", ""),
+                        "principal": principal_id,
+                        "account": m.get("account", ""),
+                        "role": m.get("role", ""),
+                        "role_arn": role_arn,
+                        "status": status,
+                        "error": error_str if status == "error" else "already exists",
+                    })
+
     return {
         "total": total,
         "results": results,
-        "summary": log_payload["last_run_summary"],
+        "entitlement_results": entitlement_results,
+        "summary": {
+            **log_payload["last_run_summary"],
+            "entitlements_total": len(entitlement_results),
+            "entitlements_created": len([e for e in entitlement_results if e["status"] == "created"]),
+            "entitlements_error": len([e for e in entitlement_results if e["status"] == "error"]),
+        },
     }
 
 

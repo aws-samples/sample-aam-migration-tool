@@ -15,7 +15,9 @@ import importlib.util
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from threading import Lock
 from typing import Callable, Optional
 
 from . import cache, config
@@ -26,6 +28,10 @@ from .aws_session import build_assumed_session, build_session
 _IDC_DIR = os.path.join(config.REPO_ROOT, "Identity Center to AAM")
 
 ProgressCb = Callable[[dict], None]
+
+# Default concurrency for parallel operations. Uses adaptive retry so throttle
+# responses are handled gracefully.
+MAX_WORKERS = 5
 
 
 def _add_idc_to_path():
@@ -147,14 +153,13 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
             ps_arns.extend(page.get("PermissionSets", []))
         emit(f"Found {len(ps_arns)} permission set(s)")
 
-    # ── Describe permission sets ─────────────────────────────────────────────
+    # ── Describe permission sets (parallel) ─────────────────────────────────
     permission_sets = []
     total_ps = len(ps_arns)
-    for i, ps_arn in enumerate(ps_arns):
-        if i % 5 == 0:
-            emit(f"Describing permission sets ({i}/{total_ps})",
-                 completed_units=i, total_units=total_ps, phase="describe")
+    _describe_lock = Lock()
+    _describe_done = [0]
 
+    def describe_one_ps(ps_arn: str) -> dict:
         try:
             desc_resp = sso_admin.describe_permission_set(
                 InstanceArn=instance_arn, PermissionSetArn=ps_arn
@@ -163,7 +168,6 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
         except Exception:
             ps = {"Name": ps_arn.rsplit("/", 1)[-1], "PermissionSetArn": ps_arn}
 
-        # Inline policy
         inline_policy = None
         try:
             inline_resp = sso_admin.get_inline_policy_for_permission_set(
@@ -174,7 +178,6 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
         except Exception:
             pass
 
-        # AWS managed policies
         aws_managed = []
         try:
             mp_pag = sso_admin.get_paginator("list_managed_policies_in_permission_set")
@@ -184,7 +187,6 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
         except Exception:
             pass
 
-        # Customer managed policy references
         cmp_refs = []
         try:
             cmp_pag = sso_admin.get_paginator("list_customer_managed_policy_references_in_permission_set")
@@ -194,7 +196,13 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
         except Exception:
             pass
 
-        permission_sets.append({
+        with _describe_lock:
+            _describe_done[0] += 1
+            if _describe_done[0] % 5 == 0 or _describe_done[0] == total_ps:
+                emit(f"Describing permission sets ({_describe_done[0]}/{total_ps})",
+                     completed_units=_describe_done[0], total_units=total_ps, phase="describe")
+
+        return {
             "arn": ps_arn,
             "name": ps.get("Name", ps_arn.rsplit("/", 1)[-1]),
             "description": ps.get("Description", ""),
@@ -202,19 +210,31 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
             "inline_policy": inline_policy,
             "aws_managed_policies": aws_managed,
             "customer_managed_policy_references": cmp_refs,
-        })
+        }
+
+    workers = int(params.get("workers", MAX_WORKERS))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(describe_one_ps, arn) for arn in ps_arns]
+        for fut in as_completed(futures):
+            try:
+                permission_sets.append(fut.result())
+            except Exception:
+                pass
 
     emit(f"Described {len(permission_sets)} permission set(s)", phase="assignments")
 
-    # ── List assignments ─────────────────────────────────────────────────────
+    # ── List assignments (parallel per permission set) ──────────────────────
     assignments = []
-    # Name resolution cache
+    _assign_lock = Lock()
+    _assign_done = [0]
     name_cache: dict = {}
+    _name_lock = Lock()
 
     def resolve_name(principal_type: str, principal_id: str) -> str:
         key = (principal_type, principal_id)
-        if key in name_cache:
-            return name_cache[key]
+        with _name_lock:
+            if key in name_cache:
+                return name_cache[key]
         try:
             if principal_type == "USER":
                 resp = identity_store.describe_user(IdentityStoreId=identity_store_id, UserId=principal_id)
@@ -224,15 +244,15 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
                 name = resp.get("DisplayName") or resp.get("GroupName") or principal_id
         except Exception:
             name = principal_id
-        name_cache[key] = name
+        with _name_lock:
+            name_cache[key] = name
         return name
 
-    for pi, ps_arn in enumerate(ps_arns):
-        if pi % 5 == 0:
-            emit(f"Fetching assignments ({pi}/{total_ps})",
-                 completed_units=pi, total_units=total_ps, phase="assignments")
+    # Build ps_name lookup for fast reference
+    ps_name_map = {ps["arn"]: ps["name"] for ps in permission_sets}
 
-        # Determine which accounts to query assignments for
+    def fetch_assignments_for_ps(ps_arn: str) -> list:
+        results = []
         if target_accounts is not None:
             accounts_for_ps = target_accounts
         else:
@@ -248,23 +268,34 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
             try:
                 asg_pag = sso_admin.get_paginator("list_account_assignments")
                 for page in asg_pag.paginate(
-                    InstanceArn=instance_arn,
-                    AccountId=acct,
-                    PermissionSetArn=ps_arn,
+                    InstanceArn=instance_arn, AccountId=acct, PermissionSetArn=ps_arn,
                 ):
                     for a in page.get("AccountAssignments", []):
                         principal_type = a["PrincipalType"]
                         principal_id = a["PrincipalId"]
-                        assignments.append({
+                        results.append({
                             "permission_set_arn": ps_arn,
-                            "permission_set_name": next(
-                                (p["name"] for p in permission_sets if p["arn"] == ps_arn), ""
-                            ),
+                            "permission_set_name": ps_name_map.get(ps_arn, ""),
                             "account_id": acct,
                             "principal_type": principal_type,
                             "principal_id": principal_id,
                             "principal_display_name": resolve_name(principal_type, principal_id),
                         })
+            except Exception:
+                pass
+
+        with _assign_lock:
+            _assign_done[0] += 1
+            if _assign_done[0] % 5 == 0 or _assign_done[0] == total_ps:
+                emit(f"Fetching assignments ({_assign_done[0]}/{total_ps})",
+                     completed_units=_assign_done[0], total_units=total_ps, phase="assignments")
+        return results
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(fetch_assignments_for_ps, arn) for arn in ps_arns]
+        for fut in as_completed(futures):
+            try:
+                assignments.extend(fut.result())
             except Exception:
                 pass
 
@@ -516,9 +547,22 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
             else:
                 account_sessions[acct] = session
     else:
-        # Single/profile mode — use the same session for all
+        # Profiles mode: resolve each profile to its account via GetCallerIdentity,
+        # then map account_id -> session. For single-account (no profiles), the hub
+        # session is used for all targets.
+        profiles = params.get("profiles") or []
+        if profiles:
+            for profile in profiles:
+                try:
+                    prof_session = build_session(profile)
+                    prof_account = prof_session.client("sts").get_caller_identity()["Account"]
+                    account_sessions[prof_account] = prof_session
+                except Exception:
+                    pass
+        # For any target accounts not covered by a profile, fall back to the hub session
         for acct in target_account_ids:
-            account_sessions[acct] = session
+            if acct not in account_sessions:
+                account_sessions[acct] = session
 
     # Build role_name map
     role_map: dict = {}
@@ -530,6 +574,7 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
     total = len(pairs)
     completed = 0
     results: list[dict] = []
+    workers = int(params.get("workers", MAX_WORKERS))
 
     trust_policy = json.dumps({
         "Version": "2012-10-17",
@@ -553,58 +598,52 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
     emit(f"Creating {total} role(s) across {len(target_account_ids)} account(s)")
 
     ps_by_arn = {ps["arn"]: ps for ps in permission_sets}
+    _apply_lock = Lock()
 
-    for ps_arn, account_id in pairs:
+    def create_one_role(pair: tuple) -> dict:
+        nonlocal completed
+        ps_arn, acct_id = pair
         role_name = role_map.get(ps_arn, "")
         ps = ps_by_arn.get(ps_arn)
-        acct_session = account_sessions.get(account_id)
+        acct_session = account_sessions.get(acct_id)
 
         if not role_name or not ps:
-            results.append({
+            return {
                 "role_name": role_name or "(unknown)",
                 "role_arn": "",
-                "account_id": account_id,
+                "account_id": acct_id,
                 "permission_set": ps["name"] if ps else ps_arn,
                 "status": "error",
                 "error": "missing role name or permission set data",
                 "timestamp": _now(),
-            })
-            completed += 1
-            emit(f"Skipped {role_name or ps_arn}")
-            continue
+            }
 
         if not acct_session:
-            results.append({
+            return {
                 "role_name": role_name,
                 "role_arn": "",
-                "account_id": account_id,
+                "account_id": acct_id,
                 "permission_set": ps["name"],
                 "status": "error",
-                "error": f"No session available for account {account_id}",
+                "error": f"No session available for account {acct_id}",
                 "timestamp": _now(),
-            })
-            completed += 1
-            emit(f"Failed {role_name} (no session)")
-            continue
+            }
 
         iam = acct_session.client("iam")
-        target_arn = f"arn:aws:iam::{account_id}:role{role_path}{role_name}"
+        target_arn = f"arn:aws:iam::{acct_id}:role{role_path}{role_name}"
 
         try:
             # Idempotency check
             try:
                 iam.get_role(RoleName=role_name)
-                results.append({
+                return {
                     "role_name": role_name,
                     "role_arn": target_arn,
-                    "account_id": account_id,
+                    "account_id": acct_id,
                     "permission_set": ps["name"],
                     "status": "already exists",
                     "timestamp": _now(),
-                })
-                completed += 1
-                emit(f"Already exists: {role_name}")
-                continue
+                }
             except Exception as e:
                 if "NoSuchEntity" not in str(e):
                     raise
@@ -629,7 +668,7 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
             # Attach CMP references
             for ref in ps.get("customer_managed_policy_references", []):
                 path = ref.get("path", "/")
-                cmp_arn = f"arn:aws:iam::{account_id}:policy{path}{ref['name']}"
+                cmp_arn = f"arn:aws:iam::{acct_id}:policy{path}{ref['name']}"
                 try:
                     iam.attach_role_policy(RoleName=role_name, PolicyArn=cmp_arn)
                 except Exception:
@@ -646,29 +685,34 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
                 except Exception:
                     pass
 
-            results.append({
+            return {
                 "role_name": role_name,
                 "role_arn": target_arn,
-                "account_id": account_id,
+                "account_id": acct_id,
                 "permission_set": ps["name"],
                 "status": "created",
                 "timestamp": _now(),
-            })
-            completed += 1
-            emit(f"Created {role_name}")
+            }
 
         except Exception as exc:
-            results.append({
+            return {
                 "role_name": role_name,
                 "role_arn": "",
-                "account_id": account_id,
+                "account_id": acct_id,
                 "permission_set": ps["name"],
                 "status": "error",
                 "error": str(exc),
                 "timestamp": _now(),
-            })
-            completed += 1
-            emit(f"Failed {role_name}")
+            }
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(create_one_role, pair): pair for pair in pairs}
+        for fut in as_completed(futures):
+            result = fut.result()
+            results.append(result)
+            with _apply_lock:
+                completed += 1
+                emit(f"{result['status'].title()}: {result['role_name']}")
 
     summary = {
         "total": total,
