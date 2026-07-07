@@ -26,9 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
-
-from credentials import assume_role
+from shared.credentials import assume_role
 
 MAX_WORKERS = 10
 

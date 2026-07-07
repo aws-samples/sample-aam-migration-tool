@@ -12,6 +12,9 @@ node_modules/
 dist/
 *.tsbuildinfo
 
+# ─── CDK ─────────────────────────────────────────────────────────────────────
+cdk.out/
+
 # ─── Local cache / runtime output ────────────────────────────────────────────
 # The console writes scan results, discovery dumps, and checkpoints here.
 frontend/cache/*

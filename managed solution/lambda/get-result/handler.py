@@ -13,10 +13,8 @@ import sys
 
 import boto3
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
-
-from credentials import get_caller_arn_from_event
-from dynamodb_helpers import get_job
+from shared.credentials import get_caller_arn_from_event
+from shared.dynamodb_helpers import get_job
 
 RESULTS_BUCKET = os.environ.get("RESULTS_BUCKET", "")
 s3_client = boto3.client("s3")

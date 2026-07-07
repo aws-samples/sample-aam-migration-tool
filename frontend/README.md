@@ -1,97 +1,206 @@
-# Truffle — Local Migration Console
+# Truffle — AAM Migration Console
 
-A locally-run web console for the Account Access Manager (AAM) migration tool.
-It uses the [Cloudscape Design System](https://cloudscape.design/) — the same
-design system the AWS Console is built from — so it looks and feels like a
-native AWS service console, while running entirely on your machine against your
-local AWS credential chain.
+A locally-run web console for migrating to AWS Account Access Manager (AAM).
+Built with the [Cloudscape Design System](https://cloudscape.design/) for an
+authentic AWS Console look and feel, running entirely on your machine.
 
-## Architecture
+---
 
-- **Backend** — a small Flask JSON API (`app.py` + `backend/`). The only web
-  dependency is Flask; boto3 is already required by the utilities.
-- **Frontend** — a Cloudscape + React app built with Vite (`web/`). Heavier to
-  install/build than hand-rolled HTML, but it delivers the authentic AWS
-  console look/feel and ships accessible, virtualized tables that stay
-  responsive on large permission-set / role lists. The production build is
-  static files served locally by Flask, so runtime stays light.
-- **Cache** — results (policy scans, permission-set dumps, federation configs)
-  are written to local files under `cache/` and re-read on load, per the design
-  tenets.
+## Prerequisites
 
-## Layout
+| Requirement | Version | Notes |
+|-------------|---------|-------|
+| Python | >= 3.11 | For the Flask backend |
+| Node.js | >= 18 | For building the React frontend |
+| npm | any recent | Comes with Node |
+| AWS CLI | v2 | For credential resolution and AAM commands |
+| AWS credentials | configured | SSO, profiles, or environment variables |
 
-```
-frontend/
-├── app.py                 # Flask entry point + JSON API + serves built UI
-├── requirements.txt
-├── backend/               # Python backend modules
-│   ├── config.py          # paths / cache locations
-│   ├── cache.py           # local-file cache helpers
-│   ├── aws_session.py     # credential-profile / session helpers
-│   ├── policy_analysis.py # WIRED to Utilites/resource_policy_scan
-│   ├── iam_federation.py  # SKELETON — to be implemented
-│   └── idc.py             # SKELETON — to be implemented
-├── web/                   # Cloudscape + React + Vite frontend (see web/README.md)
-│   └── src/pages/         # one page per tab
-└── cache/                 # local cache output (git-ignored)
-```
+### Custom boto3 SDK (required)
 
-## Feature status
+The tool uses a preview version of boto3/botocore that includes the AAM
+(`accountaccess`) service model. The `.whl` files are in the repo root and
+are installed automatically by `pip install -r requirements.txt`.
 
-| Tab | Status |
-|---|---|
-| Policy Analysis | **Wired** to `scan_resource_policies.py` (parallel accounts, background job with live progress, resumable via checkpoints) |
-| IAM Federation → AAM | Skeleton / UI outline only |
-| IdC → AAM | Skeleton / UI outline only |
-| Cache | View cache age/size/contents and clear entries |
+Once the AAM service launches publicly, the standard boto3 will work and
+these wheels can be removed.
 
-## Running
+---
 
-### 1. Backend (Flask API)
+## Quick Start
 
 ```bash
 cd frontend
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python3 app.py                      # http://127.0.0.1:5000
+./run.sh
 ```
 
-### 2. Frontend
+This handles everything: creates a virtualenv, installs dependencies, builds
+the React UI, and serves at **http://127.0.0.1:5000**.
 
-For development with hot reload (separate terminal):
+### Run Script Options
 
 ```bash
-cd frontend/web
-npm install
-npm run dev                         # http://127.0.0.1:5173  (proxies /api to Flask)
+./run.sh                       # Local mode (default)
+./run.sh --dev                 # Dev mode: Flask + Vite hot-reload
+./run.sh --rebuild             # Force frontend rebuild
+
+# Managed backend mode (requires deployed infrastructure)
+./run.sh --managed --endpoint https://<id>.execute-api.<region>.amazonaws.com/prod
+./run.sh --managed --endpoint URL --profile my-aws-profile
+./run.sh --managed --endpoint URL --region us-west-2
 ```
 
-To serve the built UI directly from Flask instead:
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--managed` | No | Use the managed AWS backend instead of local execution |
+| `--endpoint URL` | Yes (with `--managed`) | API Gateway endpoint from CDK deploy output |
+| `--region REGION` | No | AWS region for API signing (auto-detected from endpoint URL) |
+| `--profile PROFILE` | No | AWS profile for signing managed API requests |
+| `--dev` | No | Dev mode with Vite hot-reload on :5173 |
+| `--rebuild` | No | Force a fresh frontend build |
+
+Environment variables also work: `TRUFFLE_MODE`, `TRUFFLE_API_ENDPOINT`,
+`TRUFFLE_API_REGION`, `TRUFFLE_API_PROFILE`.
+
+---
+
+## Features
+
+### 1. Policy Analysis (Resource Policy Scanner)
+
+Scans resource policies across one or more AWS accounts looking for references
+to specific strings (e.g., an old SAML provider ARN you're migrating away from).
+
+**What you need to provide:**
+- **Search terms** — one or more strings to search for in resource policies
+- **Authentication** — choose between:
+  - *Local profiles* — select one or more AWS credential profiles
+  - *Assume role* — provide account IDs + a role name to assume in each
+- **Regions** — which regions to scan (default: all enabled regions)
+- **Services** — optionally filter to specific services (S3, SQS, KMS, etc.)
+- **Management account** — check this if scanning the Org management account (enables SCP/RCP scanning)
+
+### 2. IAM Federation → AAM
+
+Discovers IAM roles with SAML trust policies and migrates them to AAM.
+
+**Step 1: Discovery** — what you need:
+- **Authentication** — same options as Policy Analysis
+- **IDP ARN** — the SAML provider ARN to search for (e.g., `arn:aws:iam::123456789012:saml-provider/Okta`)
+
+**Step 2: Migration** — what you need:
+- **Mode** — `ADD` (keep existing trust, add AAM) or `REPLACE` (remove old SAML trust, add AAM)
+- **Role selection** — which discovered roles to migrate
+
+### 3. IdC → AAM
+
+Inventories Identity Center permission sets and assignments, then creates
+equivalent IAM roles with AAM trust policies and entitlements.
+
+**Step 1: Discovery** — what you need:
+- **Region** — the region where Identity Center is configured (check your IdC console)
+- **Account scope**:
+  - *Single* — scan one account's provisioned permission sets
+  - *Multi* — scan specific account IDs
+  - *Org* — scan all permission sets in the organization
+- **Target account IDs** — the management account or delegated admin account ID for IdC
+- **Authentication** — credentials with access to the IdC management/delegated admin account
+
+**Step 2: Apply** — what you need:
+- **AAM Application ARN** — required for creating entitlements. Get it with:
+  ```bash
+  aws account-access-preview list-applications --region <region>
+  ```
+  Copy the `applicationArn` from the output.
+- **Role path** — IAM path for created roles (default: `/aam/`)
+- **Permission set selection** — which permission sets to create roles for
+
+---
+
+## Important Notes
+
+### Identity Center Region
+
+Identity Center is a **single-region** service. You must provide the correct
+region where your IdC instance is configured. This is NOT necessarily
+`us-east-1`. Check the Identity Center console to find your region.
+
+### AAM Application ARN
+
+The AAM Application ARN is needed for creating entitlements (the mapping
+between IdC principals and IAM roles). To find it:
 
 ```bash
-cd frontend/web
-npm install
-npm run build                       # emits web/dist/
-# then open http://127.0.0.1:5000
+# Replace <region> with the region where AAM is configured
+aws account-access-preview list-applications --region <region>
 ```
 
-## Notes
+If no applications are listed, you need to create one first through the AAM
+console or API.
 
-- The console reads available profiles from your AWS config. Operations use
-  whatever credentials those profiles resolve to — prefer ReadOnly / least
-  privilege profiles for discovery and analysis.
-- **Scans run as background jobs.** `POST /api/policy-analysis/scan` returns a
-  `job_id`; the UI polls `GET /api/policy-analysis/status?job_id=…` (~1s) for a
-  progress bar and the final result. Accounts are scanned in parallel.
-- **Scans are resumable.** Each completed unit (per account, and per
-  account+region) is checkpointed under `cache/checkpoints/`, keyed by the scan
-  parameters. If a scan is interrupted (crash, server restart, a throttled
-  region), re-running the same scan skips the units that already finished.
-  Checkpoints older than 24h are treated as stale and re-scanned, and a
-  checkpoint is deleted once a scan completes fully — so a deliberate re-run
-  after success starts fresh.
-- Migration actions (trust-policy updates, role creation, CloudFormation
-  generation) are **not implemented yet**; those tabs render the intended
-  workflow only and the corresponding API endpoints return `501 Not Implemented`.
+### Credential Requirements
+
+| Operation | Minimum permissions needed |
+|-----------|--------------------------|
+| Policy Analysis (scan) | `ReadOnlyAccess` in target accounts |
+| IAM Federation (discover) | `iam:ListRoles`, `iam:GetRole`, `iam:ListAttachedRolePolicies`, `iam:ListRolePolicies` |
+| IAM Federation (migrate) | `iam:GetRole`, `iam:UpdateAssumeRolePolicy` |
+| IdC Discovery | `sso-admin:*`, `identitystore:Describe*`, `identitystore:List*` (from management/delegated admin account) |
+| IdC Apply (create roles) | `iam:CreateRole`, `iam:AttachRolePolicy`, `iam:PutRolePolicy`, `iam:TagRole` |
+| IdC Apply (entitlements) | `account-access-preview:CreateEntitlement` |
+
+### Local Mode vs Managed Mode
+
+| | Local Mode | Managed Mode |
+|---|---|---|
+| How it works | Scans run directly on your machine using local AWS creds | Jobs submitted to a serverless backend in AWS |
+| When to use | Small-scale (few accounts), testing, development | Large-scale (100s of accounts), long-running scans |
+| Setup | Just `./run.sh` | Deploy the managed solution first (see `managed solution/README.md`) |
+| Credentials | Your local AWS profiles/SSO | Local creds sign the API request; backend assumes into target accounts |
+
+---
+
+## Architecture
+
 ```
+frontend/
+├── run.sh                    # One-command launcher
+├── app.py                    # Flask entry point + JSON API + serves built UI
+├── requirements.txt          # Python dependencies (includes custom boto3 wheels)
+├── backend/                  # Python backend modules
+│   ├── config.py             # Paths, cache locations, execution mode config
+│   ├── cache.py              # Local-file cache helpers
+│   ├── checkpoint.py         # Scan resume/checkpoint logic
+│   ├── aws_session.py        # Credential-profile / session helpers
+│   ├── jobs.py               # Job dispatcher (routes to local or managed)
+│   ├── _jobs_local.py        # Local execution (threads, in-process scanning)
+│   ├── _jobs_managed.py      # Managed execution (SigV4 client to API Gateway)
+│   ├── policy_analysis.py    # Resource policy scanning logic
+│   ├── iam_federation.py     # IAM federation discovery + migration
+│   └── idc.py                # IdC discovery + apply
+├── web/                      # Cloudscape + React + Vite frontend
+│   └── src/pages/            # One page per feature tab
+└── cache/                    # Local cache output (git-ignored)
+```
+
+---
+
+## Troubleshooting
+
+### "No module named 'botocore'" or "'boto3'"
+Run `pip install -r requirements.txt` from the `frontend/` directory, or use
+`./run.sh` which handles this automatically.
+
+### "No IAM Identity Center instance found"
+You're scanning from the wrong account or region. IdC APIs only work from the
+management account or delegated admin account, in the specific region where
+IdC is configured.
+
+### "AccessDenied" on scans
+Check that your credentials have the required permissions (see table above).
+For assume-role mode, verify the target role exists and trusts your caller.
+
+### UI stuck on "running" with no progress
+The job may have failed silently. Check the browser console for errors, or
+restart Flask. In managed mode, check the Step Functions execution history
+in the AWS Console.

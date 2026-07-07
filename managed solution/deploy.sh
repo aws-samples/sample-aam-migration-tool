@@ -48,29 +48,37 @@ echo "╚═══════════════════════�
 echo ""
 
 # ─── Step 1: Install CDK dependencies ────────────────────────────────────────
-echo "==> [1/5] Installing CDK dependencies..."
+echo "==> [1/6] Installing CDK dependencies..."
 npm install
 
 # ─── Step 2: Build the custom boto3 Lambda Layer ─────────────────────────────
 echo ""
-echo "==> [2/5] Building custom boto3 Lambda Layer..."
+echo "==> [2/6] Building Lambda Layers..."
 cd layers/custom-boto3
+bash build.sh
+cd "$SCRIPT_DIR"
+cd layers/shared-utils
 bash build.sh
 cd "$SCRIPT_DIR"
 
 # ─── Step 3: Compile TypeScript ──────────────────────────────────────────────
 echo ""
-echo "==> [3/5] Compiling TypeScript..."
+echo "==> [3/6] Compiling TypeScript..."
 npx tsc
 
-# ─── Step 4: CDK Bootstrap (if needed) ───────────────────────────────────────
+# ─── Step 4: Validate Step Functions definitions ─────────────────────────────
 echo ""
-echo "==> [4/5] Bootstrapping CDK (if not already done)..."
+echo "==> [4/6] Validating state machine definitions..."
+bash "$SCRIPT_DIR/validate-state-machines.sh" $EXTRA_CDK_ARGS
+
+# ─── Step 5: CDK Bootstrap (if needed) ───────────────────────────────────────
+echo ""
+echo "==> [5/6] Bootstrapping CDK (if not already done)..."
 npx cdk bootstrap $EXTRA_CDK_ARGS || true
 
-# ─── Step 5: Deploy all stacks ───────────────────────────────────────────────
+# ─── Step 6: Deploy all stacks ───────────────────────────────────────────────
 echo ""
-echo "==> [5/5] Deploying all stacks..."
+echo "==> [6/6] Deploying all stacks..."
 npx cdk deploy --all --require-approval never \
   --context orgId="$ORG_ID" \
   --context externalId="$EXTERNAL_ID" \

@@ -15,6 +15,8 @@ interface ApiStackProps extends cdk.StackProps {
   policyScanStateMachine: sfn.StateMachine;
   iamDiscoverStateMachine: sfn.StateMachine;
   iamMigrateStateMachine: sfn.StateMachine;
+  idcDiscoverStateMachine: sfn.StateMachine;
+  idcApplyStateMachine: sfn.StateMachine;
   orgId: string;
 }
 
@@ -25,6 +27,13 @@ export class ApiStack extends cdk.Stack {
     super(scope, id, props);
 
     const lambdaDir = path.join(__dirname, "..", "lambda");
+
+    // ─── Shared utilities Layer ───────────────────────────────────────────
+    const sharedLayer = new lambda.LayerVersion(this, "ApiSharedUtilsLayer", {
+      code: lambda.Code.fromAsset(path.join(__dirname, "..", "layers", "shared-utils")),
+      compatibleRuntimes: [lambda.Runtime.PYTHON_3_12],
+      description: "Truffle shared utilities for API Lambdas",
+    });
 
     // ─── API Gateway (Regional, IAM Auth) ─────────────────────────────────
     this.api = new apigateway.RestApi(this, "TruffleApi", {
@@ -74,18 +83,25 @@ export class ApiStack extends cdk.Stack {
       code: lambda.Code.fromAsset(path.join(lambdaDir, "start-job")),
       memorySize: 128,
       timeout: cdk.Duration.seconds(10),
+      layers: [sharedLayer],
       environment: {
         JOBS_TABLE: props.jobsTable.tableName,
+        RESULTS_BUCKET: props.resultsBucket.bucketName,
         POLICY_SCAN_SM_ARN: props.policyScanStateMachine.stateMachineArn,
         IAM_DISCOVER_SM_ARN: props.iamDiscoverStateMachine.stateMachineArn,
         IAM_MIGRATE_SM_ARN: props.iamMigrateStateMachine.stateMachineArn,
+        IDC_DISCOVER_SM_ARN: props.idcDiscoverStateMachine.stateMachineArn,
+        IDC_APPLY_SM_ARN: props.idcApplyStateMachine.stateMachineArn,
       },
     });
 
     props.jobsTable.grantReadWriteData(startJobFn);
+    props.resultsBucket.grantRead(startJobFn);
     props.policyScanStateMachine.grantStartExecution(startJobFn);
     props.iamDiscoverStateMachine.grantStartExecution(startJobFn);
     props.iamMigrateStateMachine.grantStartExecution(startJobFn);
+    props.idcDiscoverStateMachine.grantStartExecution(startJobFn);
+    props.idcApplyStateMachine.grantStartExecution(startJobFn);
 
     // ─── Get Status Lambda ────────────────────────────────────────────────
     const getStatusFn = new lambda.Function(this, "GetStatusFn", {
@@ -95,12 +111,20 @@ export class ApiStack extends cdk.Stack {
       code: lambda.Code.fromAsset(path.join(lambdaDir, "get-status")),
       memorySize: 128,
       timeout: cdk.Duration.seconds(10),
+      layers: [sharedLayer],
       environment: {
         JOBS_TABLE: props.jobsTable.tableName,
+        POLICY_SCAN_SM_ARN: props.policyScanStateMachine.stateMachineArn,
+        IAM_DISCOVER_SM_ARN: props.iamDiscoverStateMachine.stateMachineArn,
+        IAM_MIGRATE_SM_ARN: props.iamMigrateStateMachine.stateMachineArn,
       },
     });
 
     props.jobsTable.grantReadData(getStatusFn);
+    // Allow listing executions for stale job detection
+    props.policyScanStateMachine.grantRead(getStatusFn);
+    props.iamDiscoverStateMachine.grantRead(getStatusFn);
+    props.iamMigrateStateMachine.grantRead(getStatusFn);
 
     // ─── Get Result Lambda ────────────────────────────────────────────────
     const getResultFn = new lambda.Function(this, "GetResultFn", {
@@ -110,6 +134,7 @@ export class ApiStack extends cdk.Stack {
       code: lambda.Code.fromAsset(path.join(lambdaDir, "get-result")),
       memorySize: 256,
       timeout: cdk.Duration.seconds(30),
+      layers: [sharedLayer],
       environment: {
         JOBS_TABLE: props.jobsTable.tableName,
         RESULTS_BUCKET: props.resultsBucket.bucketName,
@@ -162,6 +187,15 @@ export class ApiStack extends cdk.Stack {
 
     const idcDiscoverResult = idcDiscover.addResource("result");
     idcDiscoverResult.addMethod("GET", new apigateway.LambdaIntegration(getResultFn), iamAuth);
+
+    const idcApply = idc.addResource("apply");
+    idcApply.addMethod("POST", new apigateway.LambdaIntegration(startJobFn), iamAuth);
+
+    const idcApplyStatus = idcApply.addResource("status");
+    idcApplyStatus.addMethod("GET", new apigateway.LambdaIntegration(getStatusFn), iamAuth);
+
+    const idcApplyResult = idcApply.addResource("result");
+    idcApplyResult.addMethod("GET", new apigateway.LambdaIntegration(getResultFn), iamAuth);
 
     // ─── Outputs ──────────────────────────────────────────────────────────
     new cdk.CfnOutput(this, "ApiEndpoint", {

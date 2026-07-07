@@ -16,7 +16,7 @@
           ":p": {
             "M": {
               "completed_units": { "N": "0" },
-              "total_units": { "N.$": "States.Format('{}', States.ArrayLength($.account_ids))" },
+              "total_units": { "N": "0" },
               "message": { "S": "Discovering federated roles" }
             }
           }

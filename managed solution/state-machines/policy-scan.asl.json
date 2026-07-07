@@ -31,8 +31,8 @@
           ":p": {
             "M": {
               "completed_units": { "N": "0" },
-              "total_units": { "N.$": "States.Format('{}', States.MathAdd(States.ArrayLength($.accounts), States.MathMultiply(States.ArrayLength($.accounts), States.ArrayLength($.regions))))" },
-              "message": { "S": "Scanning accounts" }
+              "total_units": { "N": "0" },
+              "message": { "S": "Scanning accounts and regions" }
             }
           }
         }

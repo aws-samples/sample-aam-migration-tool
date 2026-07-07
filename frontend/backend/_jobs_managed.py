@@ -74,7 +74,9 @@ def _signed_request(method: str, path: str, body: Optional[dict] = None) -> dict
 def start_scan(params: dict) -> str:
     """Submit a policy scan job to the managed backend. Returns job_id."""
     resp = _signed_request("POST", "/api/policy-analysis/scan", body=params)
-    return resp["job_id"]
+    job_id = resp["job_id"]
+    _JOB_TYPE_MAP[job_id] = "policy-scan"
+    return job_id
 
 
 # ─── IAM Federation Discovery ────────────────────────────────────────────────
@@ -82,7 +84,9 @@ def start_scan(params: dict) -> str:
 def start_iam_discover(params: dict) -> str:
     """Submit an IAM federation discovery job. Returns job_id."""
     resp = _signed_request("POST", "/api/iam-federation/discover", body=params)
-    return resp["job_id"]
+    job_id = resp["job_id"]
+    _JOB_TYPE_MAP[job_id] = "iam-discover"
+    return job_id
 
 
 # ─── IAM Federation Migration ────────────────────────────────────────────────
@@ -90,7 +94,9 @@ def start_iam_discover(params: dict) -> str:
 def start_iam_migrate(params: dict) -> str:
     """Submit an IAM trust policy migration job. Returns job_id."""
     resp = _signed_request("POST", "/api/iam-federation/migrate", body=params)
-    return resp["job_id"]
+    job_id = resp["job_id"]
+    _JOB_TYPE_MAP[job_id] = "iam-migrate"
+    return job_id
 
 
 # ─── IdC Discovery ───────────────────────────────────────────────────────────
@@ -98,19 +104,30 @@ def start_iam_migrate(params: dict) -> str:
 def start_idc_discover(params: dict) -> str:
     """Submit an IdC discovery job. Returns job_id."""
     resp = _signed_request("POST", "/api/idc/discover", body=params)
-    return resp["job_id"]
+    job_id = resp["job_id"]
+    _JOB_TYPE_MAP[job_id] = "idc-discover"
+    return job_id
 
 
 # ─── IdC Apply (reuses migrate workflow) ─────────────────────────────────────
 
 def start_idc_apply(params: dict) -> str:
     """Submit an IdC apply job. Returns job_id."""
-    # IdC apply reuses the discover endpoint with apply params
-    resp = _signed_request("POST", "/api/idc/discover", body={**params, "apply": True})
-    return resp["job_id"]
+    resp = _signed_request("POST", "/api/idc/apply", body=params)
+    job_id = resp["job_id"]
+    _JOB_TYPE_MAP[job_id] = "idc-apply"
+    return job_id
 
 
 # ─── Shared: Get job status ──────────────────────────────────────────────────
+
+# Map job_id prefixes aren't used — we just try all status endpoints.
+# A better approach: the start functions return (job_id, job_type) but to keep
+# the interface compatible with _jobs_local (which only returns job_id), we
+# store a local mapping.
+
+_JOB_TYPE_MAP: dict[str, str] = {}
+
 
 def get(job_id: str) -> Optional[dict]:
     """
@@ -128,8 +145,13 @@ def get(job_id: str) -> Optional[dict]:
         "result": { ... } | None  (populated when status == "done")
       }
     """
+    # Determine the correct status endpoint based on job type
+    job_type = _JOB_TYPE_MAP.get(job_id, "policy-scan")
+    status_path = _STATUS_PATHS.get(job_type, "/api/policy-analysis/status")
+    result_path = _RESULT_PATHS.get(job_type, "/api/policy-analysis/result")
+
     try:
-        status_resp = _signed_request("GET", f"/api/policy-analysis/status?job={job_id}")
+        status_resp = _signed_request("GET", f"{status_path}?job={job_id}")
     except RuntimeError:
         return None
 
@@ -137,14 +159,18 @@ def get(job_id: str) -> Optional[dict]:
     result = None
     if status_resp.get("status") == "done":
         try:
-            result_resp = _signed_request("GET", f"/api/policy-analysis/result?job={job_id}")
-            result = result_resp.get("data")
+            result_resp = _signed_request("GET", f"{result_path}?job={job_id}")
+            # Wrap in the same shape as _jobs_local: {cached_at, data}
+            result = {
+                "cached_at": status_resp.get("finished_at"),
+                "data": result_resp.get("data"),
+            }
         except RuntimeError:
             pass
 
     return {
         "id": status_resp.get("id", job_id),
-        "type": status_resp.get("type", "unknown"),
+        "type": status_resp.get("type", job_type),
         "status": status_resp.get("status", "unknown"),
         "progress": status_resp.get("progress", {}),
         "started_at": status_resp.get("started_at"),
@@ -152,3 +178,21 @@ def get(job_id: str) -> Optional[dict]:
         "error": status_resp.get("error"),
         "result": result,
     }
+
+
+# Route maps for status/result endpoints by job type
+_STATUS_PATHS = {
+    "policy-scan": "/api/policy-analysis/status",
+    "iam-discover": "/api/iam-federation/discover/status",
+    "iam-migrate": "/api/iam-federation/migrate/status",
+    "idc-discover": "/api/idc/discover/status",
+    "idc-apply": "/api/idc/apply/status",
+}
+
+_RESULT_PATHS = {
+    "policy-scan": "/api/policy-analysis/result",
+    "iam-discover": "/api/iam-federation/discover/result",
+    "iam-migrate": "/api/iam-federation/migrate/status",  # migrate results come via status
+    "idc-discover": "/api/idc/discover/result",
+    "idc-apply": "/api/idc/apply/result",
+}

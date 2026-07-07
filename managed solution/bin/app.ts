@@ -30,5 +30,7 @@ new ApiStack(app, "TruffleApiStack", {
   policyScanStateMachine: workflows.policyScanStateMachine,
   iamDiscoverStateMachine: workflows.iamDiscoverStateMachine,
   iamMigrateStateMachine: workflows.iamMigrateStateMachine,
+  idcDiscoverStateMachine: workflows.idcDiscoverStateMachine,
+  idcApplyStateMachine: workflows.idcApplyStateMachine,
   orgId,
 });

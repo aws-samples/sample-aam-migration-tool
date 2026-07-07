@@ -214,7 +214,10 @@ def idc_state():
 def idc_discover():
     """Start an IdC inventory job; returns a job_id to poll."""
     body = request.get_json(silent=True) or {}
-    job_id = jobs.start_idc_discover(body)
+    try:
+        job_id = jobs.start_idc_discover(body)
+    except Exception as exc:
+        return _json_error(str(exc), 502)
     return jsonify({"job_id": job_id})
 
 

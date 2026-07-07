@@ -28,9 +28,7 @@ from datetime import datetime, timezone
 
 import boto3
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
-
-from credentials import assume_role
+from shared.credentials import assume_role
 
 MIGRATION_LOG_TABLE = os.environ.get("MIGRATION_LOG_TABLE", "TruffleMigrationLog")
 

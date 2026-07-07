@@ -75,8 +75,29 @@ def ensure_checkpoint_dir() -> str:
 
 EXECUTION_MODE = os.environ.get("TRUFFLE_MODE", "local")  # "local" | "managed"
 API_ENDPOINT = os.environ.get("TRUFFLE_API_ENDPOINT", "")  # e.g. https://<id>.execute-api.<region>.amazonaws.com/prod
-API_REGION = os.environ.get("TRUFFLE_API_REGION", "us-east-1")
 API_PROFILE = os.environ.get("TRUFFLE_API_PROFILE", "")  # optional: AWS profile for signing
+
+
+def _parse_region_from_endpoint(endpoint: str) -> str:
+    """Extract the AWS region from an API Gateway endpoint URL.
+
+    Expected format: https://<id>.execute-api.<region>.amazonaws.com/...
+    Falls back to us-west-2 if parsing fails.
+    """
+    try:
+        # e.g. "https://abc123.execute-api.us-west-2.amazonaws.com/prod"
+        host = endpoint.split("//")[-1].split("/")[0]  # abc123.execute-api.us-west-2.amazonaws.com
+        parts = host.split(".")
+        # parts: [id, "execute-api", region, "amazonaws", "com"]
+        if "execute-api" in parts:
+            idx = parts.index("execute-api")
+            return parts[idx + 1]
+    except (IndexError, ValueError):
+        pass
+    return "us-west-2"
+
+
+API_REGION = os.environ.get("TRUFFLE_API_REGION") or _parse_region_from_endpoint(API_ENDPOINT)
 
 
 def is_managed_mode() -> bool:

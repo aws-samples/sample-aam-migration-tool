@@ -18,11 +18,20 @@ export class WorkflowStack extends cdk.Stack {
   public readonly policyScanStateMachine: sfn.StateMachine;
   public readonly iamDiscoverStateMachine: sfn.StateMachine;
   public readonly iamMigrateStateMachine: sfn.StateMachine;
+  public readonly idcDiscoverStateMachine: sfn.StateMachine;
+  public readonly idcApplyStateMachine: sfn.StateMachine;
 
   constructor(scope: Construct, id: string, props: WorkflowStackProps) {
     super(scope, id, props);
 
     const lambdaDir = path.join(__dirname, "..", "lambda");
+
+    // ─── Shared utilities Layer (credentials, dynamodb_helpers) ────────────
+    const sharedLayer = new lambda.LayerVersion(this, "SharedUtilsLayer", {
+      code: lambda.Code.fromAsset(path.join(__dirname, "..", "layers", "shared-utils")),
+      compatibleRuntimes: [lambda.Runtime.PYTHON_3_12],
+      description: "Truffle shared utilities (credentials, dynamodb_helpers)",
+    });
 
     // ─── Custom boto3 Layer (preview SDK with AAM service model) ──────────
     const customBoto3Layer = new lambda.LayerVersion(this, "CustomBoto3Layer", {
@@ -64,6 +73,7 @@ export class WorkflowStack extends cdk.Stack {
       role: lambdaExecRole,
       memorySize: 512,
       timeout: cdk.Duration.minutes(5),
+      layers: [sharedLayer],
       environment: {
         EXTERNAL_ID: props.externalId,
         RESULTS_BUCKET: props.resultsBucket.bucketName,
@@ -79,6 +89,7 @@ export class WorkflowStack extends cdk.Stack {
       role: lambdaExecRole,
       memorySize: 512,
       timeout: cdk.Duration.minutes(10),
+      layers: [sharedLayer],
       environment: {
         EXTERNAL_ID: props.externalId,
         RESULTS_BUCKET: props.resultsBucket.bucketName,
@@ -94,7 +105,7 @@ export class WorkflowStack extends cdk.Stack {
       role: lambdaExecRole,
       memorySize: 1024,
       timeout: cdk.Duration.minutes(10),
-      layers: [customBoto3Layer],
+      layers: [sharedLayer, customBoto3Layer],
       environment: {
         EXTERNAL_ID: props.externalId,
       },
@@ -109,7 +120,7 @@ export class WorkflowStack extends cdk.Stack {
       role: lambdaExecRole,
       memorySize: 256,
       timeout: cdk.Duration.seconds(30),
-      layers: [customBoto3Layer],
+      layers: [sharedLayer, customBoto3Layer],
       environment: {
         EXTERNAL_ID: props.externalId,
         MIGRATION_LOG_TABLE: props.migrationLogTable.tableName,
@@ -125,6 +136,7 @@ export class WorkflowStack extends cdk.Stack {
       role: lambdaExecRole,
       memorySize: 1024,
       timeout: cdk.Duration.minutes(2),
+      layers: [sharedLayer],
       environment: {
         RESULTS_BUCKET: props.resultsBucket.bucketName,
         JOBS_TABLE: props.jobsTable.tableName,
@@ -188,5 +200,71 @@ export class WorkflowStack extends cdk.Stack {
     aggregateFn.grantInvoke(this.iamMigrateStateMachine);
     props.jobsTable.grantReadWriteData(this.iamMigrateStateMachine);
     props.migrationLogTable.grantReadWriteData(this.iamMigrateStateMachine);
+
+    // ─── IdC Discover Lambda ──────────────────────────────────────────────
+    const idcDiscoverFn = new lambda.Function(this, "IdcDiscoverFn", {
+      functionName: "TruffleIdcDiscover",
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: "handler.lambda_handler",
+      code: lambda.Code.fromAsset(path.join(lambdaDir, "idc-discover")),
+      role: lambdaExecRole,
+      memorySize: 1024,
+      timeout: cdk.Duration.minutes(10),
+      layers: [sharedLayer],
+      environment: {
+        EXTERNAL_ID: props.externalId,
+      },
+    });
+
+    // ─── Step Functions: IdC Discover ─────────────────────────────────────
+    this.idcDiscoverStateMachine = new sfn.StateMachine(this, "IdcDiscoverSM", {
+      stateMachineName: "TruffleIdcDiscover",
+      stateMachineType: sfn.StateMachineType.STANDARD,
+      definitionBody: sfn.DefinitionBody.fromFile(
+        path.join(__dirname, "..", "state-machines", "idc-discover.asl.json")
+      ),
+      definitionSubstitutions: {
+        IdcDiscoverFnArn: idcDiscoverFn.functionArn,
+        AggregateFnArn: aggregateFn.functionArn,
+        JobsTableName: props.jobsTable.tableName,
+      },
+    });
+
+    idcDiscoverFn.grantInvoke(this.idcDiscoverStateMachine);
+    aggregateFn.grantInvoke(this.idcDiscoverStateMachine);
+    props.jobsTable.grantReadWriteData(this.idcDiscoverStateMachine);
+
+    // ─── IdC Apply Lambda ─────────────────────────────────────────────────
+    const idcApplyFn = new lambda.Function(this, "IdcApplyFn", {
+      functionName: "TruffleIdcApply",
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: "handler.lambda_handler",
+      code: lambda.Code.fromAsset(path.join(lambdaDir, "idc-apply")),
+      role: lambdaExecRole,
+      memorySize: 512,
+      timeout: cdk.Duration.minutes(5),
+      layers: [sharedLayer, customBoto3Layer],
+      environment: {
+        EXTERNAL_ID: props.externalId,
+      },
+    });
+
+    // ─── Step Functions: IdC Apply ────────────────────────────────────────
+    this.idcApplyStateMachine = new sfn.StateMachine(this, "IdcApplySM", {
+      stateMachineName: "TruffleIdcApply",
+      stateMachineType: sfn.StateMachineType.STANDARD,
+      definitionBody: sfn.DefinitionBody.fromFile(
+        path.join(__dirname, "..", "state-machines", "idc-apply.asl.json")
+      ),
+      definitionSubstitutions: {
+        IdcApplyFnArn: idcApplyFn.functionArn,
+        AggregateFnArn: aggregateFn.functionArn,
+        JobsTableName: props.jobsTable.tableName,
+      },
+    });
+
+    idcApplyFn.grantInvoke(this.idcApplyStateMachine);
+    aggregateFn.grantInvoke(this.idcApplyStateMachine);
+    props.jobsTable.grantReadWriteData(this.idcApplyStateMachine);
   }
 }

@@ -2,6 +2,7 @@
 # Flask is the only web dependency; boto3 is already required by the utilities.
 Flask>=3.0,<4.0
 PyYAML>=6.0
+requests>=2.31,<3.0
 
 # Custom AAM-aware SDK wheels (preview — will be removed once boto3 ships AAM
 # support publicly). Order matters: botocore must be installed before boto3.

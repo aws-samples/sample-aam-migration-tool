@@ -1,0 +1,13 @@
+{
+  "resource": "/api/idc/discover",
+  "path": "/api/idc/discover",
+  "httpMethod": "POST",
+  "headers": { "Content-Type": "application/json" },
+  "queryStringParameters": null,
+  "body": "{\"account_scope\": \"single\", \"region\": \"us-east-1\"}",
+  "requestContext": {
+    "identity": {
+      "userArn": "arn:aws:iam::123456789012:user/test-user"
+    }
+  }
+}

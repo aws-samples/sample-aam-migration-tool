@@ -1,0 +1,109 @@
+{
+  "Comment": "Truffle IdC Discovery — inventories permission sets and assignments from Identity Center.",
+  "StartAt": "UpdateProgressStarted",
+  "States": {
+    "UpdateProgressStarted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${JobsTableName}",
+        "Key": {
+          "PK": { "S.$": "States.Format('CALLER#{}', $.caller_arn)" },
+          "SK": { "S.$": "States.Format('JOB#{}', $.job_id)" }
+        },
+        "UpdateExpression": "SET progress = :p",
+        "ExpressionAttributeValues": {
+          ":p": {
+            "M": {
+              "completed_units": { "N": "0" },
+              "total_units": { "N": "1" },
+              "message": { "S": "Discovering IdC permission sets and assignments" }
+            }
+          }
+        }
+      },
+      "ResultPath": null,
+      "Next": "IdcDiscover"
+    },
+    "IdcDiscover": {
+      "Type": "Task",
+      "Resource": "${IdcDiscoverFnArn}",
+      "Parameters": {
+        "hub_account_id.$": "States.ArrayGetItem($.account_ids, 0)",
+        "region.$": "$.region",
+        "account_scope.$": "$.account_scope",
+        "target_account_ids.$": "$.account_ids",
+        "job_id.$": "$.job_id",
+        "caller_arn.$": "$.caller_arn"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "ResultPath": "$.discover_result",
+      "Next": "Aggregate"
+    },
+    "Aggregate": {
+      "Type": "Task",
+      "Resource": "${AggregateFnArn}",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "caller_arn.$": "$.caller_arn",
+        "job_type": "idc-discover",
+        "results.$": "States.Array($.discover_result)",
+        "params": {
+          "region.$": "$.region",
+          "account_scope.$": "$.account_scope",
+          "account_ids.$": "$.account_ids"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${JobsTableName}",
+        "Key": {
+          "PK": { "S.$": "States.Format('CALLER#{}', $.caller_arn)" },
+          "SK": { "S.$": "States.Format('JOB#{}', $.job_id)" }
+        },
+        "UpdateExpression": "SET #s = :s, #e = :e",
+        "ExpressionAttributeNames": {
+          "#s": "status",
+          "#e": "error"
+        },
+        "ExpressionAttributeValues": {
+          ":s": { "S": "error" },
+          ":e": { "S.$": "States.Format('IdC discovery failed: {}', $.error.Cause)" }
+        }
+      },
+      "End": true
+    }
+  }
+}

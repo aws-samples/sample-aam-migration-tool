@@ -1,0 +1,12 @@
+{
+  "resource": "/api/idc/discover/status",
+  "path": "/api/idc/discover/status",
+  "httpMethod": "GET",
+  "headers": {},
+  "queryStringParameters": { "job": "test123abc" },
+  "requestContext": {
+    "identity": {
+      "userArn": "arn:aws:iam::123456789012:user/test-user"
+    }
+  }
+}

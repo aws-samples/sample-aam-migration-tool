@@ -29,9 +29,7 @@ import sys
 
 import boto3
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
-
-from dynamodb_helpers import mark_complete, mark_error
+from shared.dynamodb_helpers import mark_complete, mark_error
 
 RESULTS_BUCKET = os.environ.get("RESULTS_BUCKET", "")
 JOBS_TABLE = os.environ.get("JOBS_TABLE", "TruffleJobs")

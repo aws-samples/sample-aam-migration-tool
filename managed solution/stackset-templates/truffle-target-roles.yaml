@@ -47,6 +47,46 @@ Resources:
                 Action:
                   - iam:UpdateAssumeRolePolicy
                 Resource: "*"
+        - PolicyName: TruffleIdcReadPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowIdcDiscovery
+                Effect: Allow
+                Action:
+                  - sso:ListInstances
+                  - sso:DescribeInstance
+                  - sso-admin:ListPermissionSets
+                  - sso-admin:DescribePermissionSet
+                  - sso-admin:ListPermissionSetsProvisionedToAccount
+                  - sso-admin:ListAccountsForProvisionedPermissionSet
+                  - sso-admin:ListAccountAssignments
+                  - sso-admin:GetInlinePolicyForPermissionSet
+                  - sso-admin:ListManagedPoliciesInPermissionSet
+                  - sso-admin:ListCustomerManagedPolicyReferencesInPermissionSet
+                  - identitystore:DescribeUser
+                  - identitystore:DescribeGroup
+                  - identitystore:ListUsers
+                  - identitystore:ListGroups
+                Resource: "*"
+        - PolicyName: TruffleRoleCreationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowRoleCreation
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:AttachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:TagRole
+                  - iam:GetRole
+                Resource: "arn:aws:iam::*:role/aam/*"
+              - Sid: AllowAAMEntitlements
+                Effect: Allow
+                Action:
+                  - account-access-preview:CreateEntitlement
+                Resource: "*"
       Tags:
         - Key: ManagedBy
           Value: Truffle

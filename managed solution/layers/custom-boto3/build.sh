@@ -21,7 +21,7 @@ rm -rf "$LAYER_DIR"
 mkdir -p "$LAYER_DIR"
 
 echo "==> Installing custom boto3/botocore wheels..."
-pip install \
+pip3 install \
   --target "$LAYER_DIR" \
   --no-deps \
   "$REPO_ROOT/boto3-1.42.97-py3-none-any.whl" \
@@ -30,7 +30,7 @@ pip install \
 # Install the required dependencies that botocore/boto3 need but won't be
 # in the layer since we used --no-deps. These ARE available in the Lambda
 # runtime already, but we include them for completeness / version pinning.
-pip install \
+pip3 install \
   --target "$LAYER_DIR" \
   --no-deps \
   jmespath s3transfer urllib3

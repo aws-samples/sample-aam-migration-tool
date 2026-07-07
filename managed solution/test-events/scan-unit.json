@@ -1,0 +1,8 @@
+{
+  "account_id": "123456789012",
+  "region": "us-east-1",
+  "search_terms": ["test-idp-arn"],
+  "services": ["s3"],
+  "job_id": "test123",
+  "caller_arn": "arn:aws:iam::123456789012:user/test-user"
+}
