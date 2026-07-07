@@ -259,15 +259,29 @@ class EntitlementCreator:
             principal_block["groupId"] = assignment.principal_id
 
         try:
-            resp = self.aam.create_entitlement(
-                applicationArn=application_arn,
-                entitlement={
-                    "principalRole": {
-                        "principal": {"identityCenter": principal_block},
-                        "roleArn": role_result.role_arn,
-                    }
-                },
-            )
+            # Retry on ValidationException — IAM role may not have propagated yet
+            import time as _time
+            max_retries = 3
+            resp = None
+            for attempt in range(max_retries):
+                try:
+                    resp = self.aam.create_entitlement(
+                        applicationArn=application_arn,
+                        entitlement={
+                            "principalRole": {
+                                "principal": {"identityCenter": principal_block},
+                                "roleArn": role_result.role_arn,
+                            }
+                        },
+                    )
+                    break
+                except ClientError as retry_exc:
+                    code = retry_exc.response.get("Error", {}).get("Code", "")
+                    if code == "ValidationException" and attempt < max_retries - 1:
+                        _time.sleep(3 * (attempt + 1))
+                    else:
+                        raise
+
             ent_id = resp["entitlementId"]
             self.audit.log_success(
                 "create_entitlement",

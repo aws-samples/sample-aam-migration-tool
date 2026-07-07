@@ -1,0 +1,108 @@
+{
+  "Comment": "Truffle IAM Federation Discovery — discovers SAML-federated roles across accounts.",
+  "StartAt": "UpdateProgressStarted",
+  "States": {
+    "UpdateProgressStarted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${JobsTableName}",
+        "Key": {
+          "PK": { "S.$": "States.Format('CALLER#{}', $.caller_arn)" },
+          "SK": { "S.$": "States.Format('JOB#{}', $.job_id)" }
+        },
+        "UpdateExpression": "SET progress = :p",
+        "ExpressionAttributeValues": {
+          ":p": {
+            "M": {
+              "completed_units": { "N": "0" },
+              "total_units": { "N.$": "States.Format('{}', States.ArrayLength($.account_ids))" },
+              "message": { "S": "Discovering federated roles" }
+            }
+          }
+        }
+      },
+      "ResultPath": null,
+      "Next": "MapAccounts"
+    },
+    "MapAccounts": {
+      "Type": "Map",
+      "ItemsPath": "$.account_ids",
+      "MaxConcurrency": 10,
+      "Parameters": {
+        "account_id.$": "$$.Map.Item.Value",
+        "idp_arn.$": "$.idp_arn",
+        "job_id.$": "$.job_id",
+        "caller_arn.$": "$.caller_arn"
+      },
+      "Iterator": {
+        "StartAt": "DiscoverRoles",
+        "States": {
+          "DiscoverRoles": {
+            "Type": "Task",
+            "Resource": "${DiscoverRolesFnArn}",
+            "Retry": [
+              {
+                "ErrorEquals": ["Lambda.TooManyRequestsException", "States.TaskFailed"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              },
+              {
+                "ErrorEquals": ["States.Timeout"],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 2,
+                "BackoffRate": 1.5
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.error",
+                "Next": "DiscoverFailed"
+              }
+            ],
+            "End": true
+          },
+          "DiscoverFailed": {
+            "Type": "Pass",
+            "Parameters": {
+              "account_id.$": "$.account_id",
+              "roles": [],
+              "roles_scanned": 0,
+              "roles_found": 0,
+              "status": "error",
+              "error.$": "$.error"
+            },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.discover_results",
+      "Next": "Aggregate"
+    },
+    "Aggregate": {
+      "Type": "Task",
+      "Resource": "${AggregateFnArn}",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "caller_arn.$": "$.caller_arn",
+        "job_type.$": "$.job_type",
+        "results.$": "$.discover_results",
+        "params": {
+          "idp_arn.$": "$.idp_arn",
+          "account_ids.$": "$.account_ids"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    }
+  }
+}

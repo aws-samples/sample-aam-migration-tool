@@ -4,6 +4,10 @@ Path and location configuration for the Truffle frontend.
 Centralizes the on-disk locations so the rest of the backend never has to
 guess where things live. Everything is local to the repo per the design
 tenets (local machine, local resources, local cache files).
+
+Execution mode:
+  TRUFFLE_MODE=local    (default) — scan/discover/migrate run in-process
+  TRUFFLE_MODE=managed  — jobs are submitted to the managed AWS backend
 """
 
 import os
@@ -63,3 +67,18 @@ def ensure_checkpoint_dir() -> str:
     """Create the checkpoint directory if it does not already exist."""
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     return CHECKPOINT_DIR
+
+
+# ─── Execution mode (local vs managed backend) ───────────────────────────────
+# Set TRUFFLE_MODE=managed and TRUFFLE_API_ENDPOINT to the API Gateway URL to
+# route jobs to the managed serverless backend instead of running locally.
+
+EXECUTION_MODE = os.environ.get("TRUFFLE_MODE", "local")  # "local" | "managed"
+API_ENDPOINT = os.environ.get("TRUFFLE_API_ENDPOINT", "")  # e.g. https://<id>.execute-api.<region>.amazonaws.com/prod
+API_REGION = os.environ.get("TRUFFLE_API_REGION", "us-east-1")
+API_PROFILE = os.environ.get("TRUFFLE_API_PROFILE", "")  # optional: AWS profile for signing
+
+
+def is_managed_mode() -> bool:
+    """Return True if the backend is configured to use the managed API."""
+    return EXECUTION_MODE.lower() == "managed" and bool(API_ENDPOINT)

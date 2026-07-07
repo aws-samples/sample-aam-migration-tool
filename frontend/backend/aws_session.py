@@ -20,11 +20,11 @@ def list_profiles() -> list[str]:
         return []
 
 
-def build_session(profile: Optional[str] = None) -> boto3.Session:
+def build_session(profile: Optional[str] = None, region: Optional[str] = None) -> boto3.Session:
     """Build a boto3 session for the given profile (or the default chain)."""
     if profile:
-        return boto3.Session(profile_name=profile)
-    return boto3.Session()
+        return boto3.Session(profile_name=profile, region_name=region)
+    return boto3.Session(region_name=region)
 
 
 def build_assumed_session(

@@ -130,6 +130,9 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
     workers = int(params.get("workers", 5))
     account_workers = int(params.get("account_workers", 4))
 
+    # Default region for sessions (used by global service calls like S3 ListBuckets)
+    default_region = (regions_list[0] if regions_list else None) or "us-east-1"
+
     scanner = _load_scanner()
     scanner.MAX_WORKERS = workers
     regions_arg = ",".join(regions_list) if regions_list else None
@@ -167,7 +170,7 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
     _base_session: Optional[object] = None
     if auth_method == "assume_role":
         try:
-            _base_session = build_session(targets[0].get("base_profile") if targets else None)
+            _base_session = build_session(targets[0].get("base_profile") if targets else None, region=default_region)
             _base_account_id = _base_session.client("sts").get_caller_identity()["Account"]  # type: ignore[union-attr]
         except Exception:
             _base_account_id = None
@@ -186,7 +189,7 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
                     )
                 account_id = tgt["account_id"]
             else:
-                session = build_session(tgt["profile"])
+                session = build_session(tgt["profile"], region=default_region)
                 account_id = session.client("sts").get_caller_identity()["Account"]
             regions = scanner.get_regions(session, regions_arg)
             units = [("global", None)] + [("region", r) for r in regions]

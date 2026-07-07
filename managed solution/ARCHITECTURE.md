@@ -1,6 +1,10 @@
-# Truffle — Managed Serverless Architecture
+# Truffle — Managed Backend Architecture (Local UI + AWS Backend)
 
-This document describes the design and architecture for deploying the Truffle AAM Migration Console as a managed, multi-tenant serverless solution on AWS.
+This document describes the architecture for running the Truffle AAM Migration
+Console as a **local UI** backed by a **managed serverless API** on AWS. The
+frontend runs on the user's machine; long-running scan and migration jobs are
+submitted to a private AWS backend that handles orchestration, parallelism, and
+cross-account access.
 
 ---
 
@@ -8,454 +12,465 @@ This document describes the design and architecture for deploying the Truffle AA
 
 | Goal | Approach |
 |------|----------|
-| Fast | CloudFront edge caching for static assets; Lambda concurrency for parallel scanning |
-| Resilient to long-running jobs (hours) | Step Functions Standard Workflows (up to 1-year execution) |
-| State preserved across tab switches | Job state in DynamoDB, frontend reconnects via job ID |
-| Cost-effective at enterprise scale | Pay-per-request pricing across all components |
-| No infrastructure to manage | Fully serverless — no EC2, no containers |
-| Multi-user | Cognito authentication; jobs isolated per user |
+| No public-facing resources | Regional API Gateway with IAM (SigV4) auth — no Cognito, no CloudFront |
+| Minimal client-side change | Existing Flask UI stays; a config toggle switches between local execution and managed backend |
+| Scalable multi-account scanning | Step Functions fan out across accounts/regions; Lambda parallelizes within a single account+region |
+| Simple cross-account access | StackSet-deployed IAM role in every target account |
+| Cost-effective | Pay-per-request serverless — no idle cost |
+| Resilient to long-running jobs | Step Functions Standard Workflows (up to 1-year execution) with built-in retry |
 
 ---
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              End Users                                   │
-└──────────────────────────────────┬──────────────────────────────────────┘
-                                   │ HTTPS
-                                   ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Amazon CloudFront                                │
-│  ┌───────────────────────┐     ┌────────────────────────────────────┐   │
-│  │  S3 Origin (React UI) │     │  API Gateway Origin (/api/*)       │   │
-│  └───────────────────────┘     └────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────┘
-                                   │
-                    ┌──────────────┼──────────────┐
-                    ▼              ▼              ▼
-         ┌──────────────┐  ┌───────────┐  ┌───────────────┐
-         │  API Gateway  │  │ Cognito   │  │ S3 (UI dist)  │
-         │  (HTTP API)   │  │ User Pool │  │               │
-         └──────┬───────┘  └───────────┘  └───────────────┘
-                │
-    ┌───────────┼───────────────────┐
-    ▼           ▼                   ▼
-┌────────┐ ┌────────────┐   ┌──────────────┐
-│ Lambda │ │ Lambda     │   │ Lambda       │
-│ (CRUD) │ │ (Start Job)│   │ (Get Status) │
-└────────┘ └─────┬──────┘   └──────┬───────┘
-                 │                  │
-                 ▼                  ▼
-        ┌────────────────┐  ┌─────────────┐
-        │ Step Functions │  │  DynamoDB   │
-        │ (Standard)     │  │  (Jobs)     │
-        └───────┬────────┘  └─────────────┘
-                │
-    ┌───────────┼───────────────────┐
-    ▼           ▼                   ▼
-┌────────┐ ┌────────────┐   ┌──────────────┐
-│ Lambda │ │ Lambda     │   │ Lambda       │
-│ (Scan  │ │ (Scan      │   │ (Aggregate)  │
-│ Global)│ │ Regional)  │   │              │
-└────────┘ └────────────┘   └──────┬───────┘
-                                    │
-                                    ▼
-                            ┌──────────────┐
-                            │  S3 (Results)│
-                            └──────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  User's Machine                                                              │
+│                                                                              │
+│  ┌────────────────────┐       ┌──────────────────────────────────────────┐   │
+│  │  React/Cloudscape  │ HTTP  │  Flask Backend (localhost)                │   │
+│  │  UI (localhost:5173)│──────▶│                                          │   │
+│  └────────────────────┘       │  TRUFFLE_MODE=managed                    │   │
+│                               │  ┌────────────────────────────────────┐  │   │
+│                               │  │  SigV4 Signing Proxy               │  │   │
+│                               │  │  (uses local AWS creds to sign)    │  │   │
+│                               │  └──────────────┬─────────────────────┘  │   │
+│                               └─────────────────┼────────────────────────┘   │
+└─────────────────────────────────────────────────┼────────────────────────────┘
+                                                  │ HTTPS (SigV4-signed)
+                                                  ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  AWS Account (Truffle Backend)                                               │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐    │
+│  │  API Gateway (Regional, IAM Auth on ALL routes)                      │    │
+│  │  Resource Policy: Deny all except aws:PrincipalOrgID = o-xxxxxxxx    │    │
+│  └───────────────────────────────┬──────────────────────────────────────┘    │
+│                                  │                                           │
+│           ┌──────────────────────┼──────────────────────┐                    │
+│           ▼                      ▼                      ▼                    │
+│    ┌────────────┐      ┌──────────────────┐    ┌──────────────────┐          │
+│    │ Lambda     │      │ Lambda           │    │ Lambda           │          │
+│    │ (StartJob) │      │ (GetStatus)      │    │ (GetResult)      │          │
+│    └─────┬──────┘      └────────┬─────────┘    └────────┬─────────┘          │
+│          │                      │                       │                    │
+│          ▼                      ▼                       ▼                    │
+│  ┌───────────────┐      ┌─────────────┐         ┌─────────────┐             │
+│  │Step Functions │      │  DynamoDB   │         │  S3 Results │             │
+│  │(Standard)     │      │  (Jobs)     │         │  Bucket     │             │
+│  └───────┬───────┘      └─────────────┘         └─────────────┘             │
+│          │                                                                   │
+│          │  Map (accounts) → Map (regions)                                   │
+│          ▼                                                                   │
+│  ┌───────────────────────────────────────────────────┐                       │
+│  │  Lambda (ScanUnit)                                │                       │
+│  │  - Assumes role in target account                 │                       │
+│  │  - Parallelizes API calls within the unit         │                       │
+│  │    (asyncio + semaphore for throttle control)     │                       │
+│  └───────────────────────────────────────────────────┘                       │
+│          │                                                                   │
+│          │ sts:AssumeRole                                                    │
+│          ▼                                                                   │
+│  ┌───────────────────────────────────────────────────┐                       │
+│  │  Target Accounts (StackSet-deployed role)         │                       │
+│  │  TruffleRole — read + iam:UpdateAssumeRolePolicy  │                       │
+│  └───────────────────────────────────────────────────┘                       │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Component Details
+## Client-Side: Execution Mode Toggle
 
-### 1. Static Frontend — S3 + CloudFront
+The existing Flask backend gains a single config switch:
 
-| Component | Purpose |
-|-----------|---------|
-| S3 bucket | Hosts the built React/Cloudscape SPA (`web/dist`) |
-| CloudFront distribution | Global edge caching, HTTPS termination, custom domain |
-| Origin Access Control | S3 bucket is private; only CloudFront can read it |
+```python
+# config.py
+EXECUTION_MODE = os.environ.get("TRUFFLE_MODE", "local")   # "local" | "managed"
+API_ENDPOINT   = os.environ.get("TRUFFLE_API_ENDPOINT", "") # e.g. https://<id>.execute-api.<region>.amazonaws.com/prod
+AWS_REGION     = os.environ.get("TRUFFLE_API_REGION", "us-east-1")
+```
 
-The CloudFront distribution has two origins:
-- **Default (`/*`)** — S3 bucket for the React app (SPA fallback to `index.html`)
-- **API (`/api/*`)** — API Gateway HTTP API
+### Impact on Existing Code
 
-### 2. Authentication — Amazon Cognito
+| Component | Local mode (unchanged) | Managed mode (new) |
+|-----------|----------------------|-------------------|
+| React UI | Calls `/api/*` on localhost | Same — no change |
+| Flask routes (`app.py`) | Unchanged | Unchanged |
+| `jobs.py` | Spawns threads, runs scanner in-process | Forwards to managed API via SigV4 |
+| `policy_analysis.py` | Used directly | Not used (logic lives in Lambda) |
+| `checkpoint.py` | Active (resume interrupted scans) | Not needed (Step Functions retries) |
+| Scanner module | Loaded and executed locally | Not used client-side |
 
-| Component | Purpose |
-|-----------|---------|
-| Cognito User Pool | User registration, login, MFA |
-| Cognito Hosted UI or custom | Login flow integrated into the React app |
-| JWT authorizer on API Gateway | Validates access tokens on every /api/* request |
+The `jobs.py` module becomes a dispatcher:
 
-Each user's jobs and results are namespaced by their Cognito `sub` (user ID).
+```python
+# jobs.py
+from . import config
 
-### 3. API Layer — API Gateway (HTTP API)
+if config.EXECUTION_MODE == "managed":
+    from ._jobs_managed import start_scan, get, start_iam_discover, ...
+else:
+    from ._jobs_local import start_scan, get, start_iam_discover, ...
+```
 
-Lightweight HTTP API with JWT authorization. Routes:
+- `_jobs_local.py` — the current thread-based implementation (renamed from `jobs.py`)
+- `_jobs_managed.py` — thin SigV4 signing client (~100 lines) that POSTs to the managed API and GETs status
+
+---
+
+## API Gateway: Regional + IAM Auth
+
+### Configuration
+
+- **Type:** Regional (not Edge-optimized, not Private)
+- **Authorization:** IAM (`AWS_IAM`) on every route — no exceptions
+- **Protocol:** HTTPS only (default for API Gateway)
+
+### Resource Policy
+
+Locks the API to callers within the AWS Organization:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "execute-api:Invoke",
+      "Resource": "arn:aws:execute-api:us-east-1:ACCOUNT_ID:API_ID/prod/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:PrincipalOrgID": "o-yourorgid"
+        }
+      }
+    },
+    {
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "execute-api:Invoke",
+      "Resource": "arn:aws:execute-api:us-east-1:ACCOUNT_ID:API_ID/prod/*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:PrincipalOrgID": "o-yourorgid"
+        }
+      }
+    }
+  ]
+}
+```
+
+This means:
+- Unsigned requests → 403 (missing SigV4)
+- Signed requests from outside the Organization → explicit Deny
+- Only IAM identities within the Org can invoke the API
+
+### Routes
 
 | Method | Path | Lambda | Purpose |
 |--------|------|--------|---------|
-| GET | /api/health | HealthFn | Liveness check |
-| POST | /api/policy-analysis/scan | StartPolicyScanFn | Start a policy scan workflow |
-| GET | /api/policy-analysis/status | GetJobStatusFn | Poll job progress from DynamoDB |
+| POST | /api/policy-analysis/scan | StartScanFn | Start a policy scan workflow |
+| GET | /api/policy-analysis/status | GetStatusFn | Poll job progress from DynamoDB |
 | GET | /api/policy-analysis/result | GetResultFn | Fetch completed results from S3 |
-| POST | /api/iam-federation/providers | IamProvidersFn | List SAML providers |
 | POST | /api/iam-federation/discover | StartIamDiscoverFn | Start IAM discovery workflow |
-| GET | /api/iam-federation/discover/status | GetJobStatusFn | Poll job progress |
+| GET | /api/iam-federation/discover/status | GetStatusFn | Poll discovery job |
 | POST | /api/iam-federation/migrate | StartMigrateFn | Start migration workflow |
+| GET | /api/iam-federation/migrate/status | GetStatusFn | Poll migration job |
 | POST | /api/iam-federation/generate-iac | GenerateIacFn | Generate CloudFormation/Terraform |
-| GET | /api/iam-federation/log | GetMigrationLogFn | Fetch migration log from DynamoDB |
 | POST | /api/idc/discover | StartIdcDiscoverFn | Start IdC discovery workflow |
+| GET | /api/idc/discover/status | GetStatusFn | Poll IdC discovery job |
 
-### 4. Job Orchestration — Step Functions (Standard Workflows)
+### Caller Permissions
 
-Standard Workflows handle multi-hour executions with built-in retry, parallelism, and state persistence.
+The user's IAM identity needs only:
 
-#### Policy Analysis Workflow
-
-```
-StartExecution
-    │
-    ▼
-┌─────────────────────────┐
-│ ResolveCredentials      │  (Lambda: resolve sessions per account)
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ Map (Accounts)          │  maxConcurrency: configurable (default 10)
-│  ┌────────────────────┐ │
-│  │ ScanGlobal         │ │  (Lambda: scan global services for one account)
-│  └────────────────────┘ │
-│  ┌────────────────────┐ │
-│  │ Map (Regions)      │ │  maxConcurrency: configurable (default 5)
-│  │  └─ ScanRegional   │ │  (Lambda: scan regional services for one region)
-│  └────────────────────┘ │
-│  ┌────────────────────┐ │
-│  │ WriteProgress      │ │  (DynamoDB: update per-account progress)
-│  └────────────────────┘ │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ AggregateResults        │  (Lambda: merge matches, write to S3)
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ MarkJobComplete         │  (DynamoDB: set status = done)
-└─────────────────────────┘
+```json
+{
+  "Effect": "Allow",
+  "Action": "execute-api:Invoke",
+  "Resource": "arn:aws:execute-api:us-east-1:TRUFFLE_ACCOUNT:API_ID/prod/*"
+}
 ```
 
-#### IAM Federation Discovery Workflow
-
-```
-StartExecution
-    │
-    ▼
-┌─────────────────────────┐
-│ ResolveCredentials      │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ Map (Accounts)          │
-│  ┌────────────────────┐ │
-│  │ ListRoles          │ │  (Lambda: paginate all IAM roles)
-│  └────────────────────┘ │
-│  ┌────────────────────┐ │
-│  │ FilterSAMLRoles    │ │  (Lambda: inspect trust policies, filter by IDP)
-│  └────────────────────┘ │
-│  ┌────────────────────┐ │
-│  │ EnrichPolicies     │ │  (Lambda: get attached/inline policies per role)
-│  └────────────────────┘ │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ AggregateAndStore       │  (Lambda: merge, write to S3 + DynamoDB)
-└─────────────────────────┘
-```
-
-#### Migration Workflow
-
-```
-StartExecution (with role ARNs + mode)
-    │
-    ▼
-┌─────────────────────────┐
-│ BackupTrustPolicies     │  (Lambda: snapshot current policies to S3)
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ Map (Roles)             │  maxConcurrency: 5 (throttle IAM writes)
-│  └─ UpdateTrustPolicy   │  (Lambda: ADD or REPLACE, log result to DynamoDB)
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ WriteMigrationLog       │  (DynamoDB: summary of results)
-└─────────────────────────┘
-```
-
-### 5. State & Progress — DynamoDB
-
-**Jobs table:**
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| PK | `USER#<sub>` | Cognito user ID |
-| SK | `JOB#<job_id>` | Unique job identifier |
-| type | String | `policy-scan`, `iam-discover`, `iam-migrate` |
-| status | String | `running`, `done`, `error` |
-| progress | Map | `{completed_units, total_units, roles_scanned, roles_total, activity}` |
-| started_at | String (ISO) | Job start timestamp |
-| finished_at | String (ISO) | Job completion timestamp |
-| result_key | String | S3 key for the full result payload |
-| error | String | Error message if failed |
-| TTL | Number | Auto-expire old jobs after 30 days |
-
-**Migration Log table:**
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| PK | `USER#<sub>` | Cognito user ID |
-| SK | `MIGRATE#<timestamp>#<role_arn>` | Per-role entry |
-| status | String | `success`, `skipped`, `error` |
-| mode | String | `ADD` or `REPLACE` |
-| error | String | Error detail if failed |
-| previous_trust_policy | Map | Backup for rollback |
-
-### 6. Results Storage — S3
-
-| Bucket | Purpose |
-|--------|---------|
-| `truffle-results-<account>` | Stores scan results, discovery dumps, IaC templates |
-
-Object key pattern: `users/<sub>/policy-analysis/<job_id>.json`
-
-Results are pre-signed for frontend download or read through the API.
-
-### 7. Cross-Account Access
-
-For the assume-role authentication method:
-
-```
-┌───────────────────────┐         ┌───────────────────────┐
-│  Truffle Account      │         │  Target Account       │
-│                       │         │                       │
-│  Lambda Execution     │ ──STS──▶│  TruffleReadOnlyRole  │
-│  Role                 │  Assume │                       │
-│                       │         │  - iam:List*          │
-│                       │         │  - iam:Get*           │
-│                       │         │  - s3:GetBucket*      │
-│                       │         │  - organizations:*    │
-│                       │         │  - (service-specific  │
-│                       │         │     read permissions) │
-└───────────────────────┘         └───────────────────────┘
-```
-
-For the migration workflow, the target role additionally needs:
-- `iam:UpdateAssumeRolePolicy`
+No direct access to Step Functions, DynamoDB, S3, or target accounts is needed.
 
 ---
 
-## Deployment Architecture
+## Job Orchestration: Step Functions
 
-### Infrastructure as Code (CDK)
+Step Functions handles the **account × region fanout**. Each account+region
+combination is a discrete unit of work dispatched to a Lambda invocation.
+
+### Policy Analysis Workflow
 
 ```
-managed-solution/
-├── bin/
-│   └── app.ts                    # CDK app entry point
-├── lib/
-│   ├── frontend-stack.ts         # S3 + CloudFront + Cognito
-│   ├── api-stack.ts              # API Gateway + Lambda functions
-│   ├── workflow-stack.ts         # Step Functions state machines
-│   ├── storage-stack.ts          # DynamoDB tables + S3 results bucket
-│   └── cross-account-stack.ts   # Stackset for target account roles
-├── lambda/
-│   ├── scan-global/              # Policy scan — global services
-│   ├── scan-regional/            # Policy scan — regional services
-│   ├── iam-discover/             # IAM Federation — role discovery
-│   ├── iam-migrate/              # IAM Federation — trust policy update
-│   ├── aggregate/                # Merge results, write to S3
-│   ├── start-job/                # Start Step Functions execution
-│   ├── get-status/               # Read DynamoDB job status
-│   └── shared/                   # Shared utilities (credential resolution)
-├── state-machines/
-│   ├── policy-scan.asl.json      # Policy scan workflow definition
-│   ├── iam-discover.asl.json     # IAM discovery workflow definition
-│   └── iam-migrate.asl.json      # Migration workflow definition
-└── cdk.json
+StartExecution (input: {accounts, regions, search_terms, services})
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ Map (Accounts)   maxConcurrency: 10 (configurable)  │
+│                                                     │
+│  ┌───────────────────────────────────────────────┐  │
+│  │ Map (Regions)  maxConcurrency: 5              │  │
+│  │                                               │  │
+│  │  ┌─────────────────────────────────────────┐  │  │
+│  │  │ ScanUnit Lambda                         │  │  │
+│  │  │  - AssumeRole into target account       │  │  │
+│  │  │  - Parallel API calls within the unit   │  │  │
+│  │  │    (asyncio, bounded by semaphore)      │  │  │
+│  │  │  - Returns matches for this acct+region │  │  │
+│  │  └─────────────────────────────────────────┘  │  │
+│  │                                               │  │
+│  └───────────────────────────────────────────────┘  │
+│                                                     │
+│  ┌───────────────────────────────────────────────┐  │
+│  │ ScanGlobal Lambda (per account)               │  │
+│  │  - S3 bucket policies, IAM, Organizations     │  │
+│  └───────────────────────────────────────────────┘  │
+│                                                     │
+│  WriteProgress → DynamoDB (per-account progress)    │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ AggregateResults Lambda                             │
+│  - Merge all matches into a single result set       │
+│  - Write final payload to S3                        │
+│  - Update DynamoDB job status → "done"              │
+└─────────────────────────────────────────────────────┘
 ```
 
-### Environments
+### IAM Federation Discovery Workflow
 
-| Environment | Purpose | Account |
-|-------------|---------|---------|
-| Dev | Development and testing | Dedicated dev account |
-| Staging | Pre-production validation | Shared services account |
-| Production | Customer-facing | Production account |
+```
+StartExecution (input: {accounts, idp_filter, role_name})
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ Map (Accounts)   maxConcurrency: 10                 │
+│                                                     │
+│  ┌─────────────────────────────────────────────┐    │
+│  │ DiscoverRoles Lambda                        │    │
+│  │  - AssumeRole into target                   │    │
+│  │  - Paginate all IAM roles (parallel pages)  │    │
+│  │  - Filter by SAML trust policy              │    │
+│  │  - Enrich with attached/inline policies     │    │
+│  └─────────────────────────────────────────────┘    │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ AggregateAndStore Lambda                            │
+│  - Merge discovered roles                           │
+│  - Write to S3 + update DynamoDB                    │
+└─────────────────────────────────────────────────────┘
+```
+
+### Migration Workflow
+
+```
+StartExecution (input: {role_arns, mode, aam_provider_arn})
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ BackupTrustPolicies Lambda                          │
+│  - Snapshot current trust policies to S3            │
+└──────────────────────────┬──────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────┐
+│ Map (Roles)   maxConcurrency: 5 (throttle writes)   │
+│                                                     │
+│  ┌─────────────────────────────────────────────┐    │
+│  │ MigrateRole Lambda                          │    │
+│  │  - AssumeRole (TruffleRole)                 │    │
+│  │  - Check for existing AAM trust statement   │    │
+│  │  - ADD or REPLACE trust policy              │    │
+│  │  - Log result to DynamoDB                   │    │
+│  └─────────────────────────────────────────────┘    │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ WriteMigrationLog Lambda                            │
+│  - Summarize results in DynamoDB                    │
+└─────────────────────────────────────────────────────┘
+```
+
+### Error Handling
+
+Every Lambda invocation in a Map state has:
+
+```json
+{
+  "Retry": [
+    {
+      "ErrorEquals": ["Lambda.TooManyRequestsException", "States.TaskFailed"],
+      "IntervalSeconds": 5,
+      "MaxAttempts": 3,
+      "BackoffRate": 2.0
+    }
+  ],
+  "Catch": [
+    {
+      "ErrorEquals": ["States.ALL"],
+      "ResultPath": "$.error",
+      "Next": "RecordUnitFailure"
+    }
+  ]
+}
+```
+
+Failed units are recorded but don't block other accounts/regions. The final
+aggregation reports partial failures to the user.
 
 ---
 
-## Scalability Characteristics
+## Lambda: Parallelism Within a Unit
 
-| Dimension | Scaling mechanism | Limit |
-|-----------|-------------------|-------|
-| Concurrent users | API Gateway scales automatically | 10,000 RPS default |
-| Accounts per scan | Step Functions Map state parallelism | Configurable (1–40 concurrent) |
-| Regions per account | Nested Map state | All enabled regions in parallel |
-| Resources per region | Lambda memory + timeout | 10 GB / 15 min per invocation |
-| Job duration | Step Functions Standard | Up to 1 year |
-| Results storage | S3 | Unlimited |
+Step Functions handles fanout across accounts and regions. Within a single
+Lambda invocation (one account + one region), the scanner still parallelizes
+API calls for throughput.
 
-### Lambda Sizing Recommendations
+### Why
+
+A single region in one account might have:
+- 200 S3 buckets → 200 GetBucketPolicy calls
+- 50 SQS queues → 50 GetQueueAttributes calls
+- 30 KMS keys → 30 GetKeyPolicy calls
+
+Sequential execution would waste Lambda billable time and hit the 15-minute
+timeout on large accounts.
+
+### How
+
+```python
+import asyncio
+from aiobotocore.session import get_session
+
+CONCURRENCY_PER_SERVICE = 10  # avoid throttling any single API
+
+async def scan_unit(account_id: str, region: str, role_arn: str, search_terms: list[str]):
+    """Scan all resource policies in one account + one region."""
+    session = await assume_role_async(role_arn)
+
+    results = await asyncio.gather(
+        scan_s3_policies(session, region, search_terms),
+        scan_sqs_policies(session, region, search_terms),
+        scan_kms_policies(session, region, search_terms),
+        scan_sns_policies(session, region, search_terms),
+        scan_lambda_policies(session, region, search_terms),
+        scan_secrets_manager(session, region, search_terms),
+        scan_ecr_policies(session, region, search_terms),
+        # ... additional services
+    )
+    return merge_results(results)
+
+async def scan_s3_policies(session, region, search_terms):
+    """Fetch all bucket policies concurrently with bounded concurrency."""
+    s3 = session.create_client('s3', region_name=region)
+    buckets = await list_buckets(s3)
+
+    sem = asyncio.Semaphore(CONCURRENCY_PER_SERVICE)
+
+    async def get_one(bucket):
+        async with sem:
+            try:
+                resp = await s3.get_bucket_policy(Bucket=bucket)
+                return analyze_policy(resp['Policy'], search_terms, bucket)
+            except s3.exceptions.NoSuchBucketPolicy:
+                return None
+
+    return await asyncio.gather(*[get_one(b) for b in buckets], return_exceptions=True)
+```
+
+### Key Points
+
+- **Step Functions** = account/region fanout (no parallelism in the client)
+- **Lambda (asyncio)** = service/resource fanout within a single unit
+- **Semaphore** = per-service concurrency cap to avoid throttling
+- **Network advantage** = Lambda → AWS API is ~1-5ms vs ~50-200ms from a laptop
+
+### Lambda Sizing
 
 | Function | Memory | Timeout | Rationale |
 |----------|--------|---------|-----------|
+| ScanUnit (regional) | 512 MB | 5 min | Bounded by service count per region |
 | ScanGlobal | 512 MB | 10 min | S3 bucket enumeration can be slow |
-| ScanRegional | 512 MB | 5 min | Bounded by region service count |
-| IamDiscover | 1024 MB | 10 min | Paginating thousands of roles |
-| IamMigrate | 256 MB | 30 sec | Single IAM API call per role |
-| Aggregate | 1024 MB | 2 min | Merging large result sets |
-| StartJob / GetStatus | 128 MB | 10 sec | Simple DynamoDB reads/writes |
+| DiscoverRoles | 1024 MB | 10 min | Paginating thousands of IAM roles |
+| MigrateRole | 256 MB | 30 sec | Single IAM API call per role |
+| AggregateResults | 1024 MB | 2 min | Merging large result sets in memory |
+| StartJob / GetStatus | 128 MB | 10 sec | Simple DynamoDB read/write |
 
 ---
 
-## Cost Estimate (1,000 accounts × 5 regions × 2,000 resources)
+## Cross-Account Access: StackSet-Deployed Roles
 
-| Component | Calculation | Cost per run |
-|-----------|-------------|-------------|
-| Step Functions | ~12,000 state transitions × $0.025/1K | $0.30 |
-| Lambda (scan) | 6,000 invocations × 60s avg × 0.5 GB | $3.00 |
-| Lambda (API) | ~4,000 invocations × 0.1s × 128 MB | $0.01 |
-| DynamoDB | ~12,000 writes + ~4,000 reads | $0.02 |
-| S3 | ~10 PutObject + storage | $0.01 |
-| API Gateway | ~4,000 requests × $1/million | $0.004 |
-| CloudFront | Static assets cached | $0.01 |
-| **Total per scan** | | **~$3.35** |
+### Approach
 
-Monthly cost at once-daily runs: **~$100/month**
-Monthly cost at weekly runs: **~$14/month**
+A CloudFormation StackSet deploys IAM roles into every target account that
+Truffle needs to scan or migrate. This is a one-time setup by the customer's
+platform/infra team.
 
----
+A single role is deployed:
 
-## Security
+| Role | Purpose | Permissions |
+|------|---------|-------------|
+| `TruffleRole` | Scanning, discovery, and migration | `ReadOnlyAccess` + `iam:UpdateAssumeRolePolicy` |
 
-| Layer | Control |
-|-------|---------|
-| Network | CloudFront + API Gateway — no direct Lambda exposure |
-| Authentication | Cognito JWT tokens on every API request |
-| Authorization | User-scoped DynamoDB keys prevent cross-user access |
-| Cross-account | Least-privilege IAM roles in target accounts |
-| Encryption at rest | S3 SSE-S3, DynamoDB encryption enabled |
-| Encryption in transit | TLS everywhere (CloudFront → API GW → Lambda) |
-| Secrets | No secrets stored — all credential resolution via IAM roles |
-| Audit | CloudTrail logs all IAM mutations; Step Functions execution history |
+Read operations (scan, discovery) use only the read-only permissions. The
+`iam:UpdateAssumeRolePolicy` permission is only exercised during an explicit
+migration workflow — no write calls happen during scans.
 
----
+### Trust Relationship
 
-## Resilience & Recovery
+The role trusts only the Lambda execution role in the Truffle backend account:
 
-| Scenario | Handling |
-|----------|----------|
-| Lambda timeout on a single unit | Step Functions retries with exponential backoff (3 attempts) |
-| Partial scan failure | Map state `tolerated failure` threshold; successful units are preserved |
-| User closes browser mid-scan | Job continues in Step Functions; frontend reconnects via job ID |
-| Server-side error | DynamoDB stores error state; user can re-run (idempotent) |
-| Need to rollback migration | Trust policy backups stored in S3; rollback Lambda available |
-
----
-
-## Migration Path (Local → Managed)
-
-1. **Phase 1:** Deploy the static frontend to CloudFront + S3. Keep the API running locally for testing.
-2. **Phase 2:** Deploy the API Gateway + Lambda functions. Point the frontend at the managed API.
-3. **Phase 3:** Replace the thread-based job runner with Step Functions workflows.
-4. **Phase 4:** Add Cognito for multi-user authentication.
-5. **Phase 5:** Deploy CloudFormation StackSets for cross-account roles in target accounts.
-
-Each phase is independently deployable and testable. The frontend doesn't change between phases — only the API endpoint it targets.
-
-
----
-
-## Deep Dive: Cross-Account Access
-
-### How It Works
-
-The Truffle managed solution uses **IAM role chaining** to access customer accounts. The scan/discovery/migration Lambdas in the Truffle account call `sts:AssumeRole` to obtain temporary credentials in each target account.
-
-```
-┌─────────────────────────────┐           ┌──────────────────────────────┐
-│  Truffle Account (central)  │           │  Customer Account (target)   │
-│                             │           │                              │
-│  Lambda Execution Role      │──AssumeRole──▶ TruffleScanRole          │
-│  arn:aws:iam::TRUFFLE:role/ │           │  arn:aws:iam::CUSTOMER:role/ │
-│    TruffleLambdaExecRole    │           │    TruffleScanRole           │
-│                             │           │                              │
-│  Trust: lambda.amazonaws.com│           │  Trust: arn:aws:iam::TRUFFLE │
-│  Permissions:               │           │    :role/TruffleLambdaExec   │
-│    sts:AssumeRole on        │           │                              │
-│    arn:aws:iam::*:role/     │           │  Permissions:                │
-│      TruffleScanRole        │           │    iam:List*, iam:Get*       │
-│                             │           │    s3:GetBucket*, s3:List*   │
-│                             │           │    organizations:Describe*   │
-│                             │           │    organizations:List*       │
-│                             │           │    (service-specific reads)  │
-└─────────────────────────────┘           └──────────────────────────────┘
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::TRUFFLE_ACCOUNT:role/TruffleLambdaExecRole"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "sts:ExternalId": "${ExternalId}"
+        }
+      }
+    }
+  ]
+}
 ```
 
-For the **migration** workflow, a separate role with write permissions is used:
-
-```
-TruffleMigrateRole (target account)
-  Trust: arn:aws:iam::TRUFFLE:role/TruffleLambdaExecRole
-  Condition: sts:ExternalId = <customer-provided-secret>
-  Permissions:
-    iam:GetRole
-    iam:UpdateAssumeRolePolicy
-```
-
-### Customer Requirements
-
-To enable Truffle to scan or migrate their accounts, the customer must:
-
-| Requirement | Detail |
-|-------------|--------|
-| **1. Deploy IAM roles in target accounts** | A `TruffleScanRole` (read-only) and optionally `TruffleMigrateRole` (write) in each account to be scanned/migrated. |
-| **2. Trust the Truffle central account** | The role trust policy must allow `sts:AssumeRole` from the Truffle Lambda execution role ARN. |
-| **3. Use an external ID (recommended)** | An `sts:ExternalId` condition in the trust policy prevents confused-deputy attacks. The customer provides their unique external ID during onboarding; Truffle passes it on every AssumeRole call. |
-| **4. Scope permissions appropriately** | Read-only role gets only List/Get/Describe. Migration role gets only `iam:UpdateAssumeRolePolicy`. No admin access. |
-| **5. Deploy via StackSet or Terraform** | For multi-account, the customer deploys the role to all target accounts via CloudFormation StackSets (org-level) or Terraform. We provide the template. |
-
-### Provided Deployment Templates
-
-We provide customers with ready-to-deploy templates:
-
-**CloudFormation (StackSet-compatible):**
+### StackSet Template
 
 ```yaml
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Truffle cross-account role — deployed via StackSet to all target accounts.
+
 Parameters:
   TruffleAccountId:
     Type: String
-    Description: The AWS account ID of the Truffle managed solution
+    Description: AWS account ID hosting the Truffle managed backend
   ExternalId:
     Type: String
-    Description: Your unique external ID (provided during onboarding)
+    Description: Shared external ID for confused-deputy protection
     NoEcho: true
 
 Resources:
-  TruffleScanRole:
+  TruffleRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: TruffleScanRole
+      RoleName: TruffleRole
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -468,177 +483,231 @@ Resources:
                 sts:ExternalId: !Ref ExternalId
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Policies:
+        - PolicyName: TruffleMigratePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:UpdateAssumeRolePolicy
+                Resource: "*"
       Tags:
         - Key: ManagedBy
           Value: Truffle
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt TruffleRole.Arn
 ```
 
-### Security Controls on Cross-Account Access
+### How Lambdas Use the Role
+
+```python
+import boto3
+
+def assume_truffle_role(account_id: str, external_id: str, operation: str = "scan"):
+    """Assume the Truffle role in a target account."""
+    sts = boto3.client("sts")
+    resp = sts.assume_role(
+        RoleArn=f"arn:aws:iam::{account_id}:role/TruffleRole",
+        RoleSessionName=f"truffle-{operation}-{account_id}",
+        ExternalId=external_id,
+        DurationSeconds=3600,
+    )
+    creds = resp["Credentials"]
+    return boto3.Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+    )
+```
+
+### Security Controls
 
 | Control | Purpose |
 |---------|---------|
 | External ID | Prevents confused-deputy attacks |
-| Explicit trust to specific role ARN | Only the Truffle Lambda role can assume (not the whole account) |
-| Least privilege | Read-only for scanning; write scoped to `iam:UpdateAssumeRolePolicy` only for migration |
-| No persistent credentials | All access via short-lived STS tokens (1-hour max) |
-| CloudTrail | Every AssumeRole call is logged in both accounts |
-| Role session name | Set to `truffle-<job_id>` for auditability |
+| Trust scoped to specific role ARN | Only `TruffleLambdaExecRole` can assume — not the whole account |
+| Least privilege | ReadOnlyAccess + only `iam:UpdateAssumeRolePolicy` for migration |
+| Short-lived credentials | STS tokens expire in 1 hour max |
+| Role session name | Set to `truffle-<operation>-<account_id>` for CloudTrail auditability |
+| StackSet deployment | Centrally managed — role can be revoked org-wide in one operation |
 
 ---
 
-## Deep Dive: Failure Handling & Resilience
+## State & Progress: DynamoDB
 
-### Step Functions Error Handling Strategy
+### Jobs Table
 
-Every unit of work (one account × one region, or one role) is an individual Lambda invocation wrapped in Step Functions error handling:
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| PK | `CALLER#<iam-arn>` | Caller's IAM ARN (from SigV4 context) |
+| SK | `JOB#<job_id>` | Unique job identifier |
+| type | String | `policy-scan`, `iam-discover`, `iam-migrate`, `idc-discover` |
+| status | String | `running`, `done`, `error` |
+| progress | Map | `{completed_units, total_units, message}` |
+| started_at | String (ISO) | Job start timestamp |
+| finished_at | String (ISO) | Job completion timestamp |
+| result_key | String | S3 key for the full result payload |
+| error | String | Error message if failed |
+| TTL | Number | Auto-expire old jobs after 30 days |
 
-```json
-{
-  "ScanRegional": {
-    "Type": "Task",
-    "Resource": "arn:aws:lambda:...:scan-regional",
-    "Retry": [
-      {
-        "ErrorEquals": ["Lambda.TooManyRequestsException", "States.TaskFailed"],
-        "IntervalSeconds": 5,
-        "MaxAttempts": 3,
-        "BackoffRate": 2.0
-      },
-      {
-        "ErrorEquals": ["States.Timeout"],
-        "IntervalSeconds": 30,
-        "MaxAttempts": 2,
-        "BackoffRate": 1.5
-      }
-    ],
-    "Catch": [
-      {
-        "ErrorEquals": ["States.ALL"],
-        "ResultPath": "$.error",
-        "Next": "RecordUnitFailure"
-      }
-    ],
-    "TimeoutSeconds": 600
-  }
-}
-```
+Jobs are keyed by the caller's IAM ARN (extracted from the API Gateway request
+context). This provides natural isolation — each caller sees only their own jobs
+without needing a separate user management system.
 
-### Failure Scenarios & Responses
+### Migration Log Table
 
-| Scenario | Detection | Response | User Impact |
-|----------|-----------|----------|-------------|
-| **Single region timeout** | Lambda exceeds 10-min timeout | Step Functions catches `States.Timeout`, retries twice with 30s/45s backoff. If still failing, catches error and records partial failure. | Other regions/accounts proceed; user sees "partial" status on that account. |
-| **API rate limiting (throttling)** | `TooManyRequestsException` or `Throttling` from AWS SDK | Retry with exponential backoff: 5s → 10s → 20s (3 attempts). Lambda itself also has SDK-level retries with jitter. | Transparent to user — most throttles resolve within the retry window. |
-| **Account credential failure** | `AccessDenied` or `ExpiredToken` | Caught immediately, no retry (not transient). Recorded as account-level error. | User sees the specific account marked as "error" with the reason. Other accounts continue. |
-| **Single role migration failure** | IAM API error on UpdateAssumeRolePolicy | Caught per-role. Logged as `error` in migration log. Other roles continue. | User sees per-role status: success/skipped/error with detail. |
-| **Lambda OOM or crash** | `States.TaskFailed` | Retried up to 3 times. If persistent, caught and recorded. | Rare — Lambda memory is sized generously. |
-| **Step Functions service error** | `States.Runtime` | Built-in SF retry. Extremely rare. | User can re-run; completed units are idempotent. |
-
-### Rate Limit Mitigation (Preventive)
-
-Beyond reactive retries, we proactively prevent throttling:
-
-| Technique | Implementation |
-|-----------|---------------|
-| **Controlled parallelism** | Map state `MaxConcurrency` limits concurrent account scans (default: 10). Prevents stampeding 1,000 accounts simultaneously. |
-| **Per-service concurrency** | Within a Lambda, the scanner uses a thread pool (max 5 workers per service) — same as the local tool. |
-| **Staggered start** | Map iterations start with a small random jitter (0–2s) to avoid synchronized bursts. |
-| **SDK retry with jitter** | boto3 configured with `adaptive` retry mode — automatically handles throttling with full jitter backoff. |
-| **Regional spread** | Different regions hit different API endpoints, naturally distributing load. |
-
-### Partial Results & Resume
-
-If a scan completes with some failed units:
-
-1. **Successful units are preserved** — results from completed account/region combinations are stored in S3 and reflected in the final output.
-2. **Failed units are flagged** — the job status shows `status: "done"` with a `partial: true` flag and a list of failed units.
-3. **Re-run is safe** — a re-run of the same scan parameters will re-scan all units (no server-side checkpoint for the managed version, since Step Functions handles the retry logic internally). Completed migrations are idempotent (the AAM trust Sid is checked before update).
-
-### Idempotency Guarantees
-
-| Operation | Idempotent? | Mechanism |
-|-----------|-------------|-----------|
-| Policy scan | Yes | Read-only; repeated scans just refresh data |
-| Role discovery | Yes | Read-only |
-| Trust policy migration (ADD) | Yes | Checks for existing `AAMTrustPolicyStatement` Sid before adding |
-| Trust policy migration (REPLACE) | Yes | Same Sid check |
-| IaC generation | Yes | Pure computation from cached data |
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| PK | `CALLER#<iam-arn>` | Caller's IAM ARN |
+| SK | `MIGRATE#<timestamp>#<role_arn>` | Per-role entry |
+| status | String | `success`, `skipped`, `error` |
+| mode | String | `ADD` or `REPLACE` |
+| error | String | Error detail if failed |
+| previous_trust_policy | Map | Backup for rollback |
 
 ---
 
-## Deep Dive: Frontend Security (CloudFront)
+## Results Storage: S3
 
-### The Concern
+| Bucket | Purpose |
+|--------|---------|
+| `truffle-results-<account_id>` | Stores scan results, discovery data, IaC templates |
 
-A public CloudFront distribution means anyone with the URL could potentially access the application. For an internal migration tool that operates on IAM trust policies, this is unacceptable.
+Object key pattern: `callers/<iam-arn-hash>/policy-analysis/<job_id>.json`
 
-### Solution: CloudFront + Cognito + API Gateway Authorization
+Results are read by the GetResult Lambda and returned through the API. No
+pre-signed URLs are needed since the client never talks to S3 directly.
 
-We use the standard AWS pattern for securing single-page applications:
+---
+
+## Auth Flow: End-to-End
 
 ```
-                    ┌─────────────────────┐
-                    │  User's Browser     │
-                    └──────────┬──────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │  CloudFront         │
-                    │  (public endpoint)  │
-                    └──────────┬──────────┘
-                               │
-              ┌────────────────┼────────────────┐
-              ▼                                 ▼
-    ┌──────────────────┐              ┌──────────────────┐
-    │  S3 (static UI)  │              │  API Gateway     │
-    │  (public assets) │              │  (/api/*)        │
-    │  - HTML/JS/CSS   │              │                  │
-    │  - No sensitive   │              │  JWT Authorizer  │◀── Cognito
-    │    data           │              │  (EVERY request) │    User Pool
-    └──────────────────┘              └──────────────────┘
+1. User runs: TRUFFLE_MODE=managed TRUFFLE_API_ENDPOINT=https://xxx.execute-api.us-east-1.amazonaws.com/prod python app.py
+2. Flask starts on localhost with managed mode enabled
+3. User opens UI in browser → React app loads from localhost
+4. User configures a scan and clicks "Start"
+5. React → POST localhost:5000/api/policy-analysis/scan
+6. Flask (_jobs_managed.py) → resolves local AWS creds (SSO/profile/env)
+7. Flask → SigV4-signs the request → POST https://xxx.execute-api.../prod/api/policy-analysis/scan
+8. API Gateway validates SigV4 + resource policy (org check) → allows
+9. StartScanFn Lambda → writes job to DynamoDB → starts Step Functions execution → returns {job_id}
+10. React polls localhost:5000/api/policy-analysis/status?job=xxx every 5s
+11. Flask signs each poll → API Gateway → GetStatusFn → DynamoDB → returns progress
+12. Step Functions completes → AggregateResults writes to S3, marks job "done"
+13. React fetches results → Flask → API Gateway → GetResultFn → S3 → returns payload
 ```
 
-### Security Layers
+---
 
-| Layer | What It Does | Why It's Secure |
-|-------|-------------|-----------------|
-| **CloudFront → S3** | Serves the React bundle (HTML, JS, CSS) | These are **static build artifacts** — they contain no secrets, no data, no API keys. Even if someone loads the page unauthenticated, they see a login screen and nothing else. |
-| **Cognito Authentication** | User must sign in before the app is functional | The React app redirects to Cognito hosted UI (or embedded login). No API calls are possible without a valid JWT. |
-| **API Gateway JWT Authorizer** | Validates the Cognito access token on every `/api/*` request | Without a valid, non-expired token signed by the Cognito User Pool, API Gateway returns 401. The Lambda never executes. |
-| **Token scoping** | Each user's jobs/data are namespaced by Cognito `sub` | Even with a valid token, User A cannot access User B's scan results. |
+## Deployment Structure (CDK)
 
-### Why This Pattern Is Standard and Secure
+```
+managed-solution/
+├── bin/
+│   └── app.ts                       # CDK app entry point
+├── lib/
+│   ├── api-stack.ts                 # API Gateway (Regional, IAM auth) + Lambda functions
+│   ├── workflow-stack.ts            # Step Functions state machines
+│   ├── storage-stack.ts             # DynamoDB tables + S3 results bucket
+│   └── cross-account-stack.ts       # StackSet template for target account roles
+├── lambda/
+│   ├── start-job/                   # Start Step Functions execution
+│   ├── get-status/                  # Read DynamoDB job status
+│   ├── get-result/                  # Read results from S3
+│   ├── scan-unit/                   # Scan one account+region (async parallel)
+│   ├── scan-global/                 # Scan global services for one account
+│   ├── discover-roles/              # IAM Federation discovery for one account
+│   ├── migrate-role/                # Update trust policy for one role
+│   ├── aggregate/                   # Merge results, write to S3
+│   └── shared/                      # Credential resolution, utils
+├── state-machines/
+│   ├── policy-scan.asl.json
+│   ├── iam-discover.asl.json
+│   └── iam-migrate.asl.json
+├── stackset-templates/
+│   └── truffle-target-roles.yaml    # Cross-account role StackSet
+└── cdk.json
+```
 
-This is the [AWS-recommended pattern](https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/deploy-a-react-based-single-page-application-to-amazon-s3-and-cloudfront.html) for serverless SPAs. It's used by:
-- AWS Console itself (CloudFront + auth)
-- AWS Amplify hosted apps
-- Most SaaS products on AWS
+Note: No frontend hosting infrastructure (no CloudFront, S3 static hosting, or
+Cognito stacks). The UI runs locally.
 
-The static assets being "public" is not a vulnerability because:
-1. **The JavaScript bundle is the UI shell** — it renders a login form. It cannot access any data without a token.
-2. **All sensitive operations are behind the API** — which requires authentication.
-3. **There are no embedded secrets** — credentials are resolved server-side via IAM roles.
+---
 
-### Additional Hardening Options
+## Scalability
 
-If even the login page being publicly accessible is a concern, we have options:
+| Dimension | Mechanism | Limit |
+|-----------|-----------|-------|
+| Concurrent callers | API Gateway auto-scales | 10,000 RPS (default) |
+| Accounts per scan | Step Functions Map state | Configurable (default 10 concurrent) |
+| Regions per account | Nested Map state | All enabled regions in parallel |
+| Resources per region | Lambda asyncio with semaphore | Bounded by memory + timeout |
+| Job duration | Step Functions Standard | Up to 1 year |
+| Results storage | S3 | Unlimited |
 
-| Option | Trade-off |
-|--------|-----------|
-| **CloudFront + WAF with IP allowlist** | Restrict CloudFront to corporate IP ranges. Simple but breaks remote/VPN users. |
-| **CloudFront + Lambda@Edge auth** | Lambda@Edge checks for a valid session cookie before serving any static asset. Unauthorized users see nothing — not even the login page. |
-| **AWS Verified Access** | Place the entire app behind Verified Access with IdP integration (Okta, Entra, etc.). Zero-trust network access — only authenticated, posture-checked devices see the app. |
-| **Private CloudFront + VPN** | CloudFront with a custom origin access policy that only responds to requests from a VPN or AWS PrivateLink. Heaviest; enterprise-grade. |
-| **Cognito + hosted UI with SAML/OIDC** | Federate Cognito with the customer's corporate IdP (Okta, Entra, etc.). Login is via their existing SSO — no separate password. |
+---
 
-### Recommended Approach
+## Cost Estimate (1,000 accounts x 5 regions x 2,000 resources)
 
-For this tool, I'd recommend:
+| Component | Calculation | Cost per run |
+|-----------|-------------|-------------|
+| Step Functions | ~12,000 state transitions x $0.025/1K | $0.30 |
+| Lambda (scan) | 6,000 invocations x 60s avg x 0.5 GB | $3.00 |
+| Lambda (API) | ~100 invocations x 0.1s x 128 MB | < $0.01 |
+| DynamoDB | ~12,000 writes + reads | $0.02 |
+| S3 | Result objects + storage | $0.01 |
+| API Gateway | ~100 requests x $1/million | < $0.01 |
+| **Total per scan** | | **~$3.35** |
 
-1. **Cognito User Pool federated with the customer's corporate IdP** (SAML or OIDC) — no standalone passwords, users authenticate with their existing corporate credentials.
-2. **Lambda@Edge session check** on CloudFront — unauthenticated requests to any path (including static assets) get redirected to the Cognito login flow. Unauthorized users cannot even load the JavaScript bundle.
-3. **WAF on CloudFront** with:
-   - Rate limiting (prevent brute-force)
-   - Geographic restrictions (if applicable)
-   - AWS Managed Rules (SQLi, XSS — defense in depth even though this is a SPA)
+No CloudFront, Cognito, or WAF costs.
 
-This gives you a zero-trust posture: the app is invisible to anyone who isn't authenticated through the corporate IdP, and even authenticated users can only access their own data.
+---
+
+## Security Summary
+
+| Layer | Control |
+|-------|---------|
+| API access | IAM SigV4 on every request + resource policy (org-scoped) |
+| No public UI | Frontend runs on localhost only |
+| Cross-account | Least-privilege StackSet role with external ID |
+| Data isolation | DynamoDB keyed by caller IAM ARN |
+| Encryption at rest | S3 SSE-S3, DynamoDB encryption enabled |
+| Encryption in transit | TLS everywhere (HTTPS to API Gateway, HTTPS to AWS APIs from Lambda) |
+| No stored secrets | All credential resolution via IAM roles and STS |
+| Audit | CloudTrail logs all API Gateway calls and cross-account AssumeRole |
+
+---
+
+## Resilience & Recovery
+
+| Scenario | Handling |
+|----------|----------|
+| Lambda timeout on one unit | Step Functions retries with exponential backoff (3 attempts) |
+| Partial scan failure | Map state tolerates failures; successful units preserved |
+| User closes browser mid-scan | Job continues in Step Functions; user re-opens UI and polls status |
+| AWS API throttling | SDK adaptive retry + asyncio semaphore limits concurrent calls |
+| Need to rollback migration | Trust policy backups stored in S3; re-run with original policy |
+| Full scan re-run | Idempotent — read-only scans just refresh data |
+
+---
+
+## Comparison: Local Mode vs Managed Mode
+
+| | Local Mode | Managed Mode |
+|---|---|---|
+| Where scanning runs | User's machine (threads) | AWS Lambda (asyncio) |
+| Account/region parallelism | ThreadPoolExecutor in Python | Step Functions Map states |
+| Within-unit parallelism | ThreadPoolExecutor (same) | asyncio + semaphore (same pattern) |
+| Credential source | User's local AWS creds directly | Lambda exec role → AssumeRole into targets |
+| Resilience | Checkpoint files for resume | Step Functions retry + catch |
+| Network latency to APIs | 50-200ms per call | 1-5ms per call |
+| Max scan duration | Until machine sleeps / process killed | Up to 1 year (Step Functions) |
+| Setup required | Just AWS creds | Deploy backend stack + StackSet roles |
+| Multi-user support | No (single machine) | Yes (isolated by IAM ARN) |
+
+Both modes use the same UI, same Flask routes, and same API contract. The user
+selects the mode at launch with a single environment variable.

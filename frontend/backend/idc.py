@@ -522,14 +522,28 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
         permission_sets = [ps for ps in permission_sets if ps["arn"] in selected_ps_arns]
         assignments = [a for a in assignments if a["permission_set_arn"] in selected_ps_arns]
 
+    # Filter to selected assignments if provided
+    selected_assignments_list = params.get("selected_assignments")
+    if selected_assignments_list:
+        selected_keys = {
+            (sa["permission_set_arn"], sa["account_id"], sa["principal_id"])
+            for sa in selected_assignments_list
+        }
+        assignments = [
+            a for a in assignments
+            if (a["permission_set_arn"], a["account_id"], a["principal_id"]) in selected_keys
+        ]
+
     # Resolve sessions for the target accounts
     session = _resolve_hub_session(params)
 
-    # For multi-account, we need per-account sessions
+    # For multi-account, we need per-account sessions.
+    # IMPORTANT: only resolve sessions for accounts that are actually in scope
+    # (derived from the filtered assignments), not all accounts in the inventory.
     auth_method = params.get("auth_method") or "profiles"
     account_sessions: dict = {}
 
-    # Collect unique target accounts from assignments
+    # Collect unique target accounts from the FILTERED assignments only
     target_account_ids = sorted({a["account_id"] for a in assignments})
 
     if auth_method == "assume_role":
@@ -606,6 +620,7 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
         role_name = role_map.get(ps_arn, "")
         ps = ps_by_arn.get(ps_arn)
         acct_session = account_sessions.get(acct_id)
+        warnings: list[str] = []
 
         if not role_name or not ps:
             return {
@@ -662,8 +677,8 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
             for p in ps.get("aws_managed_policies", []):
                 try:
                     iam.attach_role_policy(RoleName=role_name, PolicyArn=p["arn"])
-                except Exception:
-                    pass
+                except Exception as exc:
+                    warnings.append(f"Failed to attach managed policy {p['arn']}: {exc}")
 
             # Attach CMP references
             for ref in ps.get("customer_managed_policy_references", []):
@@ -671,8 +686,8 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
                 cmp_arn = f"arn:aws:iam::{acct_id}:policy{path}{ref['name']}"
                 try:
                     iam.attach_role_policy(RoleName=role_name, PolicyArn=cmp_arn)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    warnings.append(f"Failed to attach CMP {cmp_arn}: {exc}")
 
             # Inline policy
             if ps.get("inline_policy"):
@@ -682,10 +697,10 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
                         PolicyName=f"{role_name}-inline",
                         PolicyDocument=json.dumps(ps["inline_policy"]),
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    warnings.append(f"Failed to attach inline policy: {exc}")
 
-            return {
+            result = {
                 "role_name": role_name,
                 "role_arn": target_arn,
                 "account_id": acct_id,
@@ -693,6 +708,10 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
                 "status": "created",
                 "timestamp": _now(),
             }
+            if warnings:
+                result["warnings"] = warnings
+                result["error"] = f"{len(warnings)} policy attach failure(s)"
+            return result
 
         except Exception as exc:
             return {
@@ -725,6 +744,11 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
     # Entitlements map each assignment (principal → role in account) to the AAM
     # application. They are created in the hub account (where AAM lives), not
     # in the spoke accounts.
+    #
+    # IAM is eventually consistent — a newly created role may not be resolvable
+    # by AAM immediately. Individual entitlement calls retry on ValidationException.
+    import time
+
     entitlement_results: list[dict] = []
 
     if aam_application_arn:
@@ -768,7 +792,10 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
                 # AAM is in preview — the GA endpoint doesn't exist yet.
                 # Default to the preview endpoint; will be removed once GA lands.
                 aam_endpoint_url = params.get("aam_endpoint_url") or f"https://account-access-preview.{aam_region}.api.aws"
-                aam_client = session.client("accountaccess", region_name=aam_region, endpoint_url=aam_endpoint_url)
+                # IMPORTANT: AAM entitlements live in the hub/management account,
+                # not the target accounts. Use default creds (same as IdC discovery).
+                hub_session_for_aam = build_session(None)
+                aam_client = hub_session_for_aam.client("accountaccess", region_name=aam_region, endpoint_url=aam_endpoint_url)
             except Exception as exc:
                 # If the AAM client can't be created (missing custom SDK), report all as failed
                 for a in eligible_assignments:
@@ -798,25 +825,40 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
                         principal_block["groupId"] = principal_id
 
                     try:
-                        resp = aam_client.create_entitlement(
-                            applicationArn=aam_application_arn,
-                            entitlement={
-                                "principalRole": {
-                                    "principal": {"identityCenter": principal_block},
-                                    "roleArn": role_arn,
-                                }
-                            },
-                        )
-                        entitlement_results.append({
-                            "principal": a["principal_display_name"],
-                            "principal_type": principal_type,
-                            "principal_id": principal_id,
-                            "account_id": a["account_id"],
-                            "role_arn": role_arn,
-                            "entitlement_id": resp.get("entitlementId", ""),
-                            "status": "created",
-                            "timestamp": _now(),
-                        })
+                        # Retry up to 3 times for ValidationException (IAM propagation delay)
+                        max_retries = 3
+                        last_exc = None
+                        for attempt in range(max_retries):
+                            try:
+                                resp = aam_client.create_entitlement(
+                                    applicationArn=aam_application_arn,
+                                    entitlement={
+                                        "principalRole": {
+                                            "principal": {"identityCenter": principal_block},
+                                            "roleArn": role_arn,
+                                        }
+                                    },
+                                )
+                                last_exc = None
+                                break
+                            except Exception as retry_exc:
+                                if "ValidationException" in str(retry_exc) and attempt < max_retries - 1:
+                                    last_exc = retry_exc
+                                    time.sleep(3 * (attempt + 1))  # 3s, 6s backoff
+                                else:
+                                    raise retry_exc
+
+                        if last_exc is None:
+                            entitlement_results.append({
+                                "principal": a["principal_display_name"],
+                                "principal_type": principal_type,
+                                "principal_id": principal_id,
+                                "account_id": a["account_id"],
+                                "role_arn": role_arn,
+                                "entitlement_id": resp.get("entitlementId", ""),
+                                "status": "created",
+                                "timestamp": _now(),
+                            })
                     except Exception as exc:
                         error_str = str(exc)
                         # Handle conflict (entitlement already exists)

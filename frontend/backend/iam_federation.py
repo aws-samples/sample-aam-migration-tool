@@ -468,9 +468,9 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
     entitlement_mappings = params.get("entitlement_mappings") or []
 
     if aam_application_arn and entitlement_mappings:
-        sessions = _resolve_sessions(params)
-        # Use the first session (hub) for AAM calls
-        hub_session = sessions[0][1] if sessions else build_session(None)
+        # IMPORTANT: AAM entitlements live in the hub/management account.
+        # Always use default creds (same as discovery), not the apply-specific creds.
+        hub_session = build_session(None)
 
         aam_region = params.get("aam_region") or "us-east-1"
         aam_endpoint_url = f"https://account-access-preview.{aam_region}.api.aws"

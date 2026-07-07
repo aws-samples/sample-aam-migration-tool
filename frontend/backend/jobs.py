@@ -1,229 +1,32 @@
 """
-Background job runner for long-running scans (option A: background job + poll).
+Job dispatcher — routes job operations to either the local (in-process)
+implementation or the managed (remote API) implementation based on the
+TRUFFLE_MODE configuration.
 
-The scan endpoint starts a job and returns immediately with a ``job_id``; the
-frontend polls ``/api/policy-analysis/status`` for progress and the final
-result. Jobs run in daemon threads with state held in memory.
-
-If the server restarts, in-memory jobs are lost — but that's fine: the scan's
-checkpoint persists, so re-running the same scan resumes from where it stopped.
+Public interface (unchanged from previous version):
+  start_scan(params) -> str (job_id)
+  get(job_id) -> Optional[dict]
+  start_iam_discover(params) -> str
+  start_idc_discover(params) -> str
+  start_idc_apply(params) -> str
 """
 
-import threading
-import uuid
-from datetime import datetime, timezone
-from typing import Optional
+from . import config
 
-from . import policy_analysis
-from . import iam_federation
-
-_JOBS: dict[str, dict] = {}
-_LOCK = threading.Lock()
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def start_scan(params: dict) -> str:
-    """Create a policy-scan job, start it on a background thread, return its id."""
-    job_id = uuid.uuid4().hex[:12]
-    with _LOCK:
-        _JOBS[job_id] = {
-            "id": job_id,
-            "type": "policy-scan",
-            "status": "running",
-            "progress": {
-                "completed_units": 0,
-                "total_units": 0,
-                "skipped_units": 0,
-                "message": "starting",
-            },
-            "started_at": _now(),
-            "finished_at": None,
-            "error": None,
-            "result": None,
-        }
-    thread = threading.Thread(target=_run, args=(job_id, params), daemon=True)
-    thread.start()
-    return job_id
-
-
-def _update_progress(job_id: str, update: dict) -> None:
-    with _LOCK:
-        job = _JOBS.get(job_id)
-        if job:
-            job["progress"].update(update)
-
-
-def _run(job_id: str, params: dict) -> None:
-    try:
-        result = policy_analysis.run_scan_job(
-            params, on_progress=lambda u: _update_progress(job_id, u)
-        )
-        with _LOCK:
-            job = _JOBS.get(job_id)
-            if job:
-                job["status"] = "done"
-                job["result"] = result
-                job["finished_at"] = _now()
-    except Exception as exc:  # noqa: BLE001 - surfaced to the UI via status
-        with _LOCK:
-            job = _JOBS.get(job_id)
-            if job:
-                job["status"] = "error"
-                job["error"] = str(exc)
-                job["finished_at"] = _now()
-
-
-def get(job_id: str) -> Optional[dict]:
-    """Return a snapshot of the job, or ``None`` if unknown (e.g. after restart)."""
-    with _LOCK:
-        job = _JOBS.get(job_id)
-        return dict(job) if job else None
-
-
-# ─── IAM Federation discovery job ────────────────────────────────────────────
-
-def start_iam_discover(params: dict) -> str:
-    """Create an IAM federation discovery job, start it, return the id."""
-    job_id = uuid.uuid4().hex[:12]
-    with _LOCK:
-        _JOBS[job_id] = {
-            "id": job_id,
-            "type": "iam-discover",
-            "status": "running",
-            "progress": {
-                "completed_units": 0,
-                "total_units": 0,
-                "skipped_units": 0,
-                "message": "starting",
-            },
-            "started_at": _now(),
-            "finished_at": None,
-            "error": None,
-            "result": None,
-        }
-    thread = threading.Thread(target=_run_iam_discover, args=(job_id, params), daemon=True)
-    thread.start()
-    return job_id
-
-
-def _run_iam_discover(job_id: str, params: dict) -> None:
-    try:
-        result = iam_federation.discover_roles(
-            params, on_progress=lambda u: _update_progress(job_id, u)
-        )
-        with _LOCK:
-            job = _JOBS.get(job_id)
-            if job:
-                job["status"] = "done"
-                job["result"] = result
-                job["finished_at"] = _now()
-    except Exception as exc:
-        with _LOCK:
-            job = _JOBS.get(job_id)
-            if job:
-                job["status"] = "error"
-                job["error"] = str(exc)
-                job["finished_at"] = _now()
-
-
-# ─── IdC discovery job ───────────────────────────────────────────────────────
-
-def start_idc_discover(params: dict) -> str:
-    """Create an IdC inventory job, start it, return the id."""
-    from . import idc
-
-    job_id = uuid.uuid4().hex[:12]
-    with _LOCK:
-        _JOBS[job_id] = {
-            "id": job_id,
-            "type": "idc-discover",
-            "status": "running",
-            "progress": {
-                "completed_units": 0,
-                "total_units": 0,
-                "skipped_units": 0,
-                "message": "starting",
-            },
-            "started_at": _now(),
-            "finished_at": None,
-            "error": None,
-            "result": None,
-        }
-    thread = threading.Thread(target=_run_idc_discover, args=(job_id, params), daemon=True)
-    thread.start()
-    return job_id
-
-
-def _run_idc_discover(job_id: str, params: dict) -> None:
-    from . import idc
-
-    try:
-        result = idc.run_inventory(
-            params, on_progress=lambda u: _update_progress(job_id, u)
-        )
-        with _LOCK:
-            job = _JOBS.get(job_id)
-            if job:
-                job["status"] = "done"
-                job["result"] = result
-                job["finished_at"] = _now()
-    except Exception as exc:
-        with _LOCK:
-            job = _JOBS.get(job_id)
-            if job:
-                job["status"] = "error"
-                job["error"] = str(exc)
-                job["finished_at"] = _now()
-
-
-# ─── IdC apply job ───────────────────────────────────────────────────────────
-
-def start_idc_apply(params: dict) -> str:
-    """Create an IdC apply job (create roles + entitlements), start it, return id."""
-    from . import idc
-
-    job_id = uuid.uuid4().hex[:12]
-    with _LOCK:
-        _JOBS[job_id] = {
-            "id": job_id,
-            "type": "idc-apply",
-            "status": "running",
-            "progress": {
-                "completed_units": 0,
-                "total_units": 0,
-                "skipped_units": 0,
-                "message": "starting",
-            },
-            "started_at": _now(),
-            "finished_at": None,
-            "error": None,
-            "result": None,
-        }
-    thread = threading.Thread(target=_run_idc_apply, args=(job_id, params), daemon=True)
-    thread.start()
-    return job_id
-
-
-def _run_idc_apply(job_id: str, params: dict) -> None:
-    from . import idc
-
-    try:
-        result = idc.apply_roles(
-            params, on_progress=lambda u: _update_progress(job_id, u)
-        )
-        with _LOCK:
-            job = _JOBS.get(job_id)
-            if job:
-                job["status"] = "done"
-                job["result"] = result
-                job["finished_at"] = _now()
-    except Exception as exc:
-        with _LOCK:
-            job = _JOBS.get(job_id)
-            if job:
-                job["status"] = "error"
-                job["error"] = str(exc)
-                job["finished_at"] = _now()
+if config.is_managed_mode():
+    from ._jobs_managed import (  # noqa: F401
+        start_scan,
+        get,
+        start_iam_discover,
+        start_iam_migrate,
+        start_idc_discover,
+        start_idc_apply,
+    )
+else:
+    from ._jobs_local import (  # noqa: F401
+        start_scan,
+        get,
+        start_iam_discover,
+        start_idc_discover,
+        start_idc_apply,
+    )

@@ -81,6 +81,7 @@ export default function Idc() {
   const [applyResults, setApplyResults] = useState<{ role_name: string; role_arn: string; account_id: string; permission_set: string; status: string; error?: string; entitlement_status?: string }[]>([]);
   const applyPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [applyCreds, setApplyCreds] = useState<"same" | "different">("same");
+  const [entitlementResults, setEntitlementResults] = useState<{ principal: string; principal_type: string; account_id: string; role_arn: string; status: string; error?: string }[]>([]);
 
   // Migration plan (editable role name mapping)
   const [roleMappings, setRoleMappings] = useState<{ key: string; psArn: string; psName: string; roleName: string; principal: string; accountId: string }[]>([]);
@@ -267,8 +268,8 @@ export default function Idc() {
       setApplyProgress(job.progress);
       if (job.status === "done" && job.result) {
         stopApplyPolling();
-        const data = job.result as unknown as { results: typeof applyResults; entitlement_results?: { role_arn: string; status: string; error?: string }[] };
-        // Merge entitlement status into role results
+        const data = job.result as unknown as { results: typeof applyResults; entitlement_results?: { principal: string; principal_type: string; account_id: string; role_arn: string; status: string; error?: string }[] };
+        // Merge entitlement status into role results for the role table
         const entMap = new Map<string, string>();
         for (const e of data.entitlement_results || []) {
           if (e.role_arn) entMap.set(e.role_arn, e.status);
@@ -278,6 +279,7 @@ export default function Idc() {
           entitlement_status: entMap.get(r.role_arn) || (r.status === "error" ? "skipped" : "not created"),
         }));
         setApplyResults(merged);
+        setEntitlementResults(data.entitlement_results || []);
         setApplying(false);
       } else if (job.status === "error") {
         stopApplyPolling();
@@ -291,7 +293,7 @@ export default function Idc() {
   }
 
   async function runApply() {
-    setError(null); setApplying(true); setApplyResults([]);
+    setError(null); setApplying(true); setApplyResults([]); setEntitlementResults([]);
     setApplyProgress({ completed_units: 0, total_units: 0, skipped_units: 0, message: "starting" });
     try {
       const payload: Record<string, unknown> = {
@@ -496,7 +498,7 @@ export default function Idc() {
                   { id: "managed", header: "AWS Managed Policies", cell: (ps) => ps.aws_managed_policies.map((p) => p.name).join(", ") || "—", minWidth: 200 },
                   { id: "cmp", header: "Customer Managed Policies", cell: (ps) => ps.customer_managed_policy_references.map((r) => r.name).join(", ") || "—", minWidth: 180 },
                   { id: "inline", header: "Inline", cell: (ps) => ps.inline_policy ? "Yes" : "No", minWidth: 70 },
-                  { id: "duration", header: "Session", cell: (ps) => ps.session_duration, minWidth: 80 },
+                  { id: "duration", header: "Session Duration (ISO 8601)", cell: (ps) => ps.session_duration, minWidth: 80 },
                 ]}
               />
             </SpaceBetween>
@@ -792,28 +794,49 @@ export default function Idc() {
                     />
                   )}
                   {applyResults.length > 0 && (
-                    <Table
-                      variant="embedded"
-                      resizableColumns
-                      items={applyResults}
-                      trackBy="role_arn"
-                      columnDefinitions={[
-                        { id: "role", header: "Role", cell: (r) => r.role_name, minWidth: 150 },
-                        { id: "account", header: "Account", cell: (r) => r.account_id, minWidth: 120 },
-                        { id: "ps", header: "Permission Set", cell: (r) => r.permission_set, minWidth: 150 },
-                        { id: "status", header: "Status", minWidth: 100, cell: (r) => (
-                          <StatusIndicator type={r.status === "created" ? "success" : r.status === "already exists" ? "info" : "error"}>
-                            {r.status}
-                          </StatusIndicator>
-                        )},
-                        { id: "error", header: "Detail", cell: (r) => r.error || "No errors", minWidth: 150 },
-                        { id: "entitlement", header: "Entitlement", minWidth: 120, cell: (r) => (
-                          <StatusIndicator type={r.entitlement_status === "created" ? "success" : r.entitlement_status === "existing" ? "info" : r.entitlement_status === "skipped" ? "stopped" : "warning"}>
-                            {r.entitlement_status || "—"}
-                          </StatusIndicator>
-                        )},
-                      ]}
-                    />
+                    <SpaceBetween size="m">
+                      <Header variant="h3">Role Creation Results</Header>
+                      <Table
+                        variant="embedded"
+                        resizableColumns
+                        items={applyResults}
+                        trackBy="role_arn"
+                        columnDefinitions={[
+                          { id: "role", header: "Role", cell: (r) => r.role_name, minWidth: 150 },
+                          { id: "account", header: "Account", cell: (r) => r.account_id, minWidth: 120 },
+                          { id: "ps", header: "Permission Set", cell: (r) => r.permission_set, minWidth: 150 },
+                          { id: "status", header: "Status", minWidth: 100, cell: (r) => (
+                            <StatusIndicator type={r.status === "created" ? "success" : r.status === "already exists" ? "info" : "error"}>
+                              {r.status}
+                            </StatusIndicator>
+                          )},
+                          { id: "error", header: "Detail", cell: (r) => r.error || "No errors", minWidth: 150 },
+                        ]}
+                      />
+                    </SpaceBetween>
+                  )}
+                  {entitlementResults.length > 0 && (
+                    <SpaceBetween size="m">
+                      <Header variant="h3">Entitlement Results</Header>
+                      <Table
+                        variant="embedded"
+                        resizableColumns
+                        items={entitlementResults}
+                        trackBy={(e) => `${e.role_arn}#${e.principal}#${e.account_id}`}
+                        columnDefinitions={[
+                          { id: "principal", header: "Principal", cell: (e) => e.principal, minWidth: 150 },
+                          { id: "type", header: "Type", cell: (e) => e.principal_type, minWidth: 80 },
+                          { id: "account", header: "Account", cell: (e) => e.account_id, minWidth: 120 },
+                          { id: "role", header: "Role ARN", cell: (e) => e.role_arn, minWidth: 200 },
+                          { id: "status", header: "Status", minWidth: 110, cell: (e) => (
+                            <StatusIndicator type={e.status === "created" ? "success" : e.status === "existing" ? "info" : e.status === "skipped" ? "stopped" : "error"}>
+                              {e.status}
+                            </StatusIndicator>
+                          )},
+                          { id: "error", header: "Detail", cell: (e) => e.error || "No errors", minWidth: 150 },
+                        ]}
+                      />
+                    </SpaceBetween>
                   )}
                 </>
               )}

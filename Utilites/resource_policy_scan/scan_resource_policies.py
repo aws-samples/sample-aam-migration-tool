@@ -40,6 +40,7 @@ Options:
 
 import argparse
 import json
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -58,6 +59,10 @@ MAX_WORKERS = 5  # Default concurrency; overridden by --workers CLI arg
 def get_session_info() -> tuple[boto3.Session, str]:
     """Return the current session and resolve the account ID from it."""
     session = boto3.Session()
+    # Ensure the session has a region. If none is configured (no AWS_DEFAULT_REGION,
+    # no profile region), default to us-east-1 so global service calls work.
+    if not session.region_name:
+        session = boto3.Session(region_name="us-east-1")
     identity = session.client("sts").get_caller_identity()
     account_id = identity["Account"]
     print(f"Using current credentials: {identity['Arn']}  (account {account_id})")
@@ -93,11 +98,34 @@ def policy_text(obj) -> str:
     return str(obj)
 
 
+def _term_matches(term: str, policy: str) -> bool:
+    """Check if a search term matches within the policy text.
+
+    Supports IAM-style wildcards (* and ?) for pattern matching.
+    All matching is case-insensitive.
+    """
+    if '*' in term or '?' in term:
+        # Convert IAM-style wildcards to regex manually (fnmatch doesn't handle
+        # ARN characters well). Escape everything except * and ?, then convert.
+        parts = re.split(r'(\*|\?)', term)
+        regex_parts = []
+        for part in parts:
+            if part == '*':
+                regex_parts.append('.*')
+            elif part == '?':
+                regex_parts.append('.')
+            else:
+                regex_parts.append(re.escape(part))
+        pattern = ''.join(regex_parts)
+        return bool(re.search(pattern, policy, re.IGNORECASE))
+    return term.lower() in policy.lower()
+
+
 def check_policy(policy: str, resource_arn: str, service: str, search_terms: list[str], account_id: str = "") -> dict | None:
     count_resource()
     if not policy:
         return None
-    matched = [t for t in search_terms if t in policy]
+    matched = [t for t in search_terms if _term_matches(t, policy)]
     if matched:
         # Try to include the policy as parsed JSON; fall back to raw string
         try:

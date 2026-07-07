@@ -1,0 +1,206 @@
+{
+  "Comment": "Truffle Policy Scan — fans out across accounts and regions, then aggregates results.",
+  "StartAt": "PrepareAccounts",
+  "States": {
+    "PrepareAccounts": {
+      "Type": "Pass",
+      "Comment": "Structure the input for the account-level Map state.",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "caller_arn.$": "$.caller_arn",
+        "job_type.$": "$.job_type",
+        "search_terms.$": "$.search_terms",
+        "services.$": "$.services",
+        "management_account.$": "$.management_account",
+        "accounts.$": "$.account_ids",
+        "regions.$": "$.regions"
+      },
+      "Next": "UpdateProgressStarted"
+    },
+    "UpdateProgressStarted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${JobsTableName}",
+        "Key": {
+          "PK": { "S.$": "States.Format('CALLER#{}', $.caller_arn)" },
+          "SK": { "S.$": "States.Format('JOB#{}', $.job_id)" }
+        },
+        "UpdateExpression": "SET progress = :p",
+        "ExpressionAttributeValues": {
+          ":p": {
+            "M": {
+              "completed_units": { "N": "0" },
+              "total_units": { "N.$": "States.Format('{}', States.MathAdd(States.ArrayLength($.accounts), States.MathMultiply(States.ArrayLength($.accounts), States.ArrayLength($.regions))))" },
+              "message": { "S": "Scanning accounts" }
+            }
+          }
+        }
+      },
+      "ResultPath": null,
+      "Next": "MapAccounts"
+    },
+    "MapAccounts": {
+      "Type": "Map",
+      "ItemsPath": "$.accounts",
+      "MaxConcurrency": 10,
+      "Parameters": {
+        "account_id.$": "$$.Map.Item.Value",
+        "search_terms.$": "$.search_terms",
+        "services.$": "$.services",
+        "management_account.$": "$.management_account",
+        "regions.$": "$.regions",
+        "job_id.$": "$.job_id",
+        "caller_arn.$": "$.caller_arn"
+      },
+      "Iterator": {
+        "StartAt": "ParallelScans",
+        "States": {
+          "ParallelScans": {
+            "Type": "Parallel",
+            "Branches": [
+              {
+                "StartAt": "ScanGlobal",
+                "States": {
+                  "ScanGlobal": {
+                    "Type": "Task",
+                    "Resource": "${ScanGlobalFnArn}",
+                    "Parameters": {
+                      "account_id.$": "$.account_id",
+                      "search_terms.$": "$.search_terms",
+                      "services.$": "$.services",
+                      "management_account.$": "$.management_account",
+                      "job_id.$": "$.job_id",
+                      "caller_arn.$": "$.caller_arn"
+                    },
+                    "Retry": [
+                      {
+                        "ErrorEquals": ["Lambda.TooManyRequestsException", "States.TaskFailed"],
+                        "IntervalSeconds": 5,
+                        "MaxAttempts": 3,
+                        "BackoffRate": 2.0
+                      }
+                    ],
+                    "Catch": [
+                      {
+                        "ErrorEquals": ["States.ALL"],
+                        "ResultPath": "$.error",
+                        "Next": "GlobalScanFailed"
+                      }
+                    ],
+                    "End": true
+                  },
+                  "GlobalScanFailed": {
+                    "Type": "Pass",
+                    "Parameters": {
+                      "account_id.$": "$.account_id",
+                      "scope": "global",
+                      "matches": [],
+                      "resources_scanned": 0,
+                      "status": "error",
+                      "error.$": "$.error"
+                    },
+                    "End": true
+                  }
+                }
+              },
+              {
+                "StartAt": "MapRegions",
+                "States": {
+                  "MapRegions": {
+                    "Type": "Map",
+                    "ItemsPath": "$.regions",
+                    "MaxConcurrency": 5,
+                    "Parameters": {
+                      "account_id.$": "$.account_id",
+                      "region.$": "$$.Map.Item.Value",
+                      "search_terms.$": "$.search_terms",
+                      "services.$": "$.services",
+                      "job_id.$": "$.job_id",
+                      "caller_arn.$": "$.caller_arn"
+                    },
+                    "Iterator": {
+                      "StartAt": "ScanUnit",
+                      "States": {
+                        "ScanUnit": {
+                          "Type": "Task",
+                          "Resource": "${ScanUnitFnArn}",
+                          "Retry": [
+                            {
+                              "ErrorEquals": ["Lambda.TooManyRequestsException", "States.TaskFailed"],
+                              "IntervalSeconds": 5,
+                              "MaxAttempts": 3,
+                              "BackoffRate": 2.0
+                            },
+                            {
+                              "ErrorEquals": ["States.Timeout"],
+                              "IntervalSeconds": 30,
+                              "MaxAttempts": 2,
+                              "BackoffRate": 1.5
+                            }
+                          ],
+                          "Catch": [
+                            {
+                              "ErrorEquals": ["States.ALL"],
+                              "ResultPath": "$.error",
+                              "Next": "UnitScanFailed"
+                            }
+                          ],
+                          "End": true
+                        },
+                        "UnitScanFailed": {
+                          "Type": "Pass",
+                          "Parameters": {
+                            "account_id.$": "$.account_id",
+                            "region.$": "$.region",
+                            "matches": [],
+                            "resources_scanned": 0,
+                            "status": "error",
+                            "error.$": "$.error"
+                          },
+                          "End": true
+                        }
+                      }
+                    },
+                    "End": true
+                  }
+                }
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.scan_results",
+      "Next": "FlattenResults"
+    },
+    "FlattenResults": {
+      "Type": "Pass",
+      "Comment": "Flatten the nested array structure from Map+Parallel into a single results array for aggregation.",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "caller_arn.$": "$.caller_arn",
+        "job_type.$": "$.job_type",
+        "results.$": "$.scan_results[*][*]",
+        "params": {
+          "search_terms.$": "$.search_terms",
+          "services.$": "$.services"
+        }
+      },
+      "Next": "Aggregate"
+    },
+    "Aggregate": {
+      "Type": "Task",
+      "Resource": "${AggregateFnArn}",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    }
+  }
+}
