@@ -38,6 +38,15 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.get("/api/config")
+def get_config():
+    """Return runtime configuration the UI needs (region, mode, etc.)."""
+    return jsonify({
+        "idc_region": config.IDC_REGION,
+        "execution_mode": config.EXECUTION_MODE,
+    })
+
+
 @app.get("/api/profiles")
 def profiles():
     """List named AWS profiles from the local credential chain."""
@@ -148,8 +157,8 @@ def iam_providers():
 def iam_discover():
     """Start a role discovery job; returns a job_id to poll."""
     body = request.get_json(silent=True) or {}
-    if not body.get("idp_arn"):
-        return _json_error("idp_arn is required")
+    if not body.get("idp_filter") and not body.get("idp_arn"):
+        return _json_error("idp_filter or idp_arn is required")
     job_id = jobs.start_iam_discover(body)
     return jsonify({"job_id": job_id})
 

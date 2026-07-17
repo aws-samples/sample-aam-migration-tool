@@ -10,6 +10,7 @@ import Input from "@cloudscape-design/components/input";
 import Modal from "@cloudscape-design/components/modal";
 import ProgressBar from "@cloudscape-design/components/progress-bar";
 import RadioGroup from "@cloudscape-design/components/radio-group";
+import Select from "@cloudscape-design/components/select";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Table from "@cloudscape-design/components/table";
@@ -65,7 +66,7 @@ export default function IamFederation() {
   // Step 1: Providers
   const [providers, setProviders] = useState<Provider[]>([]);
   const [loadingProviders, setLoadingProviders] = useState(false);
-  const [selectedIdp, setSelectedIdp] = useState<string>("");
+  const [selectedIdps, setSelectedIdps] = useState<Provider[]>([]);
 
   // Step 2: Discovery
   const [discovering, setDiscovering] = useState(false);
@@ -85,6 +86,8 @@ export default function IamFederation() {
   const [migrating, setMigrating] = useState(false);
   const [migrateResults, setMigrateResults] = useState<MigrateResult[]>([]);
   const [aamAppArn, setAamAppArn] = useState("");
+  const [aamProfile, setAamProfile] = useState<{ label: string; value: string } | null>(null);
+  const [availableProfiles, setAvailableProfiles] = useState<{ label: string; value: string }[]>([]);
   const [entitlementResults, setEntitlementResults] = useState<{ group: string; principal: string; account: string; role: string; role_arn: string; status: string; error?: string }[]>([]);
 
   // Step 4: IaC
@@ -96,11 +99,13 @@ export default function IamFederation() {
   useEffect(() => {
     api.iamState().then((r: CacheWrapper) => {
       if (r?.data) {
-        const data = r.data as { roles?: FederatedRole[]; idp_arn?: string };
+        const data = r.data as { roles?: FederatedRole[]; idp_arn?: string; idp_filter?: Record<string, string[]> };
         if (data.roles) setRoles(data.roles.filter((r) => !r.error));
-        if (data.idp_arn) setSelectedIdp(data.idp_arn);
         setCachedAt(r.cached_at);
       }
+    });
+    api.profiles().then((r) => {
+      setAvailableProfiles(r.profiles.map((p) => ({ label: p, value: p })));
     });
     // Re-attach to a running discovery job
     const saved = localStorage.getItem(DISCOVER_JOB_KEY);
@@ -135,9 +140,9 @@ export default function IamFederation() {
     try {
       const res = await api.iamProviders(authPayload());
       setProviders(res.providers);
-      // Auto-select the first non-IDC provider if there's only one
-      const nonIdc = res.providers.filter((p) => !p.is_identity_center);
-      if (nonIdc.length === 1) setSelectedIdp(nonIdc[0].arn);
+      // Auto-select all non-IDC providers
+      const nonIdc = res.providers.filter((p: Provider) => !p.is_identity_center);
+      setSelectedIdps(nonIdc);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -158,6 +163,10 @@ export default function IamFederation() {
         stopPolling(); localStorage.removeItem(DISCOVER_JOB_KEY);
         const data = job.result.data as { roles?: FederatedRole[] };
         setRoles((data.roles || []).filter((r) => !r.error));
+        setSelectedRoles([]);  // Clear selection — new discovery invalidates previous selections
+        setEntitlementMappings([]);  // Clear mappings from previous run
+        setMigrateResults([]);  // Clear previous migration results
+        setEntitlementResults([]);
         setCachedAt(job.result.cached_at);
         setDiscovering(false);
       } else if (job.status === "error") {
@@ -180,7 +189,13 @@ export default function IamFederation() {
     setError(null); setDiscovering(true);
     setDiscoverProgress({ completed_units: 0, total_units: 0, skipped_units: 0, message: "starting" });
     try {
-      const { job_id } = await api.iamDiscover({ ...authPayload(), idp_arn: selectedIdp });
+      // Build per-account IDP filter: { account_id: [arn, ...] }
+      const idpFilter: Record<string, string[]> = {};
+      for (const p of selectedIdps) {
+        if (!idpFilter[p.account_id]) idpFilter[p.account_id] = [];
+        idpFilter[p.account_id].push(p.arn);
+      }
+      const { job_id } = await api.iamDiscover({ ...authPayload(), idp_filter: idpFilter });
       localStorage.setItem(DISCOVER_JOB_KEY, job_id);
       startPolling(job_id, false);
     } catch (e) {
@@ -196,11 +211,22 @@ export default function IamFederation() {
         ...authPayload(),
         role_arns: selectedRoles.map((r) => r.role_arn),
         mode: migrateMode,
-        idp_arn: selectedIdp,
+        idp_filter: (() => {
+          const f: Record<string, string[]> = {};
+          for (const p of selectedIdps) {
+            if (!f[p.account_id]) f[p.account_id] = [];
+            f[p.account_id].push(p.arn);
+          }
+          return f;
+        })(),
       };
       // Include entitlement mappings and AAM ARN if provided
       if (aamAppArn.trim()) {
         payload.aam_application_arn = aamAppArn.trim();
+        // Pass the selected profile for entitlement API calls
+        if (aamProfile) {
+          payload.aam_profile = aamProfile.value;
+        }
       }
       if (entitlementMappings.length > 0 && aamAppArn.trim()) {
         payload.entitlement_mappings = entitlementMappings.filter((m) => m.matchedRoleArn);
@@ -314,14 +340,19 @@ export default function IamFederation() {
               List providers
             </Button>
             {providers.length > 0 && (
-              <RadioGroup
-                value={selectedIdp}
-                onChange={({ detail }) => setSelectedIdp(detail.value)}
-                items={providers.map((p) => ({
-                  value: p.arn,
-                  label: `${p.name}${p.is_identity_center ? " [Identity Center — auto-created]" : ""}`,
-                  description: `${p.account_id} — ${p.arn}`,
-                }))}
+              <Table
+                selectionType="multi"
+                selectedItems={selectedIdps}
+                onSelectionChange={({ detail }) => setSelectedIdps(detail.selectedItems)}
+                items={providers}
+                columnDefinitions={[
+                  { id: "name", header: "Provider", cell: (p) => `${p.name}${p.is_identity_center ? " [Identity Center]" : ""}` },
+                  { id: "account", header: "Account", cell: (p) => p.account_id },
+                  { id: "arn", header: "ARN", cell: (p) => p.arn },
+                ]}
+                trackBy="arn"
+                variant="embedded"
+                empty="No providers found."
               />
             )}
           </SpaceBetween>
@@ -332,7 +363,7 @@ export default function IamFederation() {
           header={
             <Header
               variant="h2"
-              description="Step 2 — discover IAM roles with SAML trust policies referencing the selected provider."
+              description="Step 2 — discover IAM roles with SAML trust policies referencing the selected provider(s)."
               counter={roles.length ? `(${roles.length})` : undefined}
               actions={
                 <Button iconName="download" onClick={handleExportRoles} disabled={!roles.length}>Export CSV</Button>
@@ -344,7 +375,7 @@ export default function IamFederation() {
         >
           <SpaceBetween size="m">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button variant="primary" loading={discovering} disabled={!selectedIdp} onClick={runDiscovery}>
+              <Button variant="primary" loading={discovering} disabled={!selectedIdps.length} onClick={runDiscovery}>
                 Discover roles
               </Button>
               {cachedAt && (
@@ -544,6 +575,21 @@ export default function IamFederation() {
                 placeholder="arn:aws:account-access:us-west-2:123456789012:application/app-id"
               />
             </FormField>
+
+            {aamAppArn.trim() && (
+              <FormField
+                label="Entitlement credentials"
+                description="AWS profile with access to the IdC management/delegated admin account. Used for Identity Store lookups and AAM entitlement creation."
+              >
+                <Select
+                  selectedOption={aamProfile}
+                  onChange={({ detail }) => setAamProfile(detail.selectedOption as { label: string; value: string })}
+                  options={availableProfiles}
+                  placeholder="Select a profile (uses default if empty)"
+                  empty="No profiles found"
+                />
+              </FormField>
+            )}
 
             {entitlementMappings.length > 0 && aamAppArn.trim() && (
               <Alert type="info">

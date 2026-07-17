@@ -103,3 +103,11 @@ API_REGION = os.environ.get("TRUFFLE_API_REGION") or _parse_region_from_endpoint
 def is_managed_mode() -> bool:
     """Return True if the backend is configured to use the managed API."""
     return EXECUTION_MODE.lower() == "managed" and bool(API_ENDPOINT)
+
+
+# ─── IdC / AAM region ────────────────────────────────────────────────────────
+# The region where Identity Center and AAM are configured. Passed at launch
+# via --region or TRUFFLE_IDC_REGION. Used for Identity Store resolution,
+# SSO Admin API calls, and AAM entitlement creation.
+
+IDC_REGION = os.environ.get("TRUFFLE_IDC_REGION", "")

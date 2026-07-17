@@ -28,14 +28,17 @@ TRUFFLE_MODE="${TRUFFLE_MODE:-local}"
 TRUFFLE_API_ENDPOINT="${TRUFFLE_API_ENDPOINT:-}"
 TRUFFLE_API_REGION="${TRUFFLE_API_REGION:-}"
 TRUFFLE_API_PROFILE="${TRUFFLE_API_PROFILE:-}"
+TRUFFLE_IDC_REGION="${TRUFFLE_IDC_REGION:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dev)       MODE="dev"; shift ;;
     --rebuild)   MODE="rebuild"; shift ;;
     --managed)   TRUFFLE_MODE="managed"; shift ;;
+    --local)     TRUFFLE_MODE="local"; TRUFFLE_API_ENDPOINT=""; shift ;;
     --endpoint)  TRUFFLE_API_ENDPOINT="$2"; shift 2 ;;
-    --region)    TRUFFLE_API_REGION="$2"; shift 2 ;;
+    --api-region) TRUFFLE_API_REGION="$2"; shift 2 ;;
+    --region)    TRUFFLE_IDC_REGION="$2"; shift 2 ;;
     --profile)   TRUFFLE_API_PROFILE="$2"; shift 2 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
@@ -52,6 +55,7 @@ export TRUFFLE_MODE
 export TRUFFLE_API_ENDPOINT
 export TRUFFLE_API_REGION
 export TRUFFLE_API_PROFILE
+export TRUFFLE_IDC_REGION
 
 # ─── Prerequisite checks ─────────────────────────────────────────────────────
 command -v python3 >/dev/null || { echo "python3 is required." >&2; exit 1; }
@@ -76,6 +80,9 @@ if [[ "$TRUFFLE_MODE" == "managed" ]]; then
   echo "==> Mode: MANAGED (backend: $TRUFFLE_API_ENDPOINT)"
 else
   echo "==> Mode: LOCAL (all scans run on this machine)"
+fi
+if [[ -n "$TRUFFLE_IDC_REGION" ]]; then
+  echo "==> IdC/AAM Region: $TRUFFLE_IDC_REGION"
 fi
 
 if [[ "$MODE" == "dev" ]]; then

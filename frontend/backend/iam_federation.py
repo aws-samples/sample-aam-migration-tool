@@ -137,18 +137,22 @@ def list_providers(params: dict) -> dict:
 
 def discover_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
     """
-    Discover IAM roles with SAML trust policies referencing the selected IDP.
+    Discover IAM roles with SAML trust policies referencing the selected IDP(s).
 
     Args:
-        params: dict with auth fields + idp_arn (required).
+        params: dict with auth fields + either:
+            - idp_filter: {account_id: [arn, ...]} — per-account provider filter
+            - idp_arn: single ARN (legacy, applied to all accounts)
         on_progress: optional callback for progress updates.
 
     Returns:
         The cache wrapper dict written to disk.
     """
-    idp_arn = params.get("idp_arn")
-    if not idp_arn:
-        raise ValueError("idp_arn is required")
+    # Support both the new idp_filter format and legacy single idp_arn
+    idp_filter: dict[str, list[str]] = params.get("idp_filter") or {}
+    legacy_idp = params.get("idp_arn")
+    if not idp_filter and not legacy_idp:
+        raise ValueError("idp_filter or idp_arn is required")
 
     eval_mod = _load_eval()
     sessions = _resolve_sessions(params)
@@ -174,6 +178,16 @@ def discover_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> di
     emit(f"Discovering roles across {total_accounts} account(s)")
 
     for label, session, account_id in sessions:
+        # Resolve which IDP ARN(s) to filter by for this account
+        account_idp_arns: list[str] = idp_filter.get(account_id, [])
+        if not account_idp_arns and legacy_idp:
+            # Legacy mode: apply the single idp_arn to all accounts
+            account_idp_arns = [legacy_idp]
+        if not account_idp_arns:
+            completed += 1
+            emit(f"Skipped {label} ({account_id}) — no IDP selected for this account")
+            continue
+
         try:
             # Temporarily override the module's client/resource with our session
             iam_client = session.client("iam")
@@ -203,7 +217,9 @@ def discover_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> di
                     federated = principal.get("Federated", "")
                     if isinstance(federated, str):
                         federated = [federated]
-                    if idp_arn in federated:
+                    # Match if any of the account's selected IDPs appear in the trust
+                    matched_idps = [a for a in account_idp_arns if a in federated]
+                    if matched_idps:
                         attached = []
                         att_paginator = iam_client.get_paginator("list_attached_role_policies")
                         for att_page in att_paginator.paginate(RoleName=rn):
@@ -242,7 +258,7 @@ def discover_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> di
                             "role_arn": f"arn:aws:iam::{account_id}:role/{rn}",
                             "account_id": account_id,
                             "label": label,
-                            "idp_arn": idp_arn,
+                            "idp_arns": matched_idps,
                             "trust_policy_document": trust_doc,
                             "trust_summary": "; ".join(trust_summary),
                             "policies": attached + inline,
@@ -279,7 +295,8 @@ def discover_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> di
         emit(f"Completed {label} ({account_id})", "")
 
     payload = {
-        "idp_arn": idp_arn,
+        "idp_filter": idp_filter,
+        "idp_arn": legacy_idp or "",  # backwards compat
         "total_roles": len([r for r in all_roles if not r.get("error")]),
         "roles": all_roles,
         "accounts_scanned": total_accounts,
@@ -309,7 +326,9 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
 
     Args:
         params: dict with auth fields + role_arns (list of ARNs to migrate),
-                mode ("ADD" or "REPLACE"), idp_arn (for REPLACE mode).
+                mode ("ADD" or "REPLACE"), and either:
+                  - idp_filter: {account_id: [arn, ...]} (per-account providers to remove in REPLACE)
+                  - idp_arn: single ARN (legacy, applied to all)
         on_progress: optional callback for progress updates.
 
     Returns:
@@ -317,7 +336,8 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
     """
     role_arns = params.get("role_arns") or []
     mode = (params.get("mode") or "ADD").upper()
-    idp_arn = params.get("idp_arn") or ""
+    idp_filter: dict[str, list[str]] = params.get("idp_filter") or {}
+    legacy_idp = params.get("idp_arn") or ""
 
     if not role_arns:
         raise ValueError("At least one role_arn is required")
@@ -396,12 +416,16 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
                 new_doc = dict(trust_doc)
                 new_doc["Statement"] = list(trust_doc["Statement"]) + [NEW_TRUST_STATEMENT]
             else:
+                # REPLACE: remove statements trusting any of this account's selected IDPs
+                idps_to_remove = set(idp_filter.get(account_id, []))
+                if not idps_to_remove and legacy_idp:
+                    idps_to_remove = {legacy_idp}
                 kept = []
                 for stmt in trust_doc["Statement"]:
                     federated = stmt.get("Principal", {}).get("Federated", "")
                     if isinstance(federated, str):
                         federated = [federated]
-                    if idp_arn not in federated:
+                    if not idps_to_remove.intersection(federated):
                         kept.append(stmt)
                 kept.append(NEW_TRUST_STATEMENT)
                 new_doc = dict(trust_doc)
@@ -468,11 +492,19 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
     entitlement_mappings = params.get("entitlement_mappings") or []
 
     if aam_application_arn and entitlement_mappings:
-        # IMPORTANT: AAM entitlements live in the hub/management account.
-        # Always use default creds (same as discovery), not the apply-specific creds.
-        hub_session = build_session(None)
+        # Use the explicitly selected AAM profile if provided, otherwise fall
+        # back to the first resolved session from auth params.
+        aam_profile = params.get("aam_profile")
+        if aam_profile:
+            hub_session = build_session(aam_profile)
+        else:
+            sessions = _resolve_sessions(params)
+            if sessions:
+                hub_session = sessions[0][1]
+            else:
+                hub_session = build_session(None)
 
-        aam_region = params.get("aam_region") or "us-east-1"
+        aam_region = params.get("aam_region") or config.IDC_REGION or "us-west-2"
         aam_endpoint_url = f"https://account-access-preview.{aam_region}.api.aws"
 
         try:
@@ -495,21 +527,90 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
             aam_client = None
 
         if aam_client:
+            # ── Resolve principal display names to Identity Store UUIDs ───────
+            # The AAM API requires group/user UUIDs, but the UI's pattern
+            # matching produces display names. We resolve them via IdentityStore.
+            identity_store_id = params.get("identity_store_id") or ""
+            idc_region = params.get("aam_region") or config.IDC_REGION or "us-west-2"
+
+            # Auto-discover identity_store_id if not provided
+            if not identity_store_id:
+                try:
+                    sso_admin = hub_session.client("sso-admin", region_name=idc_region)
+                    instances = []
+                    for page in sso_admin.get_paginator("list_instances").paginate():
+                        instances.extend(page.get("Instances", []))
+                    if instances:
+                        identity_store_id = instances[0].get("IdentityStoreId", "")
+                except Exception:
+                    pass
+
+            id_store = None
+            if identity_store_id:
+                try:
+                    id_store = hub_session.client("identitystore", region_name=idc_region)
+                except Exception:
+                    pass
+
+            def resolve_principal_id(name: str, principal_type: str) -> tuple[str, str | None]:
+                """Resolve a display name to an Identity Store UUID.
+
+                Returns (uuid, None) on success, or (original_name, error_msg) on failure.
+                """
+                if not id_store or not identity_store_id:
+                    return name, "Identity Store not available — cannot resolve name to ID"
+
+                try:
+                    if principal_type == "USER":
+                        resp = id_store.list_users(
+                            IdentityStoreId=identity_store_id,
+                            Filters=[{"AttributePath": "UserName", "AttributeValue": name}],
+                        )
+                        users = resp.get("Users", [])
+                        if users:
+                            return users[0]["UserId"], None
+                        return name, f"User '{name}' not found in Identity Store"
+                    else:
+                        resp = id_store.list_groups(
+                            IdentityStoreId=identity_store_id,
+                            Filters=[{"AttributePath": "DisplayName", "AttributeValue": name}],
+                        )
+                        groups = resp.get("Groups", [])
+                        if groups:
+                            return groups[0]["GroupId"], None
+                        return name, f"Group '{name}' not found in Identity Store"
+                except Exception as exc:
+                    return name, f"Resolution failed: {exc}"
+
             for m in entitlement_mappings:
                 role_arn = m.get("matchedRoleArn", "")
-                principal_id = m.get("principal", "")
+                principal_name = m.get("principal", "")
                 # Default to groupId; if user specifies principal_type, honor it
                 principal_type = m.get("principal_type", "GROUP")
 
                 if not role_arn:
                     entitlement_results.append({
                         "group": m.get("group", ""),
-                        "principal": principal_id,
+                        "principal": principal_name,
                         "account": m.get("account", ""),
                         "role": m.get("role", ""),
                         "role_arn": "",
                         "status": "skipped",
                         "error": "No matched role ARN",
+                    })
+                    continue
+
+                # Resolve display name → Identity Store UUID
+                principal_id, resolve_error = resolve_principal_id(principal_name, principal_type)
+                if resolve_error:
+                    entitlement_results.append({
+                        "group": m.get("group", ""),
+                        "principal": principal_name,
+                        "account": m.get("account", ""),
+                        "role": m.get("role", ""),
+                        "role_arn": role_arn,
+                        "status": "error",
+                        "error": resolve_error,
                     })
                     continue
 
@@ -519,36 +620,65 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
                 else:
                     principal_block["groupId"] = principal_id
 
-                try:
-                    resp = aam_client.create_entitlement(
-                        applicationArn=aam_application_arn,
-                        entitlement={
-                            "principalRole": {
-                                "principal": {"identityCenter": principal_block},
-                                "roleArn": role_arn,
-                            }
-                        },
-                    )
+                # Retry with backoff for ValidationException — IAM trust policy
+                # changes take up to 60s to propagate, and AAM validates the
+                # role's trust before accepting the entitlement.
+                import time
+                max_attempts = 4
+                last_error = ""
+                for attempt in range(max_attempts):
+                    try:
+                        resp = aam_client.create_entitlement(
+                            applicationArn=aam_application_arn,
+                            entitlement={
+                                "principalRole": {
+                                    "principal": {"identityCenter": principal_block},
+                                    "roleArn": role_arn,
+                                }
+                            },
+                        )
+                        entitlement_results.append({
+                            "group": m.get("group", ""),
+                            "principal": principal_id,
+                            "account": m.get("account", ""),
+                            "role": m.get("role", ""),
+                            "role_arn": role_arn,
+                            "entitlement_id": resp.get("entitlementId", ""),
+                            "status": "created",
+                        })
+                        last_error = ""
+                        break
+                    except Exception as exc:
+                        error_str = str(exc)
+                        if "Conflict" in error_str or "AlreadyExists" in error_str:
+                            entitlement_results.append({
+                                "group": m.get("group", ""),
+                                "principal": principal_id,
+                                "account": m.get("account", ""),
+                                "role": m.get("role", ""),
+                                "role_arn": role_arn,
+                                "status": "already exists",
+                                "error": "already exists",
+                            })
+                            last_error = ""
+                            break
+                        elif "ValidationException" in error_str and attempt < max_attempts - 1:
+                            # IAM eventual consistency — wait and retry
+                            time.sleep(5 * (attempt + 1))  # 5s, 10s, 15s
+                            last_error = error_str
+                        else:
+                            last_error = error_str
+                            break
+
+                if last_error:
                     entitlement_results.append({
                         "group": m.get("group", ""),
                         "principal": principal_id,
                         "account": m.get("account", ""),
                         "role": m.get("role", ""),
                         "role_arn": role_arn,
-                        "entitlement_id": resp.get("entitlementId", ""),
-                        "status": "created",
-                    })
-                except Exception as exc:
-                    error_str = str(exc)
-                    status = "already exists" if "Conflict" in error_str or "AlreadyExists" in error_str else "error"
-                    entitlement_results.append({
-                        "group": m.get("group", ""),
-                        "principal": principal_id,
-                        "account": m.get("account", ""),
-                        "role": m.get("role", ""),
-                        "role_arn": role_arn,
-                        "status": status,
-                        "error": error_str if status == "error" else "already exists",
+                        "status": "error",
+                        "error": last_error,
                     })
 
     return {

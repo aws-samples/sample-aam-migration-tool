@@ -34,7 +34,12 @@ MAX_WORKERS = 10
 def lambda_handler(event, context):
     """Discover SAML-federated roles in one account."""
     account_id = event["account_id"]
-    idp_arn = event.get("idp_arn", "")
+    # Accept either idp_arns (list, per-account) or legacy idp_arn (single string)
+    idp_arns = event.get("idp_arns", [])
+    if not idp_arns:
+        legacy = event.get("idp_arn", "")
+        if legacy:
+            idp_arns = [legacy]
 
     session = assume_role(account_id, session_suffix="discover")
     iam_client = session.client("iam")
@@ -61,7 +66,8 @@ def lambda_handler(event, context):
             if isinstance(federated, str):
                 federated = [federated]
 
-            if idp_arn in federated:
+            matched = [a for a in idp_arns if a in federated]
+            if matched:
                 # Get attached policies
                 attached = []
                 att_pag = iam_client.get_paginator("list_attached_role_policies")
@@ -92,7 +98,7 @@ def lambda_handler(event, context):
                     "role_name": role_name,
                     "role_arn": f"arn:aws:iam::{account_id}:role/{role_name}",
                     "account_id": account_id,
-                    "idp_arn": idp_arn,
+                    "idp_arns": matched,
                     "trust_policy_document": trust_doc,
                     "policies": attached + inline,
                 }

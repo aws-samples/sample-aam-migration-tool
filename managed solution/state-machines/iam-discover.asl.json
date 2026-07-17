@@ -1,5 +1,5 @@
 {
-  "Comment": "Truffle IAM Federation Discovery — discovers SAML-federated roles across accounts.",
+  "Comment": "Truffle IAM Federation Discovery — discovers SAML-federated roles across accounts with per-account IDP filtering.",
   "StartAt": "UpdateProgressStarted",
   "States": {
     "UpdateProgressStarted": {
@@ -27,11 +27,11 @@
     },
     "MapAccounts": {
       "Type": "Map",
-      "ItemsPath": "$.account_ids",
+      "ItemsPath": "$.discover_targets",
       "MaxConcurrency": 10,
       "Parameters": {
-        "account_id.$": "$$.Map.Item.Value",
-        "idp_arn.$": "$.idp_arn",
+        "account_id.$": "$$.Map.Item.Value.account_id",
+        "idp_arns.$": "$$.Map.Item.Value.idp_arns",
         "job_id.$": "$.job_id",
         "caller_arn.$": "$.caller_arn"
       },
@@ -90,8 +90,8 @@
         "job_type.$": "$.job_type",
         "results.$": "$.discover_results",
         "params": {
-          "idp_arn.$": "$.idp_arn",
-          "account_ids.$": "$.account_ids"
+          "idp_filter.$": "$.idp_filter",
+          "discover_targets.$": "$.discover_targets"
         }
       },
       "Retry": [

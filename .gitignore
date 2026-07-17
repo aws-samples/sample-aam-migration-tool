@@ -40,6 +40,12 @@ coverage.xml
 htmlcov/
 build/
 
+# ─── Utilities: test resources & scan output ──────────────────────────────────
+# CloudFormation templates with real account IDs / ARNs used for testing
+Utilites/resource_policy_scan/test_resources.yaml
+# Scan output containing customer-specific findings
+Utilites/resource_policy_scan/scan_results.json
+
 # ─── IdC-to-AAM tool: generated outputs ──────────────────────────────────────
 inventory_*.json
 migration_plan_*.xlsx

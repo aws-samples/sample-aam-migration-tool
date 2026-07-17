@@ -96,12 +96,26 @@ def lambda_handler(event, context):
         sf_input.setdefault("regions", [])
 
     elif job_type == "iam-discover":
+        sf_input.setdefault("idp_filter", {})
         sf_input.setdefault("idp_arn", "")
+        # Build discover_targets: [{account_id, idp_arns}, ...] for the Map state.
+        # This pre-resolves the per-account IDP lookup so the ASL doesn't need to.
+        idp_filter = sf_input.get("idp_filter") or {}
+        legacy_idp = sf_input.get("idp_arn", "")
+        discover_targets = []
+        for acct in sf_input.get("account_ids", []):
+            arns = idp_filter.get(acct, [])
+            if not arns and legacy_idp:
+                arns = [legacy_idp]
+            if arns:
+                discover_targets.append({"account_id": acct, "idp_arns": arns})
+        sf_input["discover_targets"] = discover_targets
 
     elif job_type == "iam-migrate":
         sf_input.setdefault("role_arns", [])
         sf_input.setdefault("mode", "ADD")
         sf_input.setdefault("idp_arn", "")
+        sf_input.setdefault("idp_filter", {})
 
     elif job_type == "idc-discover":
         sf_input.setdefault("region", "us-east-1")

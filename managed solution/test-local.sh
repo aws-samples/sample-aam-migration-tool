@@ -114,6 +114,9 @@ case "$TARGET" in
 esac
 
 EVENT_FILE="$EVENTS_DIR/$TARGET.json"
+if [[ "$TARGET" == "start-job" && -f "$EVENTS_DIR/start-job.json" ]]; then
+  EVENT_FILE="$EVENTS_DIR/start-job.json"
+fi
 if [[ ! -f "$EVENT_FILE" ]]; then
   echo "ERROR: No test event at $EVENT_FILE"
   echo "Create one and re-run."
