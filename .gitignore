@@ -20,6 +20,9 @@ cdk.out/
 frontend/cache/*
 !frontend/cache/.gitignore
 
+# ─── Managed solution (local test environment, not ready for repo) ────────────
+managed solution/
+
 # ─── OS / editor ─────────────────────────────────────────────────────────────
 .DS_Store
 *.swp
