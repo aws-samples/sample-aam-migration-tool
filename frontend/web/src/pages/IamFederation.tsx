@@ -14,11 +14,13 @@ import Select from "@cloudscape-design/components/select";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Table from "@cloudscape-design/components/table";
-import Textarea from "@cloudscape-design/components/textarea";
+import TextFilter from "@cloudscape-design/components/text-filter";
+import Pagination from "@cloudscape-design/components/pagination";
 import { api, type CacheWrapper, type JobProgress } from "../api/client";
 import { AuthMethodSelect, INITIAL_AUTH_STATE, parseAccountIds, type AuthState } from "../components/AuthMethodSelect";
 import { exportToCsv } from "../utils/csv";
 import { formatAbsolute, formatAge } from "../utils/time";
+import { useTablePagination } from "../utils/useTablePagination";
 
 interface Provider {
   arn: string;
@@ -76,10 +78,8 @@ export default function IamFederation() {
   const [selectedRoles, setSelectedRoles] = useState<FederatedRole[]>([]);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Step 3: Entitlement mapping
-  const [groupPattern, setGroupPattern] = useState("{principal}_{account}_{role}");
-  const [groupNamesRaw, setGroupNamesRaw] = useState("");
-  const [entitlementMappings, setEntitlementMappings] = useState<{ group: string; principal: string; account: string; role: string; matchedRoleArn: string; matchedRoleName: string }[]>([]);
+  // Step 3: Entitlement mapping (columnar — auto-populated from selected roles)
+  const [entitlementMappings, setEntitlementMappings] = useState<{ id: string; group: string; accountId: string; roleName: string; roleArn: string }[]>([]);
 
   // Step 4: Migrate
   const [migrateMode, setMigrateMode] = useState<MigrateMode>("ADD");
@@ -229,7 +229,15 @@ export default function IamFederation() {
         }
       }
       if (entitlementMappings.length > 0 && aamAppArn.trim()) {
-        payload.entitlement_mappings = entitlementMappings.filter((m) => m.matchedRoleArn);
+        payload.entitlement_mappings = entitlementMappings
+          .filter((m) => m.group.trim())
+          .map((m) => ({
+            group: m.group.trim(),
+            principal: m.group.trim(),
+            account: m.accountId,
+            role: m.roleName,
+            matchedRoleArn: m.roleArn || `arn:aws:iam::${m.accountId}:role/${m.roleName}`,
+          }));
       }
       const res = await api.iamMigrate(payload);
       setMigrateResults(res.results as MigrateResult[]);
@@ -310,6 +318,13 @@ export default function IamFederation() {
   const discoverPct = discoverProgress && discoverProgress.total_units > 0
     ? Math.round((discoverProgress.completed_units / discoverProgress.total_units) * 100)
     : 0;
+
+  // ─── Table pagination ─────────────────────────────────────────────────────
+  const rolesPagination = useTablePagination({
+    items: roles,
+    pageSize: 25,
+    filterFn: (r, q) => r.role_name.toLowerCase().includes(q) || r.role_arn.toLowerCase().includes(q) || r.account_id.includes(q) || r.policies.some((p) => p.policy_name.toLowerCase().includes(q)),
+  });
 
   return (
     <ContentLayout
@@ -411,8 +426,10 @@ export default function IamFederation() {
               selectionType="multi"
               selectedItems={selectedRoles}
               onSelectionChange={({ detail }) => setSelectedRoles(detail.selectedItems)}
-              items={roles}
+              items={rolesPagination.pageItems}
               trackBy="role_arn"
+              filter={<TextFilter filteringPlaceholder="Filter by role name, ARN, account, or policy" filteringText={rolesPagination.filterQuery} onChange={({ detail }) => rolesPagination.setFilterQuery(detail.filteringText)} />}
+              pagination={<Pagination {...rolesPagination.paginationProps} />}
               empty={<Box textAlign="center">Discover roles to populate this table.</Box>}
               columnDefinitions={[
                 { id: "role", header: "Role Name", cell: (r) => r.role_name, minWidth: 150 },
@@ -430,113 +447,123 @@ export default function IamFederation() {
           header={
             <Header
               variant="h2"
-              description="Step 3 — define how your IdP group names map to AAM entitlements. Provide group names (paste or upload a file) and establish the naming pattern. The parsed {role} value is matched to the federated roles discovered in Step 2."
-              counter={entitlementMappings.length ? `(${entitlementMappings.length} parsed)` : undefined}
+              description="Step 3 — define which groups/principals should be entitled to each role. Account and Role are auto-populated from your selection in Step 2. Fill in the Group/Principal column to assign access."
+              counter={entitlementMappings.length ? `(${entitlementMappings.length} mappings)` : undefined}
+              actions={
+                <SpaceBetween direction="horizontal" size="xs">
+                  <Button iconName="download" onClick={() => {
+                    exportToCsv("entitlement_mappings_template.csv", entitlementMappings.map((m) => ({
+                      group: m.group,
+                      account_id: m.accountId,
+                      role_name: m.roleName,
+                      role_arn: m.roleArn,
+                    })), [
+                      { key: "group", header: "Group/Principal" },
+                      { key: "account_id", header: "Account ID" },
+                      { key: "role_name", header: "Role Name" },
+                      { key: "role_arn", header: "Role ARN" },
+                    ]);
+                  }}>Download CSV</Button>
+                  <Button iconName="upload" onClick={() => {
+                    const input = document.createElement("input");
+                    input.type = "file";
+                    input.accept = ".csv";
+                    input.onchange = (e) => {
+                      const file = (e.target as HTMLInputElement).files?.[0];
+                      if (!file) return;
+                      const reader = new FileReader();
+                      reader.onload = (ev) => {
+                        const text = ev.target?.result as string;
+                        const lines = text.split("\n").filter((l) => l.trim());
+                        if (lines.length < 2) return;
+                        const headers = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, "").toLowerCase());
+                        const groupIdx = headers.findIndex((h) => h.includes("group") || h.includes("principal"));
+                        const accountIdx = headers.findIndex((h) => h.includes("account"));
+                        const roleIdx = headers.findIndex((h) => h === "role name" || h === "role_name");
+                        const arnIdx = headers.findIndex((h) => h.includes("role arn") || h === "role_arn");
+                        const uploaded: typeof entitlementMappings = [];
+                        for (let i = 1; i < lines.length; i++) {
+                          const cols = lines[i].split(",").map((c) => c.trim().replace(/^"|"$/g, ""));
+                          const group = groupIdx >= 0 ? cols[groupIdx] || "" : "";
+                          const acct = accountIdx >= 0 ? cols[accountIdx] || "" : "";
+                          const role = roleIdx >= 0 ? cols[roleIdx] || "" : "";
+                          const arn = arnIdx >= 0 ? cols[arnIdx] || "" : "";
+                          if (!acct && !role) continue;
+                          uploaded.push({ id: `${acct}#${role}#${group}#${i}`, group, accountId: acct, roleName: role, roleArn: arn });
+                        }
+                        if (uploaded.length) setEntitlementMappings(uploaded);
+                      };
+                      reader.readAsText(file);
+                    };
+                    input.click();
+                  }}>Upload CSV</Button>
+                  <Button onClick={() => {
+                    // Add a blank row
+                    setEntitlementMappings((prev) => [...prev, { id: `new-${Date.now()}`, group: "", accountId: "", roleName: "", roleArn: "" }]);
+                  }}>Add row</Button>
+                </SpaceBetween>
+              }
             >
               Entitlement Mapping
             </Header>
           }
         >
           <SpaceBetween size="m">
-            <FormField
-              label="Group name pattern"
-              description="Define the format of your IdP group names using placeholders: {principal}, {account}, {role}. The {role} component will be matched to the IAM role names discovered in Step 2."
-              constraintText="Example: if your groups are named 'admins_123456789012_PowerUser', the pattern is '{principal}_{account}_{role}'"
-            >
-              <Input
-                value={groupPattern}
-                onChange={({ detail }) => setGroupPattern(detail.value)}
-                placeholder="{principal}_{account}_{role}"
-              />
-            </FormField>
-
-            <FormField
-              label="Group names"
-              description="Paste your IdP group names (one per line or comma-separated), or upload a text/CSV file."
-            >
-              <SpaceBetween size="xs">
-                <Textarea
-                  value={groupNamesRaw}
-                  onChange={({ detail }) => setGroupNamesRaw(detail.value)}
-                  placeholder={"admins_111111111111_PowerUser\ndevs_222222222222_ReadOnly\nengineers_111111111111_Admin"}
-                  rows={6}
-                />
-                <Button iconName="upload" onClick={() => {
-                  const input = document.createElement("input");
-                  input.type = "file";
-                  input.accept = ".csv,.txt";
-                  input.onchange = (e) => {
-                    const file = (e.target as HTMLInputElement).files?.[0];
-                    if (!file) return;
-                    const reader = new FileReader();
-                    reader.onload = (ev) => {
-                      const text = ev.target?.result as string;
-                      setGroupNamesRaw(text);
-                    };
-                    reader.readAsText(file);
-                  };
-                  input.click();
-                }}>Upload file</Button>
-              </SpaceBetween>
-            </FormField>
-
-            <Button variant="primary" onClick={() => {
-              // Parse group names using the pattern
-              const groups = groupNamesRaw.split(/[\n,]+/).map((g) => g.trim()).filter(Boolean);
-              // Build a regex from the pattern — detect separator from pattern
-              const escaped = groupPattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-              const regexStr = escaped
-                .replace("\\{principal\\}", "(?<principal>.+?)")
-                .replace("\\{account\\}", "(?<account>\\d+)")
-                .replace("\\{role\\}", "(?<role>.+)");
-              const regex = new RegExp(`^${regexStr}$`);
-              const parsed = groups.map((g) => {
-                const match = g.match(regex);
-                if (match?.groups) {
-                  const roleParsed = match.groups.role || "";
-                  // Match to discovered federated roles from Step 2
-                  const matchedRole = roles.find((r) => r.role_name === roleParsed || r.role_name.toLowerCase() === roleParsed.toLowerCase());
-                  return {
-                    group: g,
-                    principal: match.groups.principal || "",
-                    account: match.groups.account || "",
-                    role: roleParsed,
-                    matchedRoleArn: matchedRole?.role_arn || "",
-                    matchedRoleName: matchedRole?.role_name || "(no match in Step 2)",
-                  };
-                }
-                return { group: g, principal: "(parse error)", account: "(parse error)", role: "(parse error)", matchedRoleArn: "", matchedRoleName: "(parse error)" };
-              });
-              setEntitlementMappings(parsed);
-            }}>
-              Parse group names
-            </Button>
-
+            {entitlementMappings.length === 0 && selectedRoles.length === 0 && (
+              <Alert type="info">Select federated roles in Step 2 to auto-populate this table with the account and role information.</Alert>
+            )}
+            {entitlementMappings.length === 0 && selectedRoles.length > 0 && (
+              <Alert type="info">Click the button below to auto-populate the mapping table from your selected roles.</Alert>
+            )}
+            {selectedRoles.length > 0 && (
+              <Button onClick={() => {
+                const newMappings = selectedRoles.map((r) => ({
+                  id: `${r.account_id}#${r.role_name}#${Date.now()}`,
+                  group: "",
+                  accountId: r.account_id,
+                  roleName: r.role_name,
+                  roleArn: r.role_arn,
+                }));
+                setEntitlementMappings((prev) => [...prev, ...newMappings]);
+              }}>
+                Auto-populate from selected roles ({selectedRoles.length})
+              </Button>
+            )}
             {entitlementMappings.length > 0 && (
-              <SpaceBetween size="s">
-                {entitlementMappings.some((m) => m.matchedRoleName === "(no match in Step 2)") && (
-                  <Alert type="warning">
-                    Some parsed role names could not be matched to discovered federated roles from Step 2. Ensure the {"{role}"} component in your pattern matches the IAM role name exactly.
-                  </Alert>
-                )}
-                <Table
-                  variant="embedded"
-                  resizableColumns
-                  items={entitlementMappings}
-                  trackBy="group"
-                  columnDefinitions={[
-                    { id: "group", header: "Group Name", cell: (m) => m.group, minWidth: 200 },
-                    { id: "principal", header: "Principal", cell: (m) => m.principal, minWidth: 120 },
-                    { id: "account", header: "Account", cell: (m) => m.account, minWidth: 120 },
-                    { id: "role", header: "Parsed Role", cell: (m) => m.role, minWidth: 130 },
-                    { id: "matched", header: "Matched IAM Role", cell: (m) => (
-                      <StatusIndicator type={m.matchedRoleArn ? "success" : "warning"}>
-                        {m.matchedRoleName}
-                      </StatusIndicator>
-                    ), minWidth: 180 },
-                  ]}
-                />
-              </SpaceBetween>
+              <Table
+                variant="embedded"
+                resizableColumns
+                items={entitlementMappings}
+                trackBy="id"
+                empty={<Box textAlign="center">No mappings defined.</Box>}
+                columnDefinitions={[
+                  { id: "group", header: "Group / Principal", cell: (m) => (
+                    <Input
+                      value={m.group}
+                      onChange={({ detail }) => setEntitlementMappings((prev) => prev.map((x) => x.id === m.id ? { ...x, group: detail.value } : x))}
+                      placeholder="e.g. admins, engineers"
+                    />
+                  ), minWidth: 200 },
+                  { id: "account", header: "Account ID", cell: (m) => (
+                    <Input
+                      value={m.accountId}
+                      onChange={({ detail }) => setEntitlementMappings((prev) => prev.map((x) => x.id === m.id ? { ...x, accountId: detail.value } : x))}
+                      placeholder="123456789012"
+                    />
+                  ), minWidth: 140 },
+                  { id: "role", header: "Role Name", cell: (m) => (
+                    <Input
+                      value={m.roleName}
+                      onChange={({ detail }) => setEntitlementMappings((prev) => prev.map((x) => x.id === m.id ? { ...x, roleName: detail.value } : x))}
+                      placeholder="PowerUser"
+                    />
+                  ), minWidth: 150 },
+                  { id: "arn", header: "Role ARN", cell: (m) => m.roleArn || `arn:aws:iam::${m.accountId}:role/${m.roleName}`, minWidth: 250 },
+                  { id: "remove", header: "", cell: (m) => (
+                    <Button variant="inline-link" onClick={() => setEntitlementMappings((prev) => prev.filter((x) => x.id !== m.id))}>Remove</Button>
+                  ), minWidth: 80 },
+                ]}
+              />
             )}
           </SpaceBetween>
         </Container>
@@ -593,7 +620,7 @@ export default function IamFederation() {
 
             {entitlementMappings.length > 0 && aamAppArn.trim() && (
               <Alert type="info">
-                <b>{entitlementMappings.filter((m) => m.matchedRoleArn).length}</b> entitlement(s) will be created after trust policy migration (from Step 3 mappings with matched roles).
+                <b>{entitlementMappings.filter((m) => m.group.trim()).length}</b> entitlement(s) will be created after trust policy migration (from Step 3 mappings with a group/principal assigned).
               </Alert>
             )}
             {!aamAppArn.trim() && (
@@ -603,8 +630,8 @@ export default function IamFederation() {
             )}
 
             <Button variant="primary" loading={migrating} disabled={!selectedRoles.length} onClick={runMigration}>
-              {aamAppArn.trim() && entitlementMappings.filter((m) => m.matchedRoleArn).length > 0
-                ? `Migrate ${selectedRoles.length} role(s) + create ${entitlementMappings.filter((m) => m.matchedRoleArn).length} entitlement(s)`
+              {aamAppArn.trim() && entitlementMappings.filter((m) => m.group.trim()).length > 0
+                ? `Migrate ${selectedRoles.length} role(s) + create ${entitlementMappings.filter((m) => m.group.trim()).length} entitlement(s)`
                 : `Migrate ${selectedRoles.length} role(s)`}
             </Button>
 

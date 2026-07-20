@@ -8,17 +8,20 @@ import FormField from "@cloudscape-design/components/form-field";
 import Header from "@cloudscape-design/components/header";
 import Input from "@cloudscape-design/components/input";
 import Modal from "@cloudscape-design/components/modal";
+import Pagination from "@cloudscape-design/components/pagination";
 import ProgressBar from "@cloudscape-design/components/progress-bar";
 import RadioGroup from "@cloudscape-design/components/radio-group";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Table from "@cloudscape-design/components/table";
 import Textarea from "@cloudscape-design/components/textarea";
+import TextFilter from "@cloudscape-design/components/text-filter";
 import { api, type CacheWrapper, type JobProgress } from "../api/client";
 import { INITIAL_AUTH_STATE, parseAccountIds, type AuthState } from "../components/AuthMethodSelect";
 import { ProfileMultiSelect } from "../components/ProfileSelect";
 import { exportToCsv } from "../utils/csv";
 import { formatAbsolute, formatAge } from "../utils/time";
+import { useTablePagination } from "../utils/useTablePagination";
 
 interface PermissionSet {
   arn: string;
@@ -168,6 +171,25 @@ export default function Idc() {
     }
     return mappings;
   })();
+
+  // ─── Table pagination + filtering ───────────────────────────────────────────
+  const psPagination = useTablePagination({
+    items: inventory?.permission_sets || [],
+    pageSize: 25,
+    filterFn: (ps, q) => ps.name.toLowerCase().includes(q) || ps.description.toLowerCase().includes(q),
+  });
+
+  const assignPagination = useTablePagination({
+    items: filteredAssignments,
+    pageSize: 25,
+    filterFn: (a, q) => a.principal_display_name.toLowerCase().includes(q) || a.account_id.includes(q) || a.permission_set_name.toLowerCase().includes(q),
+  });
+
+  const planPagination = useTablePagination({
+    items: filteredRoleMappings,
+    pageSize: 25,
+    filterFn: (m, q) => m.psName.toLowerCase().includes(q) || m.roleName.toLowerCase().includes(q) || m.accountId.includes(q) || m.principal.toLowerCase().includes(q),
+  });
 
   const canDiscover =
     accountScope === "org"
@@ -489,8 +511,10 @@ export default function Idc() {
                 selectionType="multi"
                 selectedItems={selectedPS}
                 onSelectionChange={({ detail }) => { setSelectedPS(detail.selectedItems); setSelectedAssignments([]); }}
-                items={inventory.permission_sets}
+                items={psPagination.pageItems}
                 trackBy="arn"
+                filter={<TextFilter filteringPlaceholder="Filter permission sets" filteringText={psPagination.filterQuery} onChange={({ detail }) => psPagination.setFilterQuery(detail.filteringText)} />}
+                pagination={<Pagination {...psPagination.paginationProps} />}
                 empty={<Box textAlign="center">No permission sets found.</Box>}
                 columnDefinitions={[
                   { id: "name", header: "Name", cell: (ps) => ps.name, minWidth: 150 },
@@ -533,8 +557,10 @@ export default function Idc() {
                 selectionType="multi"
                 selectedItems={selectedAssignments}
                 onSelectionChange={({ detail }) => setSelectedAssignments(detail.selectedItems)}
-                items={filteredAssignments}
+                items={assignPagination.pageItems}
                 trackBy={(a) => `${a.permission_set_arn}#${a.account_id}#${a.principal_id}`}
+                filter={<TextFilter filteringPlaceholder="Filter by principal, account, or permission set" filteringText={assignPagination.filterQuery} onChange={({ detail }) => assignPagination.setFilterQuery(detail.filteringText)} />}
+                pagination={<Pagination {...assignPagination.paginationProps} />}
                 empty={<Box textAlign="center">No assignments found.</Box>}
                 columnDefinitions={[
                   { id: "principal", header: "Principal", cell: (a) => a.principal_display_name, minWidth: 150 },
@@ -554,7 +580,7 @@ export default function Idc() {
               <Header
                 variant="h2"
                 description="Step 3 — review and customize the role name mapping. Each permission set maps to an IAM role. Edit role names inline or download the mapping, edit externally, and re-upload (CSV format)."
-                counter={selectedPS.length ? `(${filteredRoleMappings.length} of ${roleMappings.length} shown)` : `(${roleMappings.length} roles)`}
+                counter={selectedPS.length || selectedAssignments.length ? `(${filteredRoleMappings.length} of ${roleMappings.length} shown)` : `(${roleMappings.length} mappings)`}
                 actions={
                   <SpaceBetween direction="horizontal" size="xs">
                     <Button iconName="download" onClick={() => {
@@ -629,8 +655,10 @@ export default function Idc() {
               <Table
                 variant="embedded"
                 resizableColumns
-                items={filteredRoleMappings}
+                items={planPagination.pageItems}
                 trackBy="key"
+                filter={<TextFilter filteringPlaceholder="Filter by permission set, role name, principal, or account" filteringText={planPagination.filterQuery} onChange={({ detail }) => planPagination.setFilterQuery(detail.filteringText)} />}
+                pagination={<Pagination {...planPagination.paginationProps} />}
                 columnDefinitions={[
                   { id: "ps", header: "Permission Set", cell: (r) => r.psName, minWidth: 150 },
                   { id: "role", header: "Target Role Name", cell: (r) => (

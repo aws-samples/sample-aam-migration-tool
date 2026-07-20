@@ -13,12 +13,15 @@ import ProgressBar from "@cloudscape-design/components/progress-bar";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Table from "@cloudscape-design/components/table";
+import TextFilter from "@cloudscape-design/components/text-filter";
 import Toggle from "@cloudscape-design/components/toggle";
+import Pagination from "@cloudscape-design/components/pagination";
 import { api, type CacheWrapper, type JobProgress } from "../api/client";
 import { AuthMethodSelect, INITIAL_AUTH_STATE, parseAccountIds, type AuthState } from "../components/AuthMethodSelect";
 import { type MultiOption } from "../components/ProfileSelect";
 import { exportToCsv } from "../utils/csv";
 import { formatAbsolute, formatAge } from "../utils/time";
+import { useTablePagination } from "../utils/useTablePagination";
 
 interface Match {
   resource_arn: string;
@@ -153,6 +156,12 @@ export default function PolicyAnalysis() {
     return JSON.stringify(p, null, 2);
   }
 
+  const matchesPagination = useTablePagination({
+    items: result?.matches || [],
+    pageSize: 25,
+    filterFn: (m, q) => m.resource_arn.toLowerCase().includes(q) || m.service.toLowerCase().includes(q) || (m.account_id || "").includes(q) || m.matched_terms.some((t) => t.toLowerCase().includes(q)),
+  });
+
   function handleExport() {
     if (!result?.matches.length) return;
     exportToCsv("policy_analysis_matches.csv", result.matches.map((m) => ({
@@ -250,7 +259,9 @@ export default function PolicyAnalysis() {
               <Table
                 variant="embedded"
                 resizableColumns
-                items={result.matches}
+                items={matchesPagination.pageItems}
+                filter={<TextFilter filteringPlaceholder="Filter by ARN, service, account, or matched term" filteringText={matchesPagination.filterQuery} onChange={({ detail }) => matchesPagination.setFilterQuery(detail.filteringText)} />}
+                pagination={<Pagination {...matchesPagination.paginationProps} />}
                 empty={<Box textAlign="center">No matching policies found.</Box>}
                 columnDefinitions={[
                   { id: "service", header: "Service", cell: (m) => m.service, minWidth: 120 },
