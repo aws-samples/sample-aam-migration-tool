@@ -22,6 +22,9 @@ from typing import Callable, Optional
 
 from . import cache, config
 from .aws_session import build_assumed_session, build_session
+from .suppressed_logger import SuppressedLogger
+
+_slog = SuppressedLogger("idc")
 
 # ─── Import the IdC tool modules by path ─────────────────────────────────────
 
@@ -85,6 +88,7 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
     Returns:
         Cache wrapper dict written to disk.
     """
+    _slog.start_job(params.get("_job_id") or "unknown")
     _add_idc_to_path()
 
     account_scope = params.get("account_scope") or "single"
@@ -175,8 +179,8 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
             )
             if inline_resp.get("InlinePolicy"):
                 inline_policy = json.loads(inline_resp["InlinePolicy"])
-        except Exception:
-            pass
+        except Exception as exc:
+            _slog.record(exc, context="get_inline_policy_for_permission_set", resource=ps_arn)
 
         aws_managed = []
         try:
@@ -184,8 +188,8 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
             for page in mp_pag.paginate(InstanceArn=instance_arn, PermissionSetArn=ps_arn):
                 for p in page.get("AttachedManagedPolicies", []):
                     aws_managed.append({"name": p.get("Name", ""), "arn": p.get("Arn", "")})
-        except Exception:
-            pass
+        except Exception as exc:
+            _slog.record(exc, context="list_managed_policies_in_permission_set", resource=ps_arn)
 
         cmp_refs = []
         try:
@@ -193,8 +197,8 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
             for page in cmp_pag.paginate(InstanceArn=instance_arn, PermissionSetArn=ps_arn):
                 for ref in page.get("CustomerManagedPolicyReferences", []):
                     cmp_refs.append({"name": ref.get("Name", ""), "path": ref.get("Path", "/")})
-        except Exception:
-            pass
+        except Exception as exc:
+            _slog.record(exc, context="list_customer_managed_policy_references_in_permission_set", resource=ps_arn)
 
         with _describe_lock:
             _describe_done[0] += 1
@@ -218,8 +222,8 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
         for fut in as_completed(futures):
             try:
                 permission_sets.append(fut.result())
-            except Exception:
-                pass
+            except Exception as exc:
+                _slog.record(exc, context="describe_one_ps_future")
 
     emit(f"Described {len(permission_sets)} permission set(s)", phase="assignments")
 
@@ -242,7 +246,8 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
             else:
                 resp = identity_store.describe_group(IdentityStoreId=identity_store_id, GroupId=principal_id)
                 name = resp.get("DisplayName") or resp.get("GroupName") or principal_id
-        except Exception:
+        except Exception as exc:
+            _slog.record(exc, context=f"resolve_name({principal_type})", resource=principal_id)
             name = principal_id
         with _name_lock:
             name_cache[key] = name
@@ -261,8 +266,8 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
                 apag = sso_admin.get_paginator("list_accounts_for_provisioned_permission_set")
                 for page in apag.paginate(InstanceArn=instance_arn, PermissionSetArn=ps_arn):
                     accounts_for_ps.extend(page.get("AccountIds", []))
-            except Exception:
-                pass
+            except Exception as exc:
+                _slog.record(exc, context="list_accounts_for_provisioned_permission_set", resource=ps_arn)
 
         for acct in accounts_for_ps:
             try:
@@ -281,8 +286,8 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
                             "principal_id": principal_id,
                             "principal_display_name": resolve_name(principal_type, principal_id),
                         })
-            except Exception:
-                pass
+            except Exception as exc:
+                _slog.record(exc, context="list_account_assignments", resource=f"{ps_arn}::{acct}")
 
         with _assign_lock:
             _assign_done[0] += 1
@@ -296,8 +301,8 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
         for fut in as_completed(futures):
             try:
                 assignments.extend(fut.result())
-            except Exception:
-                pass
+            except Exception as exc:
+                _slog.record(exc, context="fetch_assignments_for_ps_future")
 
     emit(f"Inventory complete: {len(permission_sets)} permission sets, {len(assignments)} assignments",
          completed_units=total_ps, total_units=total_ps, phase="done")
@@ -312,6 +317,7 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
         "assignments": assignments,
         "total_permission_sets": len(permission_sets),
         "total_assignments": len(assignments),
+        "suppressed_warnings": _slog.get_summary(),
     }
     return cache.write_cache(config.IDC_CACHE, payload)
 
@@ -571,8 +577,8 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
                     prof_session = build_session(profile)
                     prof_account = prof_session.client("sts").get_caller_identity()["Account"]
                     account_sessions[prof_account] = prof_session
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _slog.record(exc, context="resolve_profile_session", resource=profile)
         # For any target accounts not covered by a profile, fall back to the hub session
         for acct in target_account_ids:
             if acct not in account_sessions:

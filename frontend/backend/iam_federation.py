@@ -25,6 +25,9 @@ from typing import Callable, Optional
 
 from . import cache, config
 from .aws_session import build_assumed_session, build_session
+from .suppressed_logger import SuppressedLogger
+
+_slog = SuppressedLogger("iam_federation")
 
 # ─── Load the evaluation script by path ──────────────────────────────────────
 
@@ -154,6 +157,7 @@ def discover_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> di
     if not idp_filter and not legacy_idp:
         raise ValueError("idp_filter or idp_arn is required")
 
+    _slog.start_job(params.get("_job_id") or "unknown")
     eval_mod = _load_eval()
     sessions = _resolve_sessions(params)
 
@@ -277,8 +281,8 @@ def discover_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> di
                         result = fut.result()
                         if result:
                             all_roles.append(result)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _slog.record(exc, context="inspect_role", resource=futures[fut])
 
         except Exception as exc:
             all_roles.append({
@@ -300,6 +304,7 @@ def discover_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> di
         "total_roles": len([r for r in all_roles if not r.get("error")]),
         "roles": all_roles,
         "accounts_scanned": total_accounts,
+        "suppressed_warnings": _slog.get_summary(),
     }
     return cache.write_cache(config.IAM_FEDERATION_CACHE, payload)
 
@@ -542,15 +547,15 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
                         instances.extend(page.get("Instances", []))
                     if instances:
                         identity_store_id = instances[0].get("IdentityStoreId", "")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _slog.record(exc, context="list_instances_for_identity_store", resource=idc_region)
 
             id_store = None
             if identity_store_id:
                 try:
                     id_store = hub_session.client("identitystore", region_name=idc_region)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _slog.record(exc, context="create_identitystore_client", resource=identity_store_id)
 
             def resolve_principal_id(name: str, principal_type: str) -> tuple[str, str | None]:
                 """Resolve a display name to an Identity Store UUID.

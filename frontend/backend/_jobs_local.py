@@ -58,6 +58,7 @@ def _update_progress(job_id: str, update: dict) -> None:
 
 def _run(job_id: str, params: dict) -> None:
     try:
+        params["_job_id"] = job_id
         result = policy_analysis.run_scan_job(
             params, on_progress=lambda u: _update_progress(job_id, u)
         )
@@ -111,6 +112,7 @@ def start_iam_discover(params: dict) -> str:
 
 def _run_iam_discover(job_id: str, params: dict) -> None:
     try:
+        params["_job_id"] = job_id
         result = iam_federation.discover_roles(
             params, on_progress=lambda u: _update_progress(job_id, u)
         )
@@ -161,6 +163,7 @@ def _run_idc_discover(job_id: str, params: dict) -> None:
     from . import idc
 
     try:
+        params["_job_id"] = job_id
         result = idc.run_inventory(
             params, on_progress=lambda u: _update_progress(job_id, u)
         )
@@ -211,6 +214,7 @@ def _run_idc_apply(job_id: str, params: dict) -> None:
     from . import idc
 
     try:
+        params["_job_id"] = job_id
         result = idc.apply_roles(
             params, on_progress=lambda u: _update_progress(job_id, u)
         )

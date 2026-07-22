@@ -28,6 +28,9 @@ from typing import Callable, Optional
 
 from . import cache, checkpoint, config
 from .aws_session import build_assumed_session, build_session
+from .suppressed_logger import SuppressedLogger
+
+_slog = SuppressedLogger("policy_analysis")
 
 # ─── Import the existing scanner module by path ──────────────────────────────
 # It lives outside this package, so load it explicitly rather than via a normal
@@ -94,6 +97,8 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
     search_terms = params.get("search_terms") or []
     if not search_terms:
         raise ValueError("At least one search term is required.")
+
+    _slog.start_job(params.get("_job_id") or "unknown")
 
     # ── Resolve scan targets from the chosen authentication method ───────────
     # Two mutually-exclusive ways to enumerate the accounts to scan:
@@ -172,7 +177,8 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
         try:
             _base_session = build_session(targets[0].get("base_profile") if targets else None, region=default_region)
             _base_account_id = _base_session.client("sts").get_caller_identity()["Account"]  # type: ignore[union-attr]
-        except Exception:
+        except Exception as exc:
+            _slog.record(exc, context="resolve_base_session_for_assume_role")
             _base_account_id = None
             _base_session = None
 
@@ -230,8 +236,8 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
         if management_account:
             try:
                 org_id = session.client("organizations").describe_organization()["Organization"]["Id"]
-            except Exception:
-                pass
+            except Exception as exc:
+                _slog.record(exc, context="describe_organization", resource=account_id)
         for scope, region in units:
             if scope == "global":
                 unit_key = f"{account_id}::global"
@@ -347,6 +353,7 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
             "resumed": skipped > 0,
             "complete": fully_successful,
         },
+        "suppressed_warnings": _slog.get_summary(),
     }
     return cache.write_cache(config.POLICY_ANALYSIS_CACHE, payload)
 

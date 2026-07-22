@@ -827,6 +827,89 @@ def scan_vpc_endpoints(session, region, account_id, terms):
     )
 
 
+def scan_msk(session, region, account_id, terms):
+    heading("MSK (Cluster Policies)")
+    matches = []
+    kafka = session.client("kafka", region_name=region)
+    clusters = paginate(kafka, "list_clusters_v2", "ClusterInfoList")
+    for cluster in clusters:
+        arn = cluster.get("ClusterArn", "")
+        resp = safe(kafka.get_cluster_policy, ClusterArn=arn)
+        if resp:
+            hit = check_policy(policy_text(resp.get("Policy")), arn, "MSK", terms, account_id)
+            if hit:
+                matches.append(hit)
+    return matches
+
+
+def scan_signer(session, region, account_id, terms):
+    heading("Signer (Signing Profile Permissions)")
+    matches = []
+    signer = session.client("signer", region_name=region)
+    profiles = paginate(signer, "list_signing_profiles", "profiles")
+    for profile in profiles:
+        profile_name = profile.get("profileName", "")
+        arn = profile.get("arn", f"arn:aws:signer:{region}:{account_id}:/signing-profiles/{profile_name}")
+        resp = safe(signer.list_profile_permissions, profileName=profile_name)
+        if resp and resp.get("permissions"):
+            # Serialize the permissions array to JSON for search
+            pol = json.dumps(resp["permissions"])
+            hit = check_policy(pol, arn, "Signer", terms, account_id)
+            if hit:
+                matches.append(hit)
+    return matches
+
+
+def scan_vpc_lattice(session, region, account_id, terms):
+    heading("VPC Lattice (Auth Policies)")
+    matches = []
+    lattice = session.client("vpc-lattice", region_name=region)
+    # Scan auth policies on services
+    services = paginate(lattice, "list_services", "items")
+    for svc in services:
+        arn = svc.get("arn", "")
+        resp = safe(lattice.get_auth_policy, resourceIdentifier=arn)
+        if resp:
+            hit = check_policy(policy_text(resp.get("policy")), arn, "VPC Lattice", terms, account_id)
+            if hit:
+                matches.append(hit)
+    # Scan auth policies on service networks
+    networks = paginate(lattice, "list_service_networks", "items")
+    for net in networks:
+        arn = net.get("arn", "")
+        resp = safe(lattice.get_auth_policy, resourceIdentifier=arn)
+        if resp:
+            hit = check_policy(policy_text(resp.get("policy")), arn, "VPC Lattice", terms, account_id)
+            if hit:
+                matches.append(hit)
+    return matches
+
+
+def scan_network_firewall(session, region, account_id, terms):
+    heading("Network Firewall (Resource Policies)")
+    matches = []
+    nfw = session.client("network-firewall", region_name=region)
+    # Scan resource policies on firewall policies
+    fw_policies = paginate(nfw, "list_firewall_policies", "FirewallPolicies")
+    for fp in fw_policies:
+        arn = fp.get("Arn", "")
+        resp = safe(nfw.describe_resource_policy, ResourceArn=arn)
+        if resp:
+            hit = check_policy(policy_text(resp.get("Policy")), arn, "Network Firewall", terms, account_id)
+            if hit:
+                matches.append(hit)
+    # Scan resource policies on rule groups
+    rule_groups = paginate(nfw, "list_rule_groups", "RuleGroups")
+    for rg in rule_groups:
+        arn = rg.get("Arn", "")
+        resp = safe(nfw.describe_resource_policy, ResourceArn=arn)
+        if resp:
+            hit = check_policy(policy_text(resp.get("Policy")), arn, "Network Firewall", terms, account_id)
+            if hit:
+                matches.append(hit)
+    return matches
+
+
 # ─── Regional orchestrator ──────────────────────────────────────────────────
 
 REGIONAL_SCANNERS = [
@@ -858,6 +941,10 @@ REGIONAL_SCANNERS = [
     ("Redshift Serverless", scan_redshift_serverless),
     ("Rekognition", scan_rekognition),
     ("VPC Endpoints", scan_vpc_endpoints),
+    ("MSK", scan_msk),
+    ("Signer", scan_signer),
+    ("VPC Lattice", scan_vpc_lattice),
+    ("Network Firewall", scan_network_firewall),
 ]
 
 
