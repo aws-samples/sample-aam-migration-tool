@@ -29,12 +29,25 @@ _slog = SuppressedLogger("idc")
 # ─── Import the IdC tool modules by path ─────────────────────────────────────
 
 _IDC_DIR = os.path.join(config.REPO_ROOT, "Identity Center to AAM")
+_LIB_PATH = os.path.join(_IDC_DIR, "lib.py")
 
 ProgressCb = Callable[[dict], None]
 
-# Default concurrency for parallel operations. Uses adaptive retry so throttle
-# responses are handled gracefully.
+# Default concurrency for parallel operations.
 MAX_WORKERS = 5
+
+
+def _load_idc_lib():
+    """Load the shared IdC library module."""
+    spec = importlib.util.spec_from_file_location("idc_lib", _LIB_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load IdC lib from {_LIB_PATH}")
+    module = sys.modules.get("idc_lib")
+    if module is None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["idc_lib"] = module
+        spec.loader.exec_module(module)
+    return module
 
 
 def _add_idc_to_path():
@@ -233,6 +246,7 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
     _assign_done = [0]
     name_cache: dict = {}
     _name_lock = Lock()
+    target_accounts_set = set(target_accounts) if target_accounts else set()
 
     def resolve_name(principal_type: str, principal_id: str) -> str:
         key = (principal_type, principal_id)
@@ -258,16 +272,23 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
 
     def fetch_assignments_for_ps(ps_arn: str) -> list:
         results = []
+        # Always ask IdC which accounts this PS is provisioned to, then
+        # intersect with the user's target scope (if specified). This avoids
+        # querying accounts where the PS doesn't exist AND accounts the user
+        # doesn't care about.
+        provisioned_accounts = []
+        try:
+            apag = sso_admin.get_paginator("list_accounts_for_provisioned_permission_set")
+            for page in apag.paginate(InstanceArn=instance_arn, PermissionSetArn=ps_arn):
+                provisioned_accounts.extend(page.get("AccountIds", []))
+        except Exception as exc:
+            _slog.record(exc, context="list_accounts_for_provisioned_permission_set", resource=ps_arn)
+
         if target_accounts is not None:
-            accounts_for_ps = target_accounts
+            # Only query accounts that are both provisioned AND in the user's scope
+            accounts_for_ps = [a for a in provisioned_accounts if a in target_accounts_set]
         else:
-            accounts_for_ps = []
-            try:
-                apag = sso_admin.get_paginator("list_accounts_for_provisioned_permission_set")
-                for page in apag.paginate(InstanceArn=instance_arn, PermissionSetArn=ps_arn):
-                    accounts_for_ps.extend(page.get("AccountIds", []))
-            except Exception as exc:
-                _slog.record(exc, context="list_accounts_for_provisioned_permission_set", resource=ps_arn)
+            accounts_for_ps = provisioned_accounts
 
         for acct in accounts_for_ps:
             try:
@@ -390,7 +411,7 @@ def generate_iac(params: dict) -> dict:
         lines.append("Parameters:")
         lines.append("  TrustServicePrincipal:")
         lines.append("    Type: String")
-        lines.append("    Default: account-access-preview.amazonaws.com")
+        lines.append("    Default: account-access.amazonaws.com")
         lines.append("    Description: The service principal for the new trust relationship.")
         lines.append("")
         lines.append("Resources:")
@@ -601,7 +622,7 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
         "Statement": [{
             "Sid": "AAMTrustPolicyStatement",
             "Effect": "Allow",
-            "Principal": {"Service": "account-access-preview.amazonaws.com"},
+            "Principal": {"Service": "account-access.amazonaws.com"},
             "Action": ["sts:AssumeRole", "sts:SetContext"],
         }],
     })
@@ -795,9 +816,7 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
             # Use the hub session for AAM (entitlements live in the management account)
             try:
                 aam_region = params.get("aam_region") or params.get("region") or "us-east-1"
-                # AAM is in preview — the GA endpoint doesn't exist yet.
-                # Default to the preview endpoint; will be removed once GA lands.
-                aam_endpoint_url = params.get("aam_endpoint_url") or f"https://account-access-preview.{aam_region}.api.aws"
+                aam_endpoint_url = params.get("aam_endpoint_url") or f"https://account-access.{aam_region}.api.aws"
                 # IMPORTANT: AAM entitlements live in the hub/management account,
                 # not the target accounts. Use default creds (same as IdC discovery).
                 hub_session_for_aam = build_session(None)

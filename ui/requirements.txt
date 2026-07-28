@@ -1,0 +1,11 @@
+# Truffle UI — kept intentionally minimal per design tenets.
+# Flask is the only web dependency; boto3 is already required by the utilities.
+Flask>=3.0,<4.0
+PyYAML>=6.0
+requests>=2.31,<3.0
+
+# Custom AAM-aware SDK wheels (includes the production `accountaccess` service
+# model). Order matters: botocore must be installed before boto3.
+# These are relative paths from ui/ to the repo root.
+../botocore-1.43.55-py3-none-any.whl
+../boto3-1.43.55-py3-none-any.whl

@@ -549,6 +549,196 @@ def setup_ssm_incidents(session, region, account_id, role_arn):
     print("  Skipped: service is being deprecated")
 
 
+def setup_msk(session, region, account_id, role_arn):
+    """Create an MSK Serverless cluster with a cluster policy."""
+    print("=== MSK ===")
+    kafka = session.client("kafka", region_name=region)
+    cluster_arn = None
+    # Check for existing cluster
+    try:
+        clusters = kafka.list_clusters_v2()
+        for c in clusters.get("ClusterInfoList", []):
+            if c.get("ClusterName", "") == PREFIX:
+                cluster_arn = c["ClusterArn"]
+                print(f"  Reusing existing cluster: {cluster_arn}")
+                break
+    except ClientError as e:
+        print(f"  List error: {e}")
+    if not cluster_arn:
+        # MSK provisioned clusters are expensive and slow — use serverless
+        ec2 = session.client("ec2", region_name=region)
+        vpcs = ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
+        if not vpcs["Vpcs"]:
+            vpcs = ec2.describe_vpcs()
+        if not vpcs["Vpcs"]:
+            print("  Skipped: no VPC available")
+            return
+        vpc_id = vpcs["Vpcs"][0]["VpcId"]
+        subnets = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])
+        subnet_ids = [s["SubnetId"] for s in subnets["Subnets"][:2]]
+        sgs = ec2.describe_security_groups(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}, {"Name": "group-name", "Values": ["default"]}])
+        sg_id = sgs["SecurityGroups"][0]["GroupId"] if sgs["SecurityGroups"] else None
+        if len(subnet_ids) < 2 or not sg_id:
+            print("  Skipped: insufficient subnets or security groups")
+            return
+        try:
+            resp = kafka.create_cluster_v2(
+                ClusterName=PREFIX,
+                Serverless={
+                    "VpcConfigs": [{
+                        "SubnetIds": subnet_ids,
+                        "SecurityGroupIds": [sg_id],
+                    }],
+                    "ClientAuthentication": {"Sasl": {"Iam": {"Enabled": True}}},
+                },
+            )
+            cluster_arn = resp["ClusterArn"]
+            print(f"  Created serverless cluster: {cluster_arn}")
+            print("  (Cluster will take a few minutes to become ACTIVE)")
+        except ClientError as e:
+            print(f"  Cluster creation error: {e}")
+            return
+    # Attach cluster policy
+    try:
+        kafka.put_cluster_policy(
+            ClusterArn=cluster_arn,
+            Policy=policy_doc_direct(role_arn, "kafka-cluster:Connect", cluster_arn),
+        )
+        print("  Attached cluster policy")
+    except ClientError as e:
+        print(f"  Skipped policy (cluster may still be creating): {e}")
+
+
+def setup_signer(session, region, account_id, role_arn):
+    """Create a Signer signing profile with cross-account permissions."""
+    print("=== Signer ===")
+    signer = session.client("signer", region_name=region)
+    profile_name = PREFIX.replace("-", "")  # Signer doesn't allow hyphens
+    try:
+        signer.put_signing_profile(
+            profileName=profile_name,
+            platformId="AWSLambda-SHA384-ECDSA",
+        )
+        print(f"  Created signing profile: {profile_name}")
+    except ClientError as e:
+        print(f"  Profile exists or error: {e}")
+    try:
+        signer.add_profile_permission(
+            profileName=profile_name,
+            action="signer:StartSigningJob",
+            principal=role_arn,
+            statementId="AllowIdentityCenterRole",
+        )
+        print("  Added profile permission")
+    except ClientError as e:
+        if "ConflictException" in str(type(e).__name__) or "ConflictException" in str(e):
+            print("  Permission already exists")
+        else:
+            print(f"  Skipped permission: {e}")
+
+
+def setup_vpc_lattice(session, region, account_id, role_arn):
+    """Create a VPC Lattice service with an auth policy."""
+    print("=== VPC Lattice ===")
+    lattice = session.client("vpc-lattice", region_name=region)
+    svc_arn = None
+    # Check for existing service
+    try:
+        services = lattice.list_services()
+        for s in services.get("items", []):
+            if s.get("name", "") == PREFIX:
+                svc_arn = s["arn"]
+                print(f"  Reusing existing service: {svc_arn}")
+                break
+    except ClientError as e:
+        print(f"  List error: {e}")
+    if not svc_arn:
+        try:
+            resp = lattice.create_service(name=PREFIX, authType="AWS_IAM")
+            svc_arn = resp["arn"]
+            print(f"  Created service: {svc_arn}")
+        except ClientError as e:
+            print(f"  Service creation error: {e}")
+            return
+    # Attach auth policy
+    try:
+        lattice.put_auth_policy(
+            resourceIdentifier=svc_arn,
+            policy=policy_doc(role_arn, "vpc-lattice-svcs:Invoke", svc_arn),
+        )
+        print("  Attached auth policy")
+    except ClientError as e:
+        print(f"  Skipped policy: {e}")
+
+
+def setup_network_firewall(session, region, account_id, role_arn):
+    """Create a Network Firewall rule group with a resource policy."""
+    print("=== Network Firewall ===")
+    nfw = session.client("network-firewall", region_name=region)
+    rg_arn = None
+    # Check for existing rule group
+    try:
+        rgs = nfw.list_rule_groups()
+        for rg in rgs.get("RuleGroups", []):
+            if PREFIX in rg.get("Name", ""):
+                rg_arn = rg["Arn"]
+                print(f"  Reusing existing rule group: {rg_arn}")
+                break
+    except ClientError as e:
+        print(f"  List error: {e}")
+    if not rg_arn:
+        try:
+            resp = nfw.create_rule_group(
+                RuleGroupName=PREFIX,
+                Type="STATELESS",
+                Capacity=10,
+                RuleGroup={
+                    "RulesSource": {
+                        "StatelessRulesAndCustomActions": {
+                            "StatelessRules": [{
+                                "RuleDefinition": {
+                                    "MatchAttributes": {
+                                        "Sources": [{"AddressDefinition": "0.0.0.0/0"}],
+                                        "Destinations": [{"AddressDefinition": "0.0.0.0/0"}],
+                                    },
+                                    "Actions": ["aws:pass"],
+                                },
+                                "Priority": 1,
+                            }],
+                            "CustomActions": [],
+                        }
+                    }
+                },
+            )
+            rg_arn = resp["RuleGroupResponse"]["RuleGroupArn"]
+            print(f"  Created rule group: {rg_arn}")
+        except ClientError as e:
+            print(f"  Rule group creation error: {e}")
+            return
+    # Attach resource policy (for sharing)
+    try:
+        nfw_policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "AllowIdentityCenterRole",
+                "Effect": "Allow",
+                "Principal": {"AWS": role_arn},
+                "Action": [
+                    "network-firewall:ListRuleGroups",
+                    "network-firewall:CreateFirewallPolicy",
+                ],
+                "Resource": rg_arn,
+            }]
+        })
+        nfw.put_resource_policy(
+            ResourceArn=rg_arn,
+            Policy=nfw_policy,
+        )
+        print("  Attached resource policy")
+    except ClientError as e:
+        print(f"  Skipped policy: {e}")
+
+
 # ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 def cleanup(session, region, account_id, skip_cfn=False):
@@ -698,6 +888,48 @@ def cleanup(session, region, account_id, skip_cfn=False):
     except ClientError as e:
         print(f"  SSM Incidents cleanup: {e}")
 
+    # MSK
+    try:
+        kafka = session.client("kafka", region_name=region)
+        clusters = kafka.list_clusters_v2()
+        for c in clusters.get("ClusterInfoList", []):
+            if c.get("ClusterName", "") == PREFIX:
+                kafka.delete_cluster(ClusterArn=c["ClusterArn"])
+                print(f"  Deleted MSK cluster: {c['ClusterArn']}")
+    except ClientError as e:
+        print(f"  MSK cleanup: {e}")
+
+    # Signer
+    try:
+        signer = session.client("signer", region_name=region)
+        profile_name = PREFIX.replace("-", "")
+        signer.cancel_signing_profile(profileName=profile_name)
+        print(f"  Canceled signing profile: {profile_name}")
+    except ClientError as e:
+        print(f"  Signer cleanup: {e}")
+
+    # VPC Lattice
+    try:
+        lattice = session.client("vpc-lattice", region_name=region)
+        services = lattice.list_services()
+        for s in services.get("items", []):
+            if s.get("name", "") == PREFIX:
+                lattice.delete_service(serviceIdentifier=s["id"])
+                print(f"  Deleted VPC Lattice service: {s['id']}")
+    except ClientError as e:
+        print(f"  VPC Lattice cleanup: {e}")
+
+    # Network Firewall
+    try:
+        nfw = session.client("network-firewall", region_name=region)
+        rgs = nfw.list_rule_groups()
+        for rg in rgs.get("RuleGroups", []):
+            if PREFIX in rg.get("Name", ""):
+                nfw.delete_rule_group(RuleGroupArn=rg["Arn"])
+                print(f"  Deleted Network Firewall rule group: {rg['Arn']}")
+    except ClientError as e:
+        print(f"  Network Firewall cleanup: {e}")
+
     # CloudFormation stack (last — some SDK resources depend on CFN resources)
     if not skip_cfn:
         delete_cfn_stack(session, region)
@@ -752,6 +984,10 @@ def main():
     setup_lex(session, region, account_id, role_arn)
     setup_private_ca(session, region, account_id, role_arn)
     setup_ssm_incidents(session, region, account_id, role_arn)
+    setup_msk(session, region, account_id, role_arn)
+    setup_signer(session, region, account_id, role_arn)
+    setup_vpc_lattice(session, region, account_id, role_arn)
+    setup_network_firewall(session, region, account_id, role_arn)
 
     print("\n" + "=" * 70)
     print("All test resources deployed.")

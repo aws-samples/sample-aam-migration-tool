@@ -1,17 +1,17 @@
-# Truffle web frontend (Cloudscape + React + Vite)
+# Truffle web UI (Cloudscape + React + Vite)
 
 The console UI, built with the [Cloudscape Design System](https://cloudscape.design/)
 — the same design system the AWS Console uses.
 
 ## Develop
 
-Run the Flask API in one terminal (from `frontend/`):
+Run the Flask API in one terminal (from `ui/`):
 
 ```bash
 python3 app.py        # http://127.0.0.1:5000
 ```
 
-Run the Vite dev server in another (from `frontend/web/`):
+Run the Vite dev server in another (from `ui/web/`):
 
 ```bash
 npm install

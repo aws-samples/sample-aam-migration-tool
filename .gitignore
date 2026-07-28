@@ -7,7 +7,7 @@ venv/
 .env
 *.whl
 
-# ─── Node / frontend build ───────────────────────────────────────────────────
+# ─── Node / UI build ─────────────────────────────────────────────────────────
 node_modules/
 dist/
 *.tsbuildinfo
@@ -17,8 +17,8 @@ cdk.out/
 
 # ─── Local cache / runtime output ────────────────────────────────────────────
 # The console writes scan results, discovery dumps, and checkpoints here.
-frontend/cache/*
-!frontend/cache/.gitignore
+ui/cache/*
+!ui/cache/.gitignore
 
 # ─── Managed solution (local test environment, not ready for repo) ────────────
 managed solution/
@@ -28,6 +28,9 @@ managed solution/
 *.swp
 .idea/
 .vscode/
+
+# ─── Tests (internal, not for open source) ────────────────────────────────────
+Identity Center to AAM/tests/
 
 # ─── IdC-to-AAM tool: extra Python caches ────────────────────────────────────
 env/

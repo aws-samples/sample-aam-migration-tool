@@ -140,7 +140,7 @@ class SuppressedLogger:
     def get_summary(self) -> dict:
         """Return the current warning summary for the UI.
 
-        Includes the job_id and log filename so the frontend can display them
+        Includes the job_id and log filename so the UI can display them
         in the warning banner, plus counts keyed by error code (only actionable
         errors; expected-empty codes are excluded).
         """

@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Cloudscape/React frontend for the Truffle AAM migration console.",
+  "description": "Cloudscape/React UI for the Truffle AAM migration console.",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

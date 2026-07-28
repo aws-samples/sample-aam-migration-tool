@@ -36,7 +36,7 @@ NEW_TRUST_POLICY = {
             "Sid": "AAMTrustPolicyStatement",
             "Effect": "Allow",
             "Principal": {
-                "Service": "account-access-preview.amazonaws.com"
+                "Service": "account-access.amazonaws.com"
             },
             "Action": ["sts:AssumeRole", "sts:SetContext"],
         }
@@ -92,7 +92,7 @@ def generate_cloudformation(roles: Dict[str, List[Dict[str, str]]], output_file:
     lines.append("Parameters:")
     lines.append("  TrustServicePrincipal:")
     lines.append("    Type: String")
-    lines.append("    Default: account-access-preview.amazonaws.com")
+    lines.append("    Default: account-access.amazonaws.com")
     lines.append("    Description: The service principal for the new trust relationship.")
     lines.append("")
     lines.append("Resources:")
@@ -172,7 +172,7 @@ def generate_terraform(roles: Dict[str, List[Dict[str, str]]], output_file: str)
     lines.append('variable "trust_service_principal" {')
     lines.append('  description = "The service principal for the new trust relationship"')
     lines.append('  type        = string')
-    lines.append('  default     = "account-access-preview.amazonaws.com"')
+    lines.append('  default     = "account-access.amazonaws.com"')
     lines.append('}')
     lines.append('')
     lines.append('data "aws_caller_identity" "current" {}')

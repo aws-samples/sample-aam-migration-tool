@@ -2,14 +2,14 @@
 """
 Truffle local migration console — Flask entry point.
 
-Serves a JSON API under /api and the built Cloudscape/React frontend (from
+Serves a JSON API under /api and the built Cloudscape/React UI (from
 web/dist) for everything else. Runs locally only; uses the local AWS
 credential chain.
 
 Run:
     python3 app.py            # serve API (+ built UI if web/dist exists)
 
-During frontend development, run the Vite dev server separately (see
+During UI development, run the Vite dev server separately (see
 web/README) — it proxies /api here.
 """
 
@@ -20,7 +20,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from backend import aws_session, cache, config, iam_federation, idc, jobs, policy_analysis
 
 # The Vite build outputs here. Absent until `npm run build` is run in web/.
-WEB_DIST = os.path.join(config.FRONTEND_DIR, "web", "dist")
+WEB_DIST = os.path.join(config.APP_DIR, "web", "dist")
 
 app = Flask(__name__, static_folder=None)
 
@@ -272,7 +272,7 @@ def idc_apply_status():
     return jsonify(job)
 
 
-# ─── Static frontend (built React app) ───────────────────────────────────────
+# ─── Static UI (built React app) ─────────────────────────────────────────────
 
 @app.get("/", defaults={"path": ""})
 @app.get("/<path:path>")
@@ -281,7 +281,7 @@ def serve_frontend(path: str):
     if not os.path.isdir(WEB_DIST):
         return (
             "<h1>Truffle backend is running.</h1>"
-            "<p>The frontend has not been built yet. From <code>frontend/web</code> run "
+            "<p>The UI has not been built yet. From <code>ui/web</code> run "
             "<code>npm install</code> then <code>npm run dev</code> (development) "
             "or <code>npm run build</code> (to serve from here).</p>",
             200,
@@ -294,4 +294,4 @@ def serve_frontend(path: str):
 
 if __name__ == "__main__":
     config.ensure_cache_dir()
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    app.run(host="127.0.0.1", port=5000, debug=False)

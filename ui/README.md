@@ -11,14 +11,14 @@ authentic AWS Console look and feel, running entirely on your machine.
 | Requirement | Version | Notes |
 |-------------|---------|-------|
 | Python | >= 3.11 | For the Flask backend |
-| Node.js | >= 18 | For building the React frontend |
+| Node.js | >= 18 | For building the React UI |
 | npm | any recent | Comes with Node |
 | AWS CLI | v2 | For credential resolution and AAM commands |
 | AWS credentials | configured | SSO, profiles, or environment variables |
 
 ### Custom boto3 SDK (required)
 
-The tool uses a preview version of boto3/botocore that includes the AAM
+The tool uses a custom version of boto3/botocore that includes the AAM
 (`accountaccess`) service model. The `.whl` files are in the repo root and
 are installed automatically by `pip install -r requirements.txt`.
 
@@ -30,7 +30,7 @@ these wheels can be removed.
 ## Quick Start
 
 ```bash
-cd frontend
+cd ui
 ./run.sh
 ```
 
@@ -42,7 +42,7 @@ the React UI, and serves at **http://127.0.0.1:5000**.
 ```bash
 ./run.sh                       # Local mode (default)
 ./run.sh --dev                 # Dev mode: Flask + Vite hot-reload
-./run.sh --rebuild             # Force frontend rebuild
+./run.sh --rebuild             # Force UI rebuild
 
 # Managed backend mode (requires deployed infrastructure)
 ./run.sh --managed --endpoint https://<id>.execute-api.<region>.amazonaws.com/prod
@@ -57,7 +57,7 @@ the React UI, and serves at **http://127.0.0.1:5000**.
 | `--region REGION` | No | AWS region for API signing (auto-detected from endpoint URL) |
 | `--profile PROFILE` | No | AWS profile for signing managed API requests |
 | `--dev` | No | Dev mode with Vite hot-reload on :5173 |
-| `--rebuild` | No | Force a fresh frontend build |
+| `--rebuild` | No | Force a fresh UI build |
 
 Environment variables also work: `TRUFFLE_MODE`, `TRUFFLE_API_ENDPOINT`,
 `TRUFFLE_API_REGION`, `TRUFFLE_API_PROFILE`.
@@ -109,7 +109,7 @@ equivalent IAM roles with AAM trust policies and entitlements.
 **Step 2: Apply** — what you need:
 - **AAM Application ARN** — required for creating entitlements. Get it with:
   ```bash
-  aws account-access-preview list-applications --region <region>
+  aws account-access list-applications --region <region>
   ```
   Copy the `applicationArn` from the output.
 - **Role path** — IAM path for created roles (default: `/aam/`)
@@ -132,7 +132,7 @@ between IdC principals and IAM roles). To find it:
 
 ```bash
 # Replace <region> with the region where AAM is configured
-aws account-access-preview list-applications --region <region>
+aws account-access list-applications --region <region>
 ```
 
 If no applications are listed, you need to create one first through the AAM
@@ -147,7 +147,7 @@ console or API.
 | IAM Federation (migrate) | `iam:GetRole`, `iam:UpdateAssumeRolePolicy` |
 | IdC Discovery | `sso-admin:*`, `identitystore:Describe*`, `identitystore:List*` (from management/delegated admin account) |
 | IdC Apply (create roles) | `iam:CreateRole`, `iam:AttachRolePolicy`, `iam:PutRolePolicy`, `iam:TagRole` |
-| IdC Apply (entitlements) | `account-access-preview:CreateEntitlement` |
+| IdC Apply (entitlements) | `account-access:CreateEntitlement` |
 
 ### Local Mode vs Managed Mode
 
@@ -163,7 +163,7 @@ console or API.
 ## Architecture
 
 ```
-frontend/
+ui/
 ├── run.sh                    # One-command launcher
 ├── app.py                    # Flask entry point + JSON API + serves built UI
 ├── requirements.txt          # Python dependencies (includes custom boto3 wheels)
@@ -178,7 +178,7 @@ frontend/
 │   ├── policy_analysis.py    # Resource policy scanning logic
 │   ├── iam_federation.py     # IAM federation discovery + migration
 │   └── idc.py                # IdC discovery + apply
-├── web/                      # Cloudscape + React + Vite frontend
+├── web/                      # Cloudscape + React + Vite UI
 │   └── src/pages/            # One page per feature tab
 └── cache/                    # Local cache output (git-ignored)
 ```
@@ -188,7 +188,7 @@ frontend/
 ## Troubleshooting
 
 ### "No module named 'botocore'" or "'boto3'"
-Run `pip install -r requirements.txt` from the `frontend/` directory, or use
+Run `pip install -r requirements.txt` from the `ui/` directory, or use
 `./run.sh` which handles this automatically.
 
 ### "No IAM Identity Center instance found"

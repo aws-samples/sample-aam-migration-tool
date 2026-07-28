@@ -194,8 +194,11 @@ export default function PolicyAnalysis() {
 
         <Container header={<Header variant="h2">Scan scope</Header>}>
           <SpaceBetween size="l">
-            <FormField label="Search strings" description="Comma-separated. e.g. a role ARN or principal to find in policies.">
-              <Input value={search} onChange={({ detail }) => setSearch(detail.value)} placeholder="arn:aws:iam::1111:role/Example, my-search-term" disabled={running} />
+            <FormField
+              label="Search strings"
+              description="Comma-separated terms to search for in policies. Matching is case-insensitive. Supports IAM-style wildcards: * (any characters) and ? (single character). Note: if your search term contains *, it will also match policies with concrete values in that position (e.g., searching arn:aws:iam::*:role/MyRole will match both wildcard references and specific account IDs)."
+            >
+              <Input value={search} onChange={({ detail }) => setSearch(detail.value)} placeholder="arn:aws:iam::*:role/MyRole*, my-saml-provider" disabled={running} />
             </FormField>
 
             <FormField label="Services" description="Optional. Limit the scan to specific resource types. Empty = all services.">

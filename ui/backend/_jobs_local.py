@@ -2,7 +2,7 @@
 Background job runner for long-running scans (option A: background job + poll).
 
 The scan endpoint starts a job and returns immediately with a ``job_id``; the
-frontend polls ``/api/policy-analysis/status`` for progress and the final
+UI polls ``/api/policy-analysis/status`` for progress and the final
 result. Jobs run in daemon threads with state held in memory.
 
 If the server restarts, in-memory jobs are lost — but that's fine: the scan's

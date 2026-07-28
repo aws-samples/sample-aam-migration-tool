@@ -5,7 +5,7 @@
       "Sid": "Statement1",
       "Effect": "Allow",
       "Principal": {
-        "Service": "account-access-preview.amazonaws.com"
+        "Service": "account-access.amazonaws.com"
       },
       "Action": [
         "sts:AssumeRole",

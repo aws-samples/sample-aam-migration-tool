@@ -34,10 +34,24 @@ _slog = SuppressedLogger("iam_federation")
 _SCRIPT_DIR = os.path.join(config.REPO_ROOT, "IAM Federation to AAM")
 _EVAL_PATH = os.path.join(_SCRIPT_DIR, "AAM_role_evaluation.py")
 _IAC_PATH = os.path.join(_SCRIPT_DIR, "generate_iac_templates.py")
+_LIB_PATH = os.path.join(_SCRIPT_DIR, "lib.py")
 
 ProgressCb = Callable[[dict], None]
 
 MAX_WORKERS = 5
+
+
+def _load_lib():
+    """Load the shared IAM Federation library module."""
+    spec = importlib.util.spec_from_file_location("iam_federation_lib", _LIB_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load IAM Federation lib from {_LIB_PATH}")
+    module = sys.modules.get("iam_federation_lib")
+    if module is None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["iam_federation_lib"] = module
+        spec.loader.exec_module(module)
+    return module
 
 
 def _load_eval():
@@ -115,23 +129,16 @@ def list_providers(params: dict) -> dict:
 
     Returns a flat list of providers with account context.
     """
+    lib = _load_lib()
     sessions = _resolve_sessions(params)
     all_providers = []
 
     for label, session, account_id in sessions:
-        iam = session.client("iam")
-        response = iam.list_saml_providers()
-        for p in response.get("SAMLProviderList", []):
-            arn = p["Arn"]
-            name = arn.split("/")[-1]
-            is_idc = "AWSSSO" in name or "DO_NOT_DELETE" in name
-            all_providers.append({
-                "arn": arn,
-                "name": name,
-                "account_id": account_id,
-                "label": label,
-                "is_identity_center": is_idc,
-            })
+        providers = lib.list_saml_providers(session)
+        for p in providers:
+            p["account_id"] = account_id
+            p["label"] = label
+        all_providers.extend(providers)
 
     return {"providers": all_providers}
 
@@ -193,96 +200,28 @@ def discover_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> di
             continue
 
         try:
-            # Temporarily override the module's client/resource with our session
-            iam_client = session.client("iam")
-            iam_resource = session.resource("iam")
+            lib = _load_lib()
 
             # Get all role names
-            role_names = []
-            paginator = iam_client.get_paginator("list_roles")
-            for page in paginator.paginate():
-                role_names.extend(r["RoleName"] for r in page["Roles"])
+            role_names = lib.list_all_role_names(session)
 
             roles_total += len(role_names)
             emit(f"Scanning {len(role_names)} roles in {label} ({account_id})", f"Listing roles in {account_id}")
 
-            # Filter to SAML-federated roles (parallel)
-            _scan_lock = Lock()
-
-            def inspect_role(rn: str) -> Optional[dict]:
+            # Single pass: discover roles matching ANY of the selected IDPs
+            def role_progress(p):
                 nonlocal roles_scanned
-                r = iam_resource.Role(rn)
-                trust_doc = r.assume_role_policy_document
-                if not trust_doc:
-                    return None
+                roles_scanned = p.get("roles_scanned", roles_scanned)
+                emit(p.get("message", ""), p.get("message", ""))
 
-                for stmt in trust_doc.get("Statement", []):
-                    principal = stmt.get("Principal", {})
-                    federated = principal.get("Federated", "")
-                    if isinstance(federated, str):
-                        federated = [federated]
-                    # Match if any of the account's selected IDPs appear in the trust
-                    matched_idps = [a for a in account_idp_arns if a in federated]
-                    if matched_idps:
-                        attached = []
-                        att_paginator = iam_client.get_paginator("list_attached_role_policies")
-                        for att_page in att_paginator.paginate(RoleName=rn):
-                            for p in att_page.get("AttachedPolicies", []):
-                                policy_type = (
-                                    "AWS Managed"
-                                    if p["PolicyArn"].startswith("arn:aws:iam::aws:policy")
-                                    else "Customer Managed"
-                                )
-                                attached.append({
-                                    "policy_name": p["PolicyName"],
-                                    "policy_arn": p["PolicyArn"],
-                                    "policy_type": policy_type,
-                                })
-
-                        inline = []
-                        inl_paginator = iam_client.get_paginator("list_role_policies")
-                        for inl_page in inl_paginator.paginate(RoleName=rn):
-                            for pname in inl_page.get("PolicyNames", []):
-                                inline.append({
-                                    "policy_name": pname,
-                                    "policy_type": "Inline",
-                                })
-
-                        trust_summary = []
-                        for s in trust_doc.get("Statement", []):
-                            fed = s.get("Principal", {}).get("Federated", "")
-                            if isinstance(fed, list):
-                                fed = ", ".join(fed)
-                            if fed:
-                                provider_name = fed.split("/")[-1] if "/" in fed else fed
-                                trust_summary.append(f"Federated:{provider_name}")
-
-                        return {
-                            "role_name": rn,
-                            "role_arn": f"arn:aws:iam::{account_id}:role/{rn}",
-                            "account_id": account_id,
-                            "label": label,
-                            "idp_arns": matched_idps,
-                            "trust_policy_document": trust_doc,
-                            "trust_summary": "; ".join(trust_summary),
-                            "policies": attached + inline,
-                        }
-                return None
-
-            workers = int(params.get("workers", MAX_WORKERS))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {pool.submit(inspect_role, rn): rn for rn in role_names}
-                for fut in as_completed(futures):
-                    with _scan_lock:
-                        roles_scanned += 1
-                        if roles_scanned % 10 == 0:
-                            emit(f"Scanning roles in {label} ({account_id})", f"Inspected {roles_scanned}/{roles_total} roles")
-                    try:
-                        result = fut.result()
-                        if result:
-                            all_roles.append(result)
-                    except Exception as exc:
-                        _slog.record(exc, context="inspect_role", resource=futures[fut])
+            found = lib.discover_federated_roles(
+                session, role_names, account_idp_arns, account_id,
+                workers=int(params.get("workers", MAX_WORKERS)),
+                on_progress=role_progress,
+            )
+            for r in found:
+                r["label"] = label
+            all_roles.extend(found)
 
         except Exception as exc:
             all_roles.append({
@@ -316,7 +255,7 @@ NEW_TRUST_STATEMENT = {
     "Sid": "AAMTrustPolicyStatement",
     "Effect": "Allow",
     "Principal": {
-        "Service": "account-access-preview.amazonaws.com"
+        "Service": "account-access.amazonaws.com"
     },
     "Action": [
         "sts:AssumeRole",
@@ -510,7 +449,7 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
                 hub_session = build_session(None)
 
         aam_region = params.get("aam_region") or config.IDC_REGION or "us-west-2"
-        aam_endpoint_url = f"https://account-access-preview.{aam_region}.api.aws"
+        aam_endpoint_url = f"https://account-access.{aam_region}.api.aws"
 
         try:
             aam_client = hub_session.client(

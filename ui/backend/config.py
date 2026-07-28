@@ -1,5 +1,5 @@
 """
-Path and location configuration for the Truffle frontend.
+Path and location configuration for the Truffle UI application.
 
 Centralizes the on-disk locations so the rest of the backend never has to
 guess where things live. Everything is local to the repo per the design
@@ -12,10 +12,10 @@ Execution mode:
 
 import os
 
-# frontend/backend/config.py -> frontend/ -> repo root
+# ui/backend/config.py -> ui/ -> repo root
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-FRONTEND_DIR = os.path.dirname(BACKEND_DIR)
-REPO_ROOT = os.path.dirname(FRONTEND_DIR)
+APP_DIR = os.path.dirname(BACKEND_DIR)
+REPO_ROOT = os.path.dirname(APP_DIR)
 
 # Existing utilities we reuse.
 UTILITIES_DIR = os.path.join(REPO_ROOT, "Utilites")
@@ -23,7 +23,7 @@ RESOURCE_POLICY_SCAN_DIR = os.path.join(UTILITIES_DIR, "resource_policy_scan")
 
 # Local cache directory. Results are written here and re-read on load so the
 # UI can show prior runs without re-hitting AWS.
-CACHE_DIR = os.path.join(FRONTEND_DIR, "cache")
+CACHE_DIR = os.path.join(APP_DIR, "cache")
 
 # Named cache files per feature.
 POLICY_ANALYSIS_CACHE = os.path.join(CACHE_DIR, "policy_analysis.json")

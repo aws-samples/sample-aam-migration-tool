@@ -7,6 +7,8 @@ plan, recreates each permission set as an IAM role (or emits the equivalent
 Infrastructure-as-Code), and creates the AAM entitlements that preserve who can
 access what — all with an audit trail and a final mapping report.
 
+This is the standalone CLI. For the browser-based console (recommended for most users), see the [main README](../README.md).
+
 The tool runs in clear, sequential phases:
 
 ```
@@ -69,9 +71,9 @@ It is one of three components in the larger Truffle migration toolkit.
 ## Requirements
 
 - Python 3.11+
-- The custom **boto3 / botocore 1.42.97** wheels that expose the preview
+- The custom **boto3 / botocore 1.43.55** wheels that expose the
   `accountaccess` (AAM) client. AAM is not yet in public boto3, so these are
-  required for the entitlement phase (This will get removed once boto3 is implemented).
+  required for the entitlement phase (This will get removed once boto3 is updated).
 - AWS credentials for the account that holds your IdC instance.
 
 ---
@@ -84,8 +86,8 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # Install the custom AAM-aware SDK wheels FIRST (again to be removed when boto3 is released):
-pip install /path/to/botocore-1.42.97-py3-none-any.whl
-pip install /path/to/boto3-1.42.97-py3-none-any.whl
+pip install /path/to/botocore-1.43.55-py3-none-any.whl
+pip install /path/to/boto3-1.43.55-py3-none-any.whl
 
 # Then the rest of the dependencies:
 pip install -r requirements.txt
@@ -175,7 +177,8 @@ Run `python idc_to_aam.py --help` for the live list.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--account-scope {single,multi,org}` | `single` | `single`: operate only in the hub account with current credentials. `multi`: assume a role into each specified target account. `org`: scan all accounts provisioned in the IdC instance (may be throttled in large orgs). |
-| `--account-ids` | — | Comma-separated target account IDs. **Required for `multi`.** |
+| `--account-ids` | — | Comma-separated target account IDs for role creation (assume-role targets). **Required for `multi`.** |
+| `--target-account-ids` | — | Comma-separated account IDs to filter discovery scope. Only permission sets provisioned to these accounts will be inventoried. Defaults to `--account-ids` if not specified. |
 | `--role-name` | — | Name of the IAM role to assume in each target account. **Required for `multi`.** |
 
 ### Mode
@@ -333,3 +336,23 @@ stub, so no credentials and no real API calls are involved.
   generated templates target a single account.
 - The tool does **not** modify resource-based policies, migrate IAM Federation,
   or analyze SCPs/RCPs/VPC endpoint policies (other Truffle components cover those).
+
+
+---
+
+## Architecture
+
+```
+idc_to_aam.py          ← CLI entry point (orchestration, prompts, phases)
+├── inventory.py       ← IdC discovery (permission sets, assignments)
+├── role_creator.py    ← IAM role creation (apply mode)
+├── entitlement_creator.py  ← AAM entitlement creation
+├── iac_generator.py   ← CloudFormation template generation (per-account)
+├── plan.py            ← Migration plan (XLSX read/write)
+├── mapping_reporter.py ← Final mapping report
+└── lib.py             ← Shared library (stateless functions, also used by UI adapter)
+```
+
+The `lib.py` module provides stateless functions for IdC discovery, role creation,
+and entitlement creation. The UI adapter (`ui/backend/idc.py`) imports these directly,
+ensuring a single source of truth for core logic across both CLI and UI.

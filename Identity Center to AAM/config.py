@@ -268,9 +268,9 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="aam_endpoint_url",
         help=(
             "Override the endpoint URL for the AAM (account-access) client. "
-            "Required while AAM is a preview service. Preview endpoints follow "
-            "https://account-access-preview.<region>.api.aws "
-            "(e.g. https://account-access-preview.us-west-2.api.aws)."
+            "Production endpoints follow "
+            "https://account-access.<region>.api.aws "
+            "(e.g. https://account-access.us-west-2.api.aws)."
         ),
     )
     p.add_argument(
@@ -278,8 +278,7 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="aam_region",
         help=(
             "Region for the AAM client, when it differs from --region (the IdC "
-            "region). The AAM preview currently runs in us-west-2 while IdC stays "
-            "in its primary region (e.g. us-east-1). Defaults to --region."
+            "region). Defaults to --region."
         ),
     )
 

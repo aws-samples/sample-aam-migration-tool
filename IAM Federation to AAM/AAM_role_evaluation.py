@@ -298,13 +298,15 @@ NEW_TRUST_STATEMENT = {
     "Sid": "AAMTrustPolicyStatement",
     "Effect": "Allow",
     "Principal": {
-        "Service": "account-access-preview.amazonaws.com"
+        "Service": "account-access.amazonaws.com"
     },
     "Action": [
         "sts:AssumeRole",
         "sts:SetContext"
     ],
 }
+
+AAM_SERVICE_PRINCIPALS = {"account-access.amazonaws.com", "account-access-preview.amazonaws.com"}
 
 
 def update_trust_policies(saml_roles: List[Dict[str, Any]], idp_arn: str, account_id: str) -> None:
@@ -359,10 +361,17 @@ def update_trust_policies(saml_roles: List[Dict[str, Any]], idp_arn: str, accoun
         role_name = entry["role_name"]
         trust_doc = entry["trust_policy_document"]
 
-        # Skip if the role already has our statement (avoids duplicate Sid error)
-        existing_sids = {s.get("Sid") for s in trust_doc.get("Statement", [])}
-        if NEW_TRUST_STATEMENT["Sid"] in existing_sids:
-            print(f"  ⏭ {role_name}: already has Sid '{NEW_TRUST_STATEMENT['Sid']}', skipping")
+        # Skip if the role already has the AAM service principal
+        already_has_aam = False
+        for stmt in trust_doc.get("Statement", []):
+            svc = stmt.get("Principal", {}).get("Service", "")
+            if isinstance(svc, str):
+                svc = [svc]
+            if any(s in AAM_SERVICE_PRINCIPALS for s in svc):
+                already_has_aam = True
+                break
+        if already_has_aam:
+            print(f"  ⏭ {role_name}: already has AAM service principal, skipping")
             skipped += 1
             continue
 
@@ -398,47 +407,28 @@ def update_trust_policies(saml_roles: List[Dict[str, Any]], idp_arn: str, accoun
 
 
 # ---------------------------------------------------------------------------
-# Parallelized role filtering
+# Parallelized role filtering — delegates to lib.py
 # ---------------------------------------------------------------------------
 
+from lib import (
+    list_saml_providers as _lib_list_providers,
+    list_all_role_names as _lib_list_role_names,
+    discover_federated_roles as _lib_discover_roles,
+    migrate_roles_parallel as _lib_migrate_parallel,
+    create_entitlements as _lib_create_entitlements,
+    parse_entitlement_csv as _lib_parse_csv,
+    NEW_TRUST_STATEMENT,
+)
+
+
 def filter_saml_roles_parallel(
-    role_names: List[str], idp_arn: str, workers: int = 5
+    role_names: List[str], idp_arn: str, workers: int = 5, session: Optional[Any] = None
 ) -> List[Dict[str, Any]]:
-    """Parallel version of filter_saml_roles using ThreadPoolExecutor."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    saml_roles = []
-    done = 0
-    total = len(role_names)
-
-    def inspect(name: str) -> Optional[Dict[str, Any]]:
-        role = iam_resource.Role(name)
-        trust_doc = role.assume_role_policy_document
-        if not trust_doc:
-            return None
-        for stmt in trust_doc.get("Statement", []):
-            principal = stmt.get("Principal", {})
-            federated = principal.get("Federated", "")
-            if isinstance(federated, str):
-                federated = [federated]
-            if idp_arn in federated:
-                return {"role_name": name, "trust_policy_document": trust_doc}
-        return None
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(inspect, name): name for name in role_names}
-        for fut in as_completed(futures):
-            done += 1
-            if done % 20 == 0:
-                print(f"    Inspected {done}/{total} roles...")
-            try:
-                result = fut.result()
-                if result:
-                    saml_roles.append(result)
-            except Exception:
-                pass
-
-    return saml_roles
+    """Parallel discovery using the shared library. Falls back to global session."""
+    if session is None:
+        session = boto3.Session()
+    account_id = session.client("sts").get_caller_identity()["Account"]
+    return _lib_discover_roles(session, role_names, idp_arn, account_id, workers=workers)
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +449,7 @@ def assume_role_session(account_id: str, role_name: str) -> "boto3.Session":
 
 
 # ---------------------------------------------------------------------------
-# Entitlement creation
+# Entitlement creation — delegates to lib.py
 # ---------------------------------------------------------------------------
 
 def create_entitlements_from_groups(
@@ -473,12 +463,10 @@ def create_entitlements_from_groups(
 ) -> None:
     """
     Parse group names using the pattern, match to discovered roles, and create
-    AAM entitlements.
+    AAM entitlements via the shared library.
     """
     import re
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # Read group names
     with open(group_names_file, "r") as f:
         groups = [line.strip() for line in f if line.strip()]
 
@@ -486,17 +474,14 @@ def create_entitlements_from_groups(
         print("  No group names found in file.")
         return
 
-    # Build regex from pattern
     escaped = group_pattern.replace("{principal}", "(?P<principal>.+?)")
     escaped = escaped.replace("{account}", "(?P<account>\\d+)")
     escaped = escaped.replace("{role}", "(?P<role>.+)")
     regex = re.compile(f"^{escaped}$")
 
-    # Build role name lookup
     role_lookup = {r["role_name"]: r for r in saml_roles}
     role_lookup_lower = {r["role_name"].lower(): r for r in saml_roles}
 
-    # Parse and match
     mappings = []
     for g in groups:
         match = regex.match(g)
@@ -504,70 +489,69 @@ def create_entitlements_from_groups(
             d = match.groupdict()
             role_name = d.get("role", "")
             matched_role = role_lookup.get(role_name) or role_lookup_lower.get(role_name.lower())
-            mappings.append({
-                "group": g,
-                "principal": d.get("principal", ""),
-                "account": d.get("account", ""),
-                "role_name": role_name,
-                "matched": matched_role is not None,
-                "role_arn": f"arn:aws:iam::{d.get('account', account_id)}:role/{role_name}" if matched_role else None,
-            })
-        else:
-            mappings.append({"group": g, "principal": None, "account": None, "role_name": None, "matched": False, "role_arn": None})
+            if matched_role:
+                mappings.append({
+                    "group": g,
+                    "principal": d.get("principal", ""),
+                    "account": d.get("account", account_id),
+                    "role": role_name,
+                    "matchedRoleArn": matched_role.get("role_arn") or f"arn:aws:iam::{d.get('account', account_id)}:role/{role_name}",
+                })
 
-    matched = [m for m in mappings if m["matched"] and m["role_arn"]]
-    print(f"\n  Parsed {len(mappings)} group(s), {len(matched)} matched to discovered roles.")
-
-    if not matched:
+    print(f"\n  Parsed {len(groups)} group(s), {len(mappings)} matched to discovered roles.")
+    if not mappings:
         print("  No matches to create entitlements for.")
         return
 
-    # Create AAM client with preview endpoint
-    aam_endpoint = f"https://account-access-preview.{region}.api.aws"
-    try:
-        aam_client = boto3.client("accountaccess", region_name=region, endpoint_url=aam_endpoint)
-    except Exception as exc:
-        print(f"  ERROR: Could not create AAM client: {exc}")
+    print(f"\n  Creating {len(mappings)} entitlement(s) against {aam_application_arn}")
+    hub_session = boto3.Session()
+    results = _lib_create_entitlements(
+        hub_session, aam_application_arn, mappings, region=region, workers=workers,
+    )
+
+    for r in results:
+        if r["status"] == "created":
+            print(f"  \u2713 {r.get('group', '')} \u2192 {r.get('role_arn', '')}")
+        elif r["status"] == "already exists":
+            print(f"  \u23ed {r.get('group', '')} (already exists)")
+        else:
+            print(f"  \u2717 {r.get('group', '')}: {r.get('error', '')}")
+
+    success = len([r for r in results if r["status"] == "created"])
+    existing = len([r for r in results if r["status"] == "already exists"])
+    errors = len([r for r in results if r["status"] == "error"])
+    print(f"\n  Entitlement creation complete: {success} created, {existing} existing, {errors} failed.")
+
+
+def create_entitlements_from_csv(
+    aam_application_arn: str,
+    csv_path: str,
+    region: str = "us-east-1",
+    workers: int = 5,
+) -> None:
+    """Create entitlements from a columnar CSV file via the shared library."""
+    mappings = _lib_parse_csv(csv_path)
+    if not mappings:
+        print("  No valid mappings in CSV.")
         return
 
-    print(f"\n  Creating {len(matched)} entitlement(s) against {aam_application_arn}")
-    success = 0
-    errors = 0
-    existing = 0
+    print(f"\n  Creating {len(mappings)} entitlement(s) from CSV against {aam_application_arn}")
+    hub_session = boto3.Session()
+    results = _lib_create_entitlements(
+        hub_session, aam_application_arn, mappings, region=region, workers=workers,
+    )
 
-    def create_one(m):
-        principal_block = {"groupId": m["principal"]}
-        try:
-            aam_client.create_entitlement(
-                applicationArn=aam_application_arn,
-                entitlement={
-                    "principalRole": {
-                        "principal": {"identityCenter": principal_block},
-                        "roleArn": m["role_arn"],
-                    }
-                },
-            )
-            return "created"
-        except Exception as exc:
-            if "Conflict" in str(exc) or "AlreadyExists" in str(exc):
-                return "existing"
-            return f"error: {exc}"
+    for r in results:
+        if r["status"] == "created":
+            print(f"  \u2713 {r.get('group', '')} \u2192 {r.get('role_arn', '')}")
+        elif r["status"] == "already exists":
+            print(f"  \u23ed {r.get('group', '')} (already exists)")
+        else:
+            print(f"  \u2717 {r.get('group', '')}: {r.get('error', '')}")
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(create_one, m): m for m in matched}
-        for fut in as_completed(futures):
-            m = futures[fut]
-            result = fut.result()
-            if result == "created":
-                print(f"  ✓ {m['group']} → {m['role_arn']}")
-                success += 1
-            elif result == "existing":
-                print(f"  ⏭ {m['group']} (already exists)")
-                existing += 1
-            else:
-                print(f"  ✗ {m['group']}: {result}")
-                errors += 1
-
+    success = len([r for r in results if r["status"] == "created"])
+    existing = len([r for r in results if r["status"] == "already exists"])
+    errors = len([r for r in results if r["status"] == "error"])
     print(f"\n  Entitlement creation complete: {success} created, {existing} existing, {errors} failed.")
 
 
@@ -591,6 +575,7 @@ def main():
     parser.add_argument("--group-names-file", help="File with IdP group names (one per line) for entitlement mapping.")
     parser.add_argument("--group-pattern", default="{principal}_{account}_{role}",
                         help="Pattern to parse group names. Placeholders: {principal}, {account}, {role}.")
+    parser.add_argument("--entitlement-csv", help="Columnar CSV with Group, Account, Role columns for direct entitlement mapping (alternative to --group-names-file).")
     parser.add_argument("--region", default="us-east-1", help="AWS region for AAM calls.")
 
     args = parser.parse_args()
@@ -647,14 +632,19 @@ def main():
                 all_saml_roles.extend(saml_roles)
 
         # Entitlement creation (after all accounts processed)
-        if args.aam_application_arn and args.group_names_file and all_saml_roles:
+        if args.aam_application_arn and all_saml_roles:
             print("\n" + "=" * 60)
             print("  AAM Entitlement Creation")
             print("=" * 60)
-            create_entitlements_from_groups(
-                all_saml_roles, account_ids[0], args.aam_application_arn,
-                args.group_names_file, args.group_pattern, args.region, args.workers,
-            )
+            if args.entitlement_csv:
+                create_entitlements_from_csv(
+                    args.aam_application_arn, args.entitlement_csv, args.region, args.workers,
+                )
+            elif args.group_names_file:
+                create_entitlements_from_groups(
+                    all_saml_roles, account_ids[0], args.aam_application_arn,
+                    args.group_names_file, args.group_pattern, args.region, args.workers,
+                )
         print("\nDone.")
         return
 
@@ -684,14 +674,19 @@ def main():
     update_trust_policies(saml_roles, idp_arn, account_id)
 
     # Entitlement creation
-    if args.aam_application_arn and args.group_names_file:
+    if args.aam_application_arn:
         print("\n" + "=" * 60)
         print("  AAM Entitlement Creation")
         print("=" * 60)
-        create_entitlements_from_groups(
-            saml_roles, account_id, args.aam_application_arn,
-            args.group_names_file, args.group_pattern, args.region, args.workers,
-        )
+        if args.entitlement_csv:
+            create_entitlements_from_csv(
+                args.aam_application_arn, args.entitlement_csv, args.region, args.workers,
+            )
+        elif args.group_names_file:
+            create_entitlements_from_groups(
+                saml_roles, account_id, args.aam_application_arn,
+                args.group_names_file, args.group_pattern, args.region, args.workers,
+            )
 
     print("\nDone.")
 

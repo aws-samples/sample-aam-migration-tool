@@ -5,7 +5,7 @@
 # Usage:
 #   ./run.sh                             Local mode (default)
 #   ./run.sh --managed --endpoint URL    Managed mode (backend in AWS)
-#   ./run.sh --rebuild                   Force a fresh frontend build before serving.
+#   ./run.sh --rebuild                   Force a fresh UI build before serving.
 #   ./run.sh --dev                       Dev mode: Flask API (:5000) + Vite hot-reload (:5173).
 #
 # Options:
@@ -14,13 +14,13 @@
 #   --region REGION        Override the API region (auto-detected from endpoint if omitted)
 #   --profile PROFILE      AWS profile for signing API requests
 #   --dev                  Run in dev mode (Flask + Vite)
-#   --rebuild              Force frontend rebuild
+#   --rebuild              Force UI rebuild
 #
 # All steps are idempotent — safe to re-run.
 
 set -euo pipefail
 
-# Always operate from the frontend/ directory (where this script lives).
+# Always operate from the ui/ directory (where this script lives).
 cd "$(dirname "$0")"
 
 MODE="serve"
@@ -69,9 +69,9 @@ fi
 echo "==> Installing Python dependencies"
 .venv/bin/pip install -q -r requirements.txt
 
-# ─── Frontend setup (idempotent) ─────────────────────────────────────────────
+# ─── UI setup (idempotent) ────────────────────────────────────────────────────
 if [[ ! -d web/node_modules ]]; then
-  echo "==> Installing frontend dependencies (npm install)"
+  echo "==> Installing UI dependencies (npm install)"
   (cd web && npm install --no-fund --no-audit)
 fi
 
@@ -99,7 +99,7 @@ fi
 
 # serve / rebuild modes: build the static UI, then serve it from Flask.
 if [[ "$MODE" == "rebuild" || ! -d web/dist ]]; then
-  echo "==> Building frontend (npm run build)"
+  echo "==> Building UI (npm run build)"
   (cd web && npm run build)
 fi
 

@@ -7,7 +7,7 @@ to its role. Performs no AWS API calls.
 Each role (``AWS::IAM::Role``):
   - name from the migration plan
   - the configured role path and tags
-  - a trust policy granting the `account-access-preview.amazonaws.com` service
+  - a trust policy granting the `account-access.amazonaws.com` service
     principal sts:AssumeRole + sts:SetContext (or an operator-supplied trust
     policy file when provided)
   - the AWS managed policies, inline policy, and customer managed policy
@@ -36,7 +36,7 @@ from config import Config
 from models import Inventory, PermissionSetRecord, RoleCreationResult
 
 
-AAM_TRUST_SERVICE_PRINCIPAL = "account-access-preview.amazonaws.com"
+AAM_TRUST_SERVICE_PRINCIPAL = "account-access.amazonaws.com"
 AAM_TRUST_ACTIONS = ["sts:AssumeRole", "sts:SetContext"]
 
 
