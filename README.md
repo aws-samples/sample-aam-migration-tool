@@ -40,9 +40,13 @@ Discovers SAML-federated IAM roles and migrates their trust policies to include 
 
 - ADD mode: keeps existing SAML trust alongside AAM (parallel operation)
 - REPLACE mode: removes SAML trust, adds AAM only (cutover)
+- Multi-IDP selection (discover roles matching multiple providers in a single pass)
 - Entitlement creation from explicit columnar mapping (Group → Account → Role)
+- `--apply-only` mode: skip discovery, apply directly from a CSV
+- Multi-account with `--profiles` or `--account-ids` + `--role-name`
+- Parallelized discovery and migration
+- Trust policy backup before any modification
 - Per-account CloudFormation and Terraform template generation
-- Multi-account with parallelized discovery and migration
 
 ### 3. IdC → AAM
 
@@ -53,8 +57,11 @@ Inventories Identity Center permission sets and assignments, then recreates them
 - Editable migration plan (role name mapping with download/upload)
 - Per-account CloudFormation templates
 - Direct apply mode (creates roles + entitlements via API)
+- `--apply-only` mode: skip discovery, apply from a previously saved inventory
+- Multi-account with `--profiles` or `--account-ids` + `--role-name`
 - CMP attach failure surfacing
 - IAM propagation delay handling (ValidationException retry)
+- Trust policy backup before any modification
 
 ---
 
@@ -69,6 +76,8 @@ Each tool can also be run independently from the command line without the UI. Th
 | IdC → AAM | `Identity Center to AAM/` | [`Identity Center to AAM/README.md`](Identity%20Center%20to%20AAM/README.md) |
 
 The CLI tools and the UI share the same core logic via `lib.py` modules. Bug fixes and features apply to both.
+
+Both the IAM Federation and IdC CLIs support `--apply-only` mode to skip discovery and apply directly from a previously generated file (CSV or inventory JSON). Both also support `--profiles` for multi-account credential resolution via named AWS profiles.
 
 ---
 
@@ -233,7 +242,7 @@ account-access:GetApplication
 - **No rollback automation** — apply mode logs what it changed but doesn't provide one-click undo.
 - **IdC API throttling** — org-wide scans may hit rate limits (20 TPS). The tool uses adaptive retry with exponential backoff.
 - **Inline policy size limits** — IAM roles have a 10,240-character limit. Large IdC inline policies may need conversion to CMPs.
-- **AAM preview SDK** — custom boto3 wheels required for entitlement creation. Included in repo root. Generate-IaC mode works with standard boto3.
+- **AAM SDK** — custom boto3 wheels required for entitlement creation. Included in repo root. Generate-IaC mode works with standard boto3.
 - **Customer managed policy propagation** — CMPs referenced by permission sets must exist in target accounts before role creation.
 
 ---

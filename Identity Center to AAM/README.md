@@ -185,6 +185,8 @@ Run `python idc_to_aam.py --help` for the live list.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--auto-approve` | off | Skip the confirmation prompt in apply mode. |
+| `--apply-only` | off | Skip discovery. Create roles + entitlements from a previously saved inventory JSON (`--inventory-input`). Requires `--trust-policy` and `--aam-application-arn`. |
+| `--inventory-input` | — | Path to a previously generated inventory JSON file (for `--apply-only`). |
 | `--role-creation-mode {apply,generate-iac}` | `generate-iac` | `generate-iac` (default) reads your environment and writes a CloudFormation template, changing nothing in AWS; `apply` creates roles and entitlements live. |
 
 ### Role creation
@@ -261,6 +263,27 @@ python idc_to_aam.py --region us-east-1 \
 
 **Unattended run (CI):** add `--auto-approve`.
 
+**Apply-only (skip discovery, use saved inventory):**
+```bash
+python idc_to_aam.py --region us-east-1 \
+  --apply-only \
+  --inventory-input inventory_<run_id>.json \
+  --plan my_plan.xlsx \
+  --trust-policy trust.json \
+  --aam-application-arn arn:aws:account-access:us-east-1:<acct>:application/<id> \
+  --auto-approve
+```
+
+**Multi-account with profiles:**
+```bash
+python idc_to_aam.py --region us-east-1 \
+  --account-scope multi \
+  --profiles prod,dev,staging \
+  --role-creation-mode apply \
+  --trust-policy trust.json \
+  --aam-application-arn arn:aws:account-access:us-east-1:<acct>:application/<id>
+```
+
 ---
 
 ## Outputs
@@ -302,8 +325,11 @@ and `CreateEntitlement` / `ListEntitlements`.
 - In **apply mode**, an explicit "this will change your environment"
   confirmation must pass before anything is created (skip it with
   `--auto-approve`).
+- **Trust policy backup** — original trust policies are backed up before modification.
 - **Idempotent:** existing roles and entitlements are detected and reused, not
-  duplicated.
+  duplicated. CMP attach failures are surfaced (not silently swallowed).
+- **ValidationException retry:** entitlement creation retries up to 3 times
+  with backoff to handle IAM role propagation delay.
 - **Fail-and-continue:** a failure on one permission set, account, or policy is
   logged and skipped; the run continues.
 - The tool **never** creates or modifies the AAM application, and never calls

@@ -28,7 +28,15 @@ python AAM_role_evaluation.py \
   --role-name ReadOnlyRole \
   --workers 5
 
-# With entitlement creation (columnar CSV)
+# Apply-only mode (skip discovery, apply from CSV)
+python AAM_role_evaluation.py \
+  --apply-only \
+  --entitlement-csv entitlement_mappings.csv \
+  --aam-application-arn "arn:aws:account-access:us-east-1:123456:application/app-id" \
+  --mode ADD \
+  --region us-east-1
+
+# With entitlement creation after discovery (columnar CSV)
 python AAM_role_evaluation.py \
   --aam-application-arn "arn:aws:account-access:us-east-1:123456:application/app-id" \
   --entitlement-csv entitlement_mappings.csv \
@@ -78,6 +86,13 @@ python AAM_role_evaluation.py --rollback <backup_file>
 | `--role-name` | — | Role to assume in each target (for multi with assume-role). |
 | `--profiles` | — | Comma-separated AWS profile names (for multi with profiles). Each resolved to its account via GetCallerIdentity. |
 | `--workers` | `5` | Parallel workers for role inspection and migration. |
+
+### Apply-only mode
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--apply-only` | off | Skip discovery. Apply trust policy updates + entitlement creation directly from `--entitlement-csv`. |
+| `--mode` | `ADD` | Trust policy update mode: `ADD` (keep SAML, add AAM) or `REPLACE` (remove SAML). |
 
 ### Entitlement creation
 
@@ -156,12 +171,13 @@ account-access:GetApplication
 
 ## Safety
 
-- **Backup before modify** — trust policies are backed up to a timestamped JSON before any update.
+- **Backup before modify** — trust policies are backed up to a timestamped JSON before any update (both interactive and `--apply-only` modes).
 - **Rollback available** — `--rollback <backup_file>` restores original trust policies.
-- **Idempotent** — roles already containing the AAM trust statement are skipped.
+- **Idempotent** — roles already containing the AAM service principal (`account-access.amazonaws.com` or `account-access-preview.amazonaws.com`) are skipped.
 - **Fail-and-continue** — a failure on one role doesn't abort others.
 - **GA endpoint** — AAM calls use the GA endpoint (`account-access.<region>.api.aws`).
 - **ValidationException retry** — entitlement creation retries up to 3 times with backoff for IAM propagation delay.
+- **Multi-IDP** — supports selecting multiple identity providers (comma-separated numbers) and scanning all roles in a single pass.
 
 ---
 
