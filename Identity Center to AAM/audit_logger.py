@@ -123,6 +123,12 @@ class AuditLogger:
                     self._csv_file = None
                     self._csv_writer = None
 
+    def __enter__(self) -> "AuditLogger":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
     # ── Public API ───────────────────────────────────────────────────────────
 
     def log(

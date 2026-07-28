@@ -1071,7 +1071,7 @@ def main():
         "total_matches": len(all_matches),
         "matches": all_matches,
     }
-    with open(args.output, "w") as f:
+    with open(args.output, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
     print(f"Results written to {args.output}")
 

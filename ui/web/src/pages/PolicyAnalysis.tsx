@@ -264,7 +264,7 @@ export default function PolicyAnalysis() {
                 resizableColumns
                 items={matchesPagination.pageItems}
                 filter={<TextFilter filteringPlaceholder="Filter by ARN, service, account, or matched term" filteringText={matchesPagination.filterQuery} onChange={({ detail }) => matchesPagination.setFilterQuery(detail.filteringText)} />}
-                pagination={<Pagination {...matchesPagination.paginationProps} />}
+                pagination={<Pagination currentPageIndex={matchesPagination.paginationProps.currentPageIndex} pagesCount={matchesPagination.paginationProps.pagesCount} onChange={matchesPagination.paginationProps.onChange} />}
                 empty={<Box textAlign="center">No matching policies found.</Box>}
                 columnDefinitions={[
                   { id: "service", header: "Service", cell: (m) => m.service, minWidth: 120 },

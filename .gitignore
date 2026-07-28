@@ -68,3 +68,6 @@ output/
 # and contains customer-specific data — never commit them.
 *.xlsx
 ~$*
+
+# ─── Test utilities (not for distribution) ────────────────────────────────────
+Utilites/resource_policy_scan/deploy_test_policies.py

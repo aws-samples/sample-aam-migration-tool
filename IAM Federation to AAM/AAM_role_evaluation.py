@@ -21,7 +21,7 @@ Requirements:
 
 import boto3
 import json
-import csv
+import defusedcsv as csv
 import sys
 import os
 from datetime import datetime
@@ -238,7 +238,7 @@ def generate_csv(
             # Role has no policies attached — still record it
             rows.append([role_name, "(none)", "N/A", trust_name])
 
-    with open(output_file, "w", newline="") as f:
+    with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)
         writer.writerows(rows)
@@ -262,7 +262,7 @@ def backup_trust_policies(saml_roles: List[Dict[str, Any]], account_id: str) -> 
         role.reload()
         backup_data[role_name] = role.assume_role_policy_document
 
-    with open(backup_file, "w") as f:
+    with open(backup_file, "w", encoding="utf-8") as f:
         json.dump(backup_data, f, indent=2)
 
     print(f"  Backup saved: {backup_file}")
@@ -277,7 +277,7 @@ def rollback_trust_policies(backup_file: str) -> None:
         print(f"Backup file not found: {backup_file}")
         sys.exit(1)
 
-    with open(backup_file, "r") as f:
+    with open(backup_file, "r", encoding="utf-8") as f:
         backup_data = json.load(f)
 
     print(f"\nRolling back {len(backup_data)} role(s) from {backup_file}")
@@ -478,7 +478,7 @@ def create_entitlements_from_groups(
     """
     import re
 
-    with open(group_names_file, "r") as f:
+    with open(group_names_file, "r", encoding="utf-8") as f:
         groups = [line.strip() for line in f if line.strip()]
 
     if not groups:
@@ -669,7 +669,7 @@ def main():
             if backup_data:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 backup_file = f"AAM_trust_backup_apply_only_{timestamp}.json"
-                with open(backup_file, "w") as f:
+                with open(backup_file, "w", encoding="utf-8") as f:
                     json.dump(backup_data, f, indent=2)
                 print(f"  Backup saved: {backup_file}")
                 print(f"  To rollback: python3 AAM_role_evaluation.py --rollback {backup_file}")

@@ -60,7 +60,7 @@ def parse_csv(csv_file: str) -> Dict[str, List[Dict[str, str]]]:
     Returns: {role_name: [{"policy_name": ..., "policy_type": ...}, ...]}
     """
     roles: Dict[str, List[Dict[str, str]]] = defaultdict(list)
-    with open(csv_file, "r") as f:
+    with open(csv_file, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             role_name = row["Role Name"].strip()
@@ -153,7 +153,7 @@ def generate_cloudformation(roles: Dict[str, List[Dict[str, str]]], output_file:
         lines.append(f"    Description: ARN of {role_name}")
         lines.append(f"    Value: !GetAtt {logical_id}.Arn")
 
-    with open(output_file, "w") as f:
+    with open(output_file, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
     print(f"  CloudFormation template: {output_file}")
@@ -250,7 +250,7 @@ def generate_terraform(roles: Dict[str, List[Dict[str, str]]], output_file: str)
         lines.append('}')
         lines.append('')
 
-    with open(output_file, "w") as f:
+    with open(output_file, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
     print(f"  Terraform template:     {output_file}")

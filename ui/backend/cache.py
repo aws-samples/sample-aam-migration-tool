@@ -19,7 +19,7 @@ def read_cache(path: str) -> Optional[dict]:
     if not os.path.exists(path):
         return None
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return None
@@ -37,7 +37,7 @@ def write_cache(path: str, payload: Any) -> dict:
         "cached_at": datetime.now(timezone.utc).isoformat(),
         "data": payload,
     }
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(wrapper, f, indent=2, default=str)
     return wrapper
 

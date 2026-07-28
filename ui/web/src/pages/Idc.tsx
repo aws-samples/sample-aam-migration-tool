@@ -514,7 +514,7 @@ export default function Idc() {
                 items={psPagination.pageItems}
                 trackBy="arn"
                 filter={<TextFilter filteringPlaceholder="Filter permission sets" filteringText={psPagination.filterQuery} onChange={({ detail }) => psPagination.setFilterQuery(detail.filteringText)} />}
-                pagination={<Pagination {...psPagination.paginationProps} />}
+                pagination={<Pagination currentPageIndex={psPagination.paginationProps.currentPageIndex} pagesCount={psPagination.paginationProps.pagesCount} onChange={psPagination.paginationProps.onChange} />}
                 empty={<Box textAlign="center">No permission sets found.</Box>}
                 columnDefinitions={[
                   { id: "name", header: "Name", cell: (ps) => ps.name, minWidth: 150 },
@@ -560,7 +560,7 @@ export default function Idc() {
                 items={assignPagination.pageItems}
                 trackBy={(a) => `${a.permission_set_arn}#${a.account_id}#${a.principal_id}`}
                 filter={<TextFilter filteringPlaceholder="Filter by principal, account, or permission set" filteringText={assignPagination.filterQuery} onChange={({ detail }) => assignPagination.setFilterQuery(detail.filteringText)} />}
-                pagination={<Pagination {...assignPagination.paginationProps} />}
+                pagination={<Pagination currentPageIndex={assignPagination.paginationProps.currentPageIndex} pagesCount={assignPagination.paginationProps.pagesCount} onChange={assignPagination.paginationProps.onChange} />}
                 empty={<Box textAlign="center">No assignments found.</Box>}
                 columnDefinitions={[
                   { id: "principal", header: "Principal", cell: (a) => a.principal_display_name, minWidth: 150 },
@@ -658,7 +658,7 @@ export default function Idc() {
                 items={planPagination.pageItems}
                 trackBy="key"
                 filter={<TextFilter filteringPlaceholder="Filter by permission set, role name, principal, or account" filteringText={planPagination.filterQuery} onChange={({ detail }) => planPagination.setFilterQuery(detail.filteringText)} />}
-                pagination={<Pagination {...planPagination.paginationProps} />}
+                pagination={<Pagination currentPageIndex={planPagination.paginationProps.currentPageIndex} pagesCount={planPagination.paginationProps.pagesCount} onChange={planPagination.paginationProps.onChange} />}
                 columnDefinitions={[
                   { id: "ps", header: "Permission Set", cell: (r) => r.psName, minWidth: 150 },
                   { id: "role", header: "Target Role Name", cell: (r) => (

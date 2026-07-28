@@ -331,7 +331,7 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
             f"iam_federation_trust_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json",
         )
         os.makedirs(config.CACHE_DIR, exist_ok=True)
-        with open(backup_path, "w") as f:
+        with open(backup_path, "w", encoding="utf-8") as f:
             json.dump(backup_data, f, indent=2)
         _slog.record(None, context="trust_policy_backup", resource=backup_path)
 
@@ -713,9 +713,9 @@ def generate_iac(params: dict) -> dict:
     iac_mod.generate_terraform(roles_dict, tf_path)
 
     # Read the generated content to return to the UI
-    with open(cfn_path, "r") as f:
+    with open(cfn_path, "r", encoding="utf-8") as f:
         cfn_content = f.read()
-    with open(tf_path, "r") as f:
+    with open(tf_path, "r", encoding="utf-8") as f:
         tf_content = f.read()
 
     return {

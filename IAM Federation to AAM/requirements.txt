@@ -1,0 +1,8 @@
+# IAM Federation to AAM — dependencies
+# Custom AAM-aware SDK wheels (same as the rest of the project):
+#   pip install /path/to/botocore-1.43.55-py3-none-any.whl
+#   pip install /path/to/boto3-1.43.55-py3-none-any.whl
+#   pip install -r requirements.txt
+boto3==1.43.55
+botocore==1.43.55
+defusedcsv>=2.0

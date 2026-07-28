@@ -427,7 +427,7 @@ def parse_entitlement_csv(csv_path: str) -> List[Dict[str, str]]:
     import csv
 
     mappings = []
-    with open(csv_path, "r") as f:
+    with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             # Flexible column name matching

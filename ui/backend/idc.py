@@ -500,7 +500,7 @@ def generate_iac(params: dict) -> dict:
         else:
             filename = f"idc_roles_{account_id}.yaml"
         cfn_path = os.path.join(config.CACHE_DIR, filename)
-        with open(cfn_path, "w") as f:
+        with open(cfn_path, "w", encoding="utf-8") as f:
             f.write(content)
         templates[account_id] = {"path": cfn_path, "content": content}
 

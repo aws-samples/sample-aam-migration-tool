@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import csv
+import defusedcsv as csv
 import json
 import os
 from typing import Iterable

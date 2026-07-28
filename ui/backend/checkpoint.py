@@ -60,7 +60,7 @@ def _read(ck_key: str) -> dict:
     if not os.path.exists(path):
         return {}
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return {}
@@ -70,7 +70,7 @@ def _write_atomic(ck_key: str, doc: dict) -> None:
     config.ensure_checkpoint_dir()
     path = _path(ck_key)
     tmp = f"{path}.tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2, default=str)
     os.replace(tmp, path)
 

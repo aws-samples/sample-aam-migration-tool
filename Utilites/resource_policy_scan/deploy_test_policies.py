@@ -79,7 +79,7 @@ def deploy_cfn_stack(session, region, role_arn):
     print("=== CloudFormation Stack ===")
     cfn = session.client("cloudformation", region_name=region)
 
-    with open(TEMPLATE_FILE, "r") as f:
+    with open(TEMPLATE_FILE, "r", encoding="utf-8") as f:
         template_body = f.read()
 
     try:

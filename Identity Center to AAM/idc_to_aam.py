@@ -96,7 +96,7 @@ def main(argv: Sequence[str]) -> int:
 
         import json as _json
         print(f"Loading inventory from: {cfg.inventory_input}")
-        with open(cfg.inventory_input, "r") as f:
+        with open(cfg.inventory_input, "r", encoding="utf-8") as f:
             inv_data = _json.load(f)
 
         # Reconstruct an Inventory from the JSON
