@@ -310,6 +310,31 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
 
     emit(f"Migrating {total} role(s) in {mode} mode")
 
+    # Backup current trust policies before modification
+    backup_data = {}
+    for role_arn in role_arns:
+        parts = role_arn.split(":")
+        account_id = parts[4] if len(parts) >= 5 else ""
+        role_name = role_arn.split("/")[-1]
+        session = session_map.get(account_id)
+        if not session and sessions:
+            session = sessions[0][1]
+        if session:
+            try:
+                resp = session.client("iam").get_role(RoleName=role_name)
+                backup_data[role_name] = resp["Role"]["AssumeRolePolicyDocument"]
+            except Exception:
+                pass
+    if backup_data:
+        backup_path = os.path.join(
+            config.CACHE_DIR,
+            f"iam_federation_trust_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json",
+        )
+        os.makedirs(config.CACHE_DIR, exist_ok=True)
+        with open(backup_path, "w") as f:
+            json.dump(backup_data, f, indent=2)
+        _slog.record(None, context="trust_policy_backup", resource=backup_path)
+
     # Load cached discovery to get trust_policy_documents
     cached = cache.read_cache(config.IAM_FEDERATION_CACHE)
     cached_roles = {}

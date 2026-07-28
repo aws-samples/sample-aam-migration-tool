@@ -177,9 +177,9 @@ Run `python idc_to_aam.py --help` for the live list.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--account-scope {single,multi,org}` | `single` | `single`: operate only in the hub account with current credentials. `multi`: assume a role into each specified target account. `org`: scan all accounts provisioned in the IdC instance (may be throttled in large orgs). |
-| `--account-ids` | — | Comma-separated target account IDs for role creation (assume-role targets). **Required for `multi`.** |
-| `--target-account-ids` | — | Comma-separated account IDs to filter discovery scope. Only permission sets provisioned to these accounts will be inventoried. Defaults to `--account-ids` if not specified. |
-| `--role-name` | — | Name of the IAM role to assume in each target account. **Required for `multi`.** |
+| `--account-ids` | — | Comma-separated AWS account IDs. Defines which accounts to discover permission sets/assignments for AND where to create roles. **Required for `multi`.** |
+| `--role-name` | — | Name of the IAM role to assume in each target account. **Required for `multi` with assume-role.** |
+| `--profiles` | — | Comma-separated AWS profile names for multi-account. Each resolved to its account via GetCallerIdentity. Alternative to `--account-ids` + `--role-name`. |
 
 ### Mode
 | Flag | Default | Description |

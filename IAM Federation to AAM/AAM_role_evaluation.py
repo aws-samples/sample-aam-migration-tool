@@ -48,11 +48,11 @@ def get_saml_providers() -> List[Dict[str, str]]:
     return providers
 
 
-def prompt_for_idp(providers: List[Dict[str, str]], account_id: str) -> str:
+def prompt_for_idp(providers: List[Dict[str, str]], account_id: str) -> List[str]:
     """
-    Display existing SAML identity providers and let the user pick one,
-    or enter a custom ARN or just a provider name. The first non-Identity-Center
-    provider is offered as the default.
+    Display existing SAML identity providers and let the user pick one or more.
+    Supports comma-separated numbers (e.g., "1,3"), a single number, a full ARN,
+    or a provider name. Returns a list of ARNs.
     """
     if not providers:
         print("No SAML identity providers found in this account.")
@@ -63,7 +63,7 @@ def prompt_for_idp(providers: List[Dict[str, str]], account_id: str) -> str:
         if not custom.startswith("arn:"):
             custom = f"arn:aws:iam::{account_id}:saml-provider/{custom}"
             print(f"  Constructed ARN: {custom}")
-        return custom
+        return [custom]
 
     print("\nSAML Identity Providers found in this account:")
     for idx, p in enumerate(providers, start=1):
@@ -82,28 +82,38 @@ def prompt_for_idp(providers: List[Dict[str, str]], account_id: str) -> str:
     default_arn = providers[default_idx]["arn"]
     print(f"\nDefault: {default_idx + 1}) {providers[default_idx]['name']}")
     choice = input(
-        "Select a number, enter a provider name, full ARN, or press Enter for default: "
+        "Select number(s) (comma-separated for multiple), a provider name, full ARN, or Enter for default: "
     ).strip()
 
     if choice == "":
-        return default_arn
+        return [default_arn]
 
-    # Numeric selection
+    # Comma-separated numeric selections (e.g., "1,3" or "2, 4")
+    if all(part.strip().isdigit() for part in choice.split(",")):
+        selected = []
+        for part in choice.split(","):
+            index = int(part.strip()) - 1
+            if 0 <= index < len(providers):
+                selected.append(providers[index]["arn"])
+        if selected:
+            return selected
+
+    # Single numeric selection
     try:
         index = int(choice) - 1
         if 0 <= index < len(providers):
-            return providers[index]["arn"]
+            return [providers[index]["arn"]]
     except ValueError:
         pass
 
     # Full ARN
     if choice.startswith("arn:"):
-        return choice
+        return [choice]
 
     # Bare name — construct the ARN
     constructed = f"arn:aws:iam::{account_id}:saml-provider/{choice}"
     print(f"  Constructed ARN: {constructed}")
-    return constructed
+    return [constructed]
 
 
 def get_all_role_names() -> List[str]:
@@ -309,7 +319,7 @@ NEW_TRUST_STATEMENT = {
 AAM_SERVICE_PRINCIPALS = {"account-access.amazonaws.com", "account-access-preview.amazonaws.com"}
 
 
-def update_trust_policies(saml_roles: List[Dict[str, Any]], idp_arn: str, account_id: str) -> None:
+def update_trust_policies(saml_roles: List[Dict[str, Any]], idp_arns: List[str], account_id: str) -> None:
     """
     For each identified SAML role, prompt the user to either:
       1) ADD the new trust statement alongside the existing IDP statement
@@ -387,7 +397,8 @@ def update_trust_policies(saml_roles: List[Dict[str, Any]], idp_arn: str, accoun
                 federated = stmt.get("Principal", {}).get("Federated", "")
                 if isinstance(federated, str):
                     federated = [federated]
-                if idp_arn not in federated:
+                # Keep statements that don't reference any of the selected IDPs
+                if not any(idp in federated for idp in idp_arns):
                     kept.append(stmt)
             kept.append(NEW_TRUST_STATEMENT)
             new_doc["Statement"] = kept
@@ -422,13 +433,13 @@ from lib import (
 
 
 def filter_saml_roles_parallel(
-    role_names: List[str], idp_arn: str, workers: int = 5, session: Optional[Any] = None
+    role_names: List[str], idp_arns: List[str] | str, workers: int = 5, session: Optional[Any] = None
 ) -> List[Dict[str, Any]]:
     """Parallel discovery using the shared library. Falls back to global session."""
     if session is None:
         session = boto3.Session()
     account_id = session.client("sts").get_caller_identity()["Account"]
-    return _lib_discover_roles(session, role_names, idp_arn, account_id, workers=workers)
+    return _lib_discover_roles(session, role_names, idp_arns, account_id, workers=workers)
 
 
 # ---------------------------------------------------------------------------
@@ -567,11 +578,16 @@ def main():
     )
     parser.add_argument("--rollback", help="Rollback trust policies from a backup file.")
     parser.add_argument("--account-scope", choices=["single", "multi"], default="single",
-                        help="single: current account. multi: assume into each target account.")
-    parser.add_argument("--account-ids", help="Comma-separated target account IDs (required for multi).")
-    parser.add_argument("--role-name", help="Role name to assume in each target account (required for multi).")
+                        help="single: current account. multi: use profiles or assume-role into each target.")
+    parser.add_argument("--account-ids", help="Comma-separated target account IDs (for multi with assume-role).")
+    parser.add_argument("--role-name", help="Role name to assume in each target account (for multi with assume-role).")
+    parser.add_argument("--profiles", help="Comma-separated AWS profile names (for multi with profiles). Each profile is resolved to its account via GetCallerIdentity.")
     parser.add_argument("--workers", type=int, default=5, help="Max parallel workers (default 5).")
     parser.add_argument("--aam-application-arn", help="AAM application ARN for entitlement creation.")
+    parser.add_argument("--apply-only", action="store_true",
+                        help="Skip discovery. Apply trust policy updates + entitlement creation directly from --entitlement-csv. Requires --aam-application-arn and --entitlement-csv.")
+    parser.add_argument("--mode", choices=["ADD", "REPLACE"], default="ADD",
+                        help="Trust policy update mode for --apply-only. ADD (default): keep SAML trust, add AAM. REPLACE: remove SAML trust.")
     parser.add_argument("--group-names-file", help="File with IdP group names (one per line) for entitlement mapping.")
     parser.add_argument("--group-pattern", default="{principal}_{account}_{role}",
                         help="Pattern to parse group names. Placeholders: {principal}, {account}, {role}.")
@@ -588,47 +604,156 @@ def main():
         rollback_trust_policies(args.rollback)
         return
 
+    # Handle --apply-only mode (skip discovery, apply directly from CSV)
+    if args.apply_only:
+        if not args.entitlement_csv:
+            print("ERROR: --entitlement-csv is required with --apply-only")
+            sys.exit(1)
+        if not args.aam_application_arn:
+            print("ERROR: --aam-application-arn is required with --apply-only")
+            sys.exit(1)
+
+        print("=" * 60)
+        print("  AAM Role Evaluation — Apply Only Mode")
+        print("=" * 60)
+
+        # Parse the CSV
+        mappings = _lib_parse_csv(args.entitlement_csv)
+        print(f"\n  Loaded {len(mappings)} mapping(s) from {args.entitlement_csv}")
+
+        if not mappings:
+            print("  No valid mappings found. Exiting.")
+            return
+
+        # Step 1: Update trust policies on the roles referenced in the CSV
+        role_arns = list({m["matchedRoleArn"] for m in mappings if m.get("matchedRoleArn")})
+        if role_arns:
+            print(f"\n  Updating trust policies on {len(role_arns)} role(s) ({args.mode} mode)...")
+
+            # Build session map — resolve from profiles or assume-role
+            session_map: Dict[str, Any] = {}
+            if args.profiles:
+                for profile in [p.strip() for p in args.profiles.split(",") if p.strip()]:
+                    try:
+                        s = boto3.Session(profile_name=profile)
+                        acct = s.client("sts").get_caller_identity()["Account"]
+                        session_map[acct] = s
+                    except Exception as exc:
+                        print(f"    WARNING: Profile '{profile}' failed: {exc}")
+            elif args.account_ids and args.role_name:
+                for acct in [a.strip() for a in args.account_ids.split(",") if a.strip()]:
+                    try:
+                        session_map[acct] = assume_role_session(acct, args.role_name)
+                    except Exception as exc:
+                        print(f"    WARNING: Could not assume into {acct}: {exc}")
+            else:
+                # Single account — use default session
+                default_session = boto3.Session()
+                default_acct = default_session.client("sts").get_caller_identity()["Account"]
+                session_map[default_acct] = default_session
+
+            # Backup current trust policies before modification
+            print("  Backing up current trust policies...")
+            backup_data = {}
+            for role_arn in role_arns:
+                parts = role_arn.split(":")
+                acct = parts[4] if len(parts) >= 5 else ""
+                rn = role_arn.split("/")[-1]
+                s = session_map.get(acct) or next(iter(session_map.values()), None)
+                if s:
+                    try:
+                        resp = s.client("iam").get_role(RoleName=rn)
+                        backup_data[rn] = resp["Role"]["AssumeRolePolicyDocument"]
+                    except Exception:
+                        pass
+            if backup_data:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_file = f"AAM_trust_backup_apply_only_{timestamp}.json"
+                with open(backup_file, "w") as f:
+                    json.dump(backup_data, f, indent=2)
+                print(f"  Backup saved: {backup_file}")
+                print(f"  To rollback: python3 AAM_role_evaluation.py --rollback {backup_file}")
+
+            # Apply trust policy updates
+            results = _lib_migrate_parallel(
+                session_map, role_arns, args.mode, "",
+                workers=args.workers,
+            )
+            success = len([r for r in results if r["status"] == "success"])
+            skipped = len([r for r in results if r["status"] == "skipped"])
+            errors = len([r for r in results if r["status"] == "error"])
+            print(f"  Trust policy update: {success} succeeded, {skipped} skipped, {errors} failed.")
+
+        # Step 2: Create entitlements
+        print(f"\n  Creating entitlements...")
+        create_entitlements_from_csv(
+            args.aam_application_arn, args.entitlement_csv, args.region, args.workers,
+        )
+
+        print("\nDone.")
+        return
+
     print("=" * 60)
     print("  AAM Role Evaluation — SAML Federated Role Report")
     print("=" * 60)
 
     # Multi-account support
     if args.account_scope == "multi":
-        if not args.account_ids or not args.role_name:
-            print("ERROR: --account-ids and --role-name are required for --account-scope multi")
+        if not args.account_ids and not args.profiles:
+            print("ERROR: --account-ids (with --role-name) or --profiles is required for --account-scope multi")
             sys.exit(1)
-        account_ids = [a.strip() for a in args.account_ids.split(",") if a.strip()]
+
+        # Resolve sessions: either from profiles or assume-role
+        account_sessions = []  # list of (label, session, account_id)
+        if args.profiles:
+            # Profile mode: resolve each profile to its account
+            for profile in [p.strip() for p in args.profiles.split(",") if p.strip()]:
+                try:
+                    session = boto3.Session(profile_name=profile)
+                    acct = session.client("sts").get_caller_identity()["Account"]
+                    account_sessions.append((profile, session, acct))
+                    print(f"  Profile '{profile}' → account {acct}")
+                except Exception as exc:
+                    print(f"  ERROR: Profile '{profile}' failed: {exc}")
+        else:
+            # Assume-role mode
+            if not args.role_name:
+                print("ERROR: --role-name is required when using --account-ids")
+                sys.exit(1)
+            account_ids = [a.strip() for a in args.account_ids.split(",") if a.strip()]
+            for acct in account_ids:
+                try:
+                    session = assume_role_session(acct, args.role_name)
+                    account_sessions.append((acct, session, acct))
+                except Exception as exc:
+                    print(f"  ERROR: Could not assume role in {acct}: {exc}")
+
         all_saml_roles = []
-        for acct in account_ids:
+        for label, session, account_id in account_sessions:
             print(f"\n{'='*60}")
-            print(f"  Account: {acct}")
+            print(f"  Account: {account_id} ({label})")
             print(f"{'='*60}")
-            try:
-                session = assume_role_session(acct, args.role_name)
-                # Override global clients for this account
-                global iam_client, iam_resource
-                iam_client = session.client("iam")
-                iam_resource = session.resource("iam")
-                account_id = acct
-            except Exception as exc:
-                print(f"  ERROR: Could not assume role in {acct}: {exc}")
-                continue
+
+            # Override global clients for this account
+            global iam_client, iam_resource
+            iam_client = session.client("iam")
+            iam_resource = session.resource("iam")
 
             providers = get_saml_providers()
-            idp_arn = prompt_for_idp(providers, account_id)
-            print(f"\n  Using Identity Provider: {idp_arn}")
+            idp_arns = prompt_for_idp(providers, account_id)
+            print(f"\n  Using Identity Provider(s): {', '.join(idp_arns)}")
 
             all_roles = get_all_role_names()
             print(f"  Total roles: {len(all_roles)}")
 
             print(f"  Filtering (parallel, {args.workers} workers)...")
-            saml_roles = filter_saml_roles_parallel(all_roles, idp_arn, args.workers)
+            saml_roles = filter_saml_roles_parallel(all_roles, idp_arns, args.workers, session)
             print(f"  SAML-federated roles found: {len(saml_roles)}")
 
             if saml_roles:
-                csv_path = generate_csv(account_id, idp_arn, saml_roles)
+                csv_path = generate_csv(account_id, idp_arns[0], saml_roles)
                 print(f"  CSV: {csv_path}")
-                update_trust_policies(saml_roles, idp_arn, account_id)
+                update_trust_policies(saml_roles, idp_arns, account_id)
                 all_saml_roles.extend(saml_roles)
 
         # Entitlement creation (after all accounts processed)
@@ -636,13 +761,14 @@ def main():
             print("\n" + "=" * 60)
             print("  AAM Entitlement Creation")
             print("=" * 60)
+            first_account = account_sessions[0][2] if account_sessions else ""
             if args.entitlement_csv:
                 create_entitlements_from_csv(
                     args.aam_application_arn, args.entitlement_csv, args.region, args.workers,
                 )
             elif args.group_names_file:
                 create_entitlements_from_groups(
-                    all_saml_roles, account_ids[0], args.aam_application_arn,
+                    all_saml_roles, first_account, args.aam_application_arn,
                     args.group_names_file, args.group_pattern, args.region, args.workers,
                 )
         print("\nDone.")
@@ -653,25 +779,25 @@ def main():
     print(f"\nAWS Account: {account_id}")
 
     providers = get_saml_providers()
-    idp_arn = prompt_for_idp(providers, account_id)
-    print(f"\nUsing Identity Provider: {idp_arn}")
+    idp_arns = prompt_for_idp(providers, account_id)
+    print(f"\nUsing Identity Provider(s): {', '.join(idp_arns)}")
 
     print("\nRetrieving IAM roles...")
     all_roles = get_all_role_names()
     print(f"  Total roles in account: {len(all_roles)}")
 
     print(f"Filtering roles (parallel, {args.workers} workers)...")
-    saml_roles = filter_saml_roles_parallel(all_roles, idp_arn, args.workers)
+    saml_roles = filter_saml_roles_parallel(all_roles, idp_arns, args.workers)
     print(f"  SAML-federated roles found: {len(saml_roles)}")
 
     if not saml_roles:
         print("\nNo SAML-federated roles found for the selected provider. Nothing to export.")
         sys.exit(0)
 
-    csv_path = generate_csv(account_id, idp_arn, saml_roles)
+    csv_path = generate_csv(account_id, idp_arns[0], saml_roles)
     print(f"\nCSV report generated: {csv_path}")
 
-    update_trust_policies(saml_roles, idp_arn, account_id)
+    update_trust_policies(saml_roles, idp_arns, account_id)
 
     # Entitlement creation
     if args.aam_application_arn:

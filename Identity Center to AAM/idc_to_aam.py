@@ -85,12 +85,65 @@ def main(argv: Sequence[str]) -> int:
     hub = get_hub_context(region=cfg.region)
     apply_mode = cfg.role_creation_mode == "apply"
 
-    # Ask up front — before any inventory output — so apply mode confirms intent
-    # before the run does anything (Req 13).
-    if apply_mode and not cfg.auto_approve:
-        if not confirm_apply(hub.account_id):
-            print("Cancelled. No changes were made to your AWS environment.")
-            return 0
+    # ── Apply-only: skip discovery, load from a previous inventory file ───────
+    if cfg.apply_only:
+        if not cfg.inventory_input:
+            print("ERROR: --inventory-input is required with --apply-only", file=sys.stderr)
+            return 2
+        if not cfg.trust_policy_path:
+            print("ERROR: --trust-policy is required with --apply-only", file=sys.stderr)
+            return 2
+
+        import json as _json
+        print(f"Loading inventory from: {cfg.inventory_input}")
+        with open(cfg.inventory_input, "r") as f:
+            inv_data = _json.load(f)
+
+        # Reconstruct an Inventory from the JSON
+        from models import Inventory, PermissionSetRecord, AccountAssignmentRecord
+        inventory = Inventory.from_json_data(inv_data) if hasattr(Inventory, "from_json_data") else Inventory(
+            hub_account_id=inv_data.get("hub_account_id", hub.account_id),
+            idc_instance_arn=inv_data.get("idc_instance_arn", ""),
+            identity_store_id=inv_data.get("identity_store_id", ""),
+            permission_sets=tuple(
+                PermissionSetRecord(
+                    arn=ps.get("arn", ""),
+                    name=ps.get("name", ""),
+                    description=ps.get("description", ""),
+                    session_duration=ps.get("session_duration", "PT1H"),
+                    inline_policy=ps.get("inline_policy"),
+                    aws_managed_policy_arns=tuple(p.get("arn", "") for p in ps.get("aws_managed_policy_arns", ps.get("aws_managed_policies", []))),
+                    customer_managed_policy_references=tuple(),
+                    permission_boundary=None,
+                ) for ps in inv_data.get("permission_sets", [])
+            ),
+            assignments=tuple(
+                AccountAssignmentRecord(
+                    permission_set_arn=a.get("permission_set_arn", ""),
+                    account_id=a.get("account_id", ""),
+                    principal_type=a.get("principal_type", ""),
+                    principal_id=a.get("principal_id", ""),
+                    principal_display_name=a.get("principal_display_name", ""),
+                ) for a in inv_data.get("assignments", [])
+            ),
+            run_id=cfg.run_id,
+            captured_at=inv_data.get("captured_at", ""),
+        )
+        print(f"  {len(inventory.permission_sets)} permission set(s), {len(inventory.assignments)} assignment(s)")
+
+        # Force apply mode for --apply-only
+        apply_mode = True
+        # Skip confirmation prompt or honor --auto-approve
+        if not cfg.auto_approve:
+            if not confirm_apply(hub.account_id):
+                print("Cancelled. No changes were made.")
+                return 0
+    else:
+        # Normal flow: ask up front, then run discovery
+        if apply_mode and not cfg.auto_approve:
+            if not confirm_apply(hub.account_id):
+                print("Cancelled. No changes were made to your AWS environment.")
+                return 0
 
     audit = AuditLogger(run_id=cfg.run_id, caller_arn=hub.caller_arn, cfg=cfg)
     audit.log_success(
@@ -102,9 +155,13 @@ def main(argv: Sequence[str]) -> int:
     )
 
     try:
-        # ── Phase 1: Inventory (always read-only) ─────────────────────────────
-        inventory = InventoryModule(hub, cfg, audit).run()
-        print_inventory_summary(inventory)
+        # ── Phase 1: Inventory ────────────────────────────────────────────────
+        if cfg.apply_only:
+            # Already loaded above from --inventory-input
+            pass
+        else:
+            inventory = InventoryModule(hub, cfg, audit).run()
+            print_inventory_summary(inventory)
 
         # ── Phase 2: Migration plan (generate or consume) ────────────────────
         plan_module = MigrationPlanModule(cfg, audit)

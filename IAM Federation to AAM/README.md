@@ -15,7 +15,13 @@ pip install boto3
 # Single account — discover and generate CSV report
 python AAM_role_evaluation.py --workers 5
 
-# Multi-account — assume a role into each target
+# Multi-account with profiles
+python AAM_role_evaluation.py \
+  --account-scope multi \
+  --profiles prod-account,dev-account,staging-account \
+  --workers 5
+
+# Multi-account with assume-role
 python AAM_role_evaluation.py \
   --account-scope multi \
   --account-ids 111111111111,222222222222 \
@@ -67,9 +73,10 @@ python AAM_role_evaluation.py --rollback <backup_file>
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--account-scope` | `single` | `single`: current account. `multi`: assume into each target. |
-| `--account-ids` | — | Comma-separated account IDs (required for multi). |
-| `--role-name` | — | Role to assume in each target (required for multi). |
+| `--account-scope` | `single` | `single`: current account. `multi`: use profiles or assume-role into targets. |
+| `--account-ids` | — | Comma-separated account IDs (for multi with assume-role). |
+| `--role-name` | — | Role to assume in each target (for multi with assume-role). |
+| `--profiles` | — | Comma-separated AWS profile names (for multi with profiles). Each resolved to its account via GetCallerIdentity. |
 | `--workers` | `5` | Parallel workers for role inspection and migration. |
 
 ### Entitlement creation

@@ -43,10 +43,12 @@ class Config:
     # Account targeting
     account_scope: str  # "single" | "multi" | "org"
     account_ids: tuple[str, ...]
-    target_account_ids: tuple[str, ...]  # Filters discovery scope (separate from assume-role targets)
     role_name: str | None
+    profiles: tuple[str, ...]  # AWS profile names for multi-account (alternative to assume-role)
     # Mode
     auto_approve: bool
+    apply_only: bool
+    inventory_input: str | None
     role_creation_mode: str  # "apply" | "generate-iac"
     # Role creation
     role_name_template: str  # default-name generator for the migration plan only
@@ -65,7 +67,6 @@ class Config:
     aam_application_arn: str | None
     validate_aam_application: bool
     aam_idc_instance_arn: str | None
-    aam_endpoint_url: str | None
     aam_region: str | None
     # Audit
     audit_to_cloudwatch: bool
@@ -140,22 +141,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--account-ids",
         help=(
-            "Comma-separated AWS account IDs for role creation (assume-role targets). "
-            "Required for --account-scope multi when creating roles in spoke accounts."
-        ),
-    )
-    p.add_argument(
-        "--target-account-ids",
-        help=(
-            "Comma-separated account IDs to filter discovery scope. Only permission "
-            "sets and assignments for these accounts will be inventoried. "
-            "Defaults to --account-ids if not specified. For single-account scope, "
-            "defaults to the hub account."
+            "Comma-separated AWS account IDs. Defines which accounts to discover "
+            "permission sets/assignments for AND where to create roles in apply mode."
         ),
     )
     p.add_argument(
         "--role-name",
-        help="Name of the IAM role to AssumeRole into in each target account (required for multi).",
+        help="Name of the IAM role to AssumeRole into in each target account (for multi with assume-role).",
+    )
+    p.add_argument(
+        "--profiles",
+        help=(
+            "Comma-separated AWS profile names for multi-account role creation. "
+            "Each profile is resolved to its account via GetCallerIdentity. "
+            "Alternative to --account-ids + --role-name."
+        ),
     )
 
     # Mode
@@ -163,6 +163,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--auto-approve",
         action="store_true",
         help="Skip the confirmation prompt before applying changes (apply mode).",
+    )
+    p.add_argument(
+        "--apply-only",
+        action="store_true",
+        help=(
+            "Skip discovery. Create roles + entitlements directly from a previously "
+            "generated inventory JSON (--inventory-input). Requires --trust-policy "
+            "and --aam-application-arn."
+        ),
+    )
+    p.add_argument(
+        "--inventory-input",
+        help="Path to a previously generated inventory JSON file (for --apply-only).",
     )
     p.add_argument(
         "--role-creation-mode",
@@ -264,16 +277,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override IdC instance ARN. Auto-discovered if not supplied.",
     )
     p.add_argument(
-        "--aam-endpoint-url",
-        dest="aam_endpoint_url",
-        help=(
-            "Override the endpoint URL for the AAM (account-access) client. "
-            "Production endpoints follow "
-            "https://account-access.<region>.api.aws "
-            "(e.g. https://account-access.us-west-2.api.aws)."
-        ),
-    )
-    p.add_argument(
         "--aam-region",
         dest="aam_region",
         help=(
@@ -338,24 +341,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="AWS region (default us-east-1 or AWS_DEFAULT_REGION).",
     )
 
-    # Out-of-scope detectors (cause graceful exit)
+    # Hidden out-of-scope detectors (kept for backwards compatibility but hidden from --help)
     p.add_argument(
         "--scan-resource-policies",
         dest="out_of_scope_scan_resource_policies",
         action="store_true",
-        help="(Out of scope. Use the resource_policy_scan utility.)",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--migrate-iam-federation",
         dest="out_of_scope_iam_federation",
         action="store_true",
-        help="(Out of scope. Use the IAM Federation to AAM component.)",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--analyze-scps",
         dest="out_of_scope_scp_analysis",
         action="store_true",
-        help="(Out of scope. Not handled by this tool.)",
+        help=argparse.SUPPRESS,
     )
 
     return p
@@ -377,9 +380,11 @@ def parse_args(argv: Sequence[str]) -> Config:
     cfg = Config(
         account_scope=ns.account_scope,
         account_ids=tuple(_split_csv(ns.account_ids)),
-        target_account_ids=tuple(_split_csv(getattr(ns, "target_account_ids", None))),
         role_name=ns.role_name,
+        profiles=tuple(_split_csv(getattr(ns, "profiles", None))),
         auto_approve=bool(ns.auto_approve),
+        apply_only=bool(getattr(ns, "apply_only", False)),
+        inventory_input=getattr(ns, "inventory_input", None),
         role_creation_mode=ns.role_creation_mode,
         role_name_template=ns.role_name_template,
         role_path=ns.role_path,
@@ -394,7 +399,6 @@ def parse_args(argv: Sequence[str]) -> Config:
         aam_application_arn=ns.aam_application_arn,
         validate_aam_application=bool(ns.validate_aam_application),
         aam_idc_instance_arn=ns.aam_idc_instance_arn,
-        aam_endpoint_url=ns.aam_endpoint_url,
         aam_region=ns.aam_region,
         audit_to_cloudwatch=bool(ns.audit_to_cloudwatch),
         cloudwatch_log_group=ns.cloudwatch_log_group,
@@ -460,14 +464,14 @@ def validate(cfg: Config) -> None:
             f"--account-scope must be 'single', 'multi', or 'org', got {cfg.account_scope!r}"
         )
     if cfg.account_scope == "multi":
-        # multi requires both target account IDs and an assume-role role name.
-        if not cfg.account_ids:
+        # multi requires either profiles or (account_ids + role_name)
+        if not cfg.account_ids and not cfg.profiles:
             raise ConfigError(
-                "--account-ids is required when --account-scope is 'multi'"
+                "--account-ids (with --role-name) or --profiles is required when --account-scope is 'multi'"
             )
-        if not cfg.role_name:
+        if cfg.account_ids and not cfg.role_name:
             raise ConfigError(
-                "--role-name is required when --account-scope is 'multi'"
+                "--role-name is required when --account-scope is 'multi' with --account-ids"
             )
 
     # Out-of-scope short-circuit: skip the role/AAM checks (Req 16.5).
