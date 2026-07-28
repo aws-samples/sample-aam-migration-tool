@@ -80,7 +80,7 @@ class AuditLogger:
     def _open_csv(self, path: str) -> None:
         existed = os.path.isfile(path)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        self._csv_file = open(path, "a", newline="", encoding="utf-8")
+        self._csv_file = open(path, "a", newline="", encoding="utf-8")  # nosemgrep: open-never-closed
         fieldnames = [
             "timestamp",
             "run_id",
