@@ -291,7 +291,7 @@ export default function IamFederation() {
     exportToCsv("iam_federation_roles.csv", rows, [
       { key: "role_name", header: "Role Name" },
       { key: "role_arn", header: "Role ARN" },
-      { key: "account_id", header: "Account" },
+      { key: "account_id", header: "Account", text: true },
       { key: "policy_name", header: "Policy Name" },
       { key: "policy_type", header: "Policy Type" },
       { key: "trust_summary", header: "Trust Policy" },
@@ -339,7 +339,7 @@ export default function IamFederation() {
 
         {/* Credentials */}
         <Container header={<Header variant="h2">Credentials</Header>}>
-          <AuthMethodSelect state={auth} onChange={setAuth} disabled={discovering || migrating} profileMode="multi" />
+          <AuthMethodSelect state={auth} onChange={setAuth} disabled={discovering || migrating} profileMode="multi" allowOrg={false} />
         </Container>
 
         {/* Step 1 — discover SAML providers */}
@@ -459,7 +459,7 @@ export default function IamFederation() {
                       role_arn: m.roleArn,
                     })), [
                       { key: "group", header: "Group/Principal" },
-                      { key: "account_id", header: "Account ID" },
+                      { key: "account_id", header: "Account ID", text: true },
                       { key: "role_name", header: "Role Name" },
                       { key: "role_arn", header: "Role ARN" },
                     ]);
@@ -476,14 +476,16 @@ export default function IamFederation() {
                         const text = ev.target?.result as string;
                         const lines = text.split("\n").filter((l) => l.trim());
                         if (lines.length < 2) return;
-                        const headers = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, "").toLowerCase());
+                        // Trim again after unquoting: exported text columns carry a
+                        // leading tab inside the quotes to stop Excel coercing them.
+                        const headers = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, "").trim().toLowerCase());
                         const groupIdx = headers.findIndex((h) => h.includes("group") || h.includes("principal"));
                         const accountIdx = headers.findIndex((h) => h.includes("account"));
                         const roleIdx = headers.findIndex((h) => h === "role name" || h === "role_name");
                         const arnIdx = headers.findIndex((h) => h.includes("role arn") || h === "role_arn");
                         const uploaded: typeof entitlementMappings = [];
                         for (let i = 1; i < lines.length; i++) {
-                          const cols = lines[i].split(",").map((c) => c.trim().replace(/^"|"$/g, ""));
+                          const cols = lines[i].split(",").map((c) => c.trim().replace(/^"|"$/g, "").trim());
                           const group = groupIdx >= 0 ? cols[groupIdx] || "" : "";
                           const acct = accountIdx >= 0 ? cols[accountIdx] || "" : "";
                           const role = roleIdx >= 0 ? cols[roleIdx] || "" : "";
