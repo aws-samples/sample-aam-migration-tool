@@ -419,17 +419,26 @@ def create_entitlements(
 
 # ─── Entitlement CSV Parsing ──────────────────────────────────────────────────
 
+ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
+
+
 def parse_entitlement_csv(csv_path: str) -> List[Dict[str, str]]:
     """
     Parse a columnar entitlement CSV with columns: Group/Principal, Account ID, Role Name, Role ARN.
     Returns list of mapping dicts.
+
+    When a row has no explicit Role ARN, the ARN is constructed from the account
+    ID and role name, so the account ID must be a valid 12-digit value. Rows that
+    fail that check raise a ValueError rather than silently producing a malformed
+    ARN that only fails later at the CreateEntitlement call.
     """
     import csv
 
     mappings = []
+    invalid_accounts: List[str] = []
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        for row in reader:
+        for row_num, row in enumerate(reader, start=2):  # start=2: row 1 is the header
             # Flexible column name matching
             group = ""
             account = ""
@@ -449,7 +458,11 @@ def parse_entitlement_csv(csv_path: str) -> List[Dict[str, str]]:
             if not account and not role:
                 continue
 
-            if not role_arn and account and role:
+            if not role_arn:
+                # The ARN has to be built, so the account ID must be usable.
+                if not ACCOUNT_ID_RE.match(account):
+                    invalid_accounts.append(f"row {row_num}: {account!r}")
+                    continue
                 role_arn = f"arn:aws:iam::{account}:role/{role}"
 
             mappings.append({
@@ -459,5 +472,14 @@ def parse_entitlement_csv(csv_path: str) -> List[Dict[str, str]]:
                 "role": role,
                 "matchedRoleArn": role_arn,
             })
+
+    if invalid_accounts:
+        raise ValueError(
+            f"Invalid account ID(s) in {csv_path} — {', '.join(invalid_accounts)}. "
+            "Account IDs must be exactly 12 digits when no Role ARN column is supplied. "
+            "A value like '3.96045E+11' means a spreadsheet application converted the "
+            "column to a number on save; format the account column as text, or re-download "
+            "the template and edit it without saving through Excel."
+        )
 
     return mappings

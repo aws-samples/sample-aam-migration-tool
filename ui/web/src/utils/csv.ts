@@ -1,24 +1,49 @@
+export interface CsvColumn {
+  key: string;
+  header: string;
+  /**
+   * Force spreadsheet applications to import this column as text.
+   *
+   * Excel and Numbers coerce long digit strings into scientific notation under
+   * the General format, so a 12-digit AWS account ID renders as "3.96045E+11".
+   * That is cosmetic on its own, but re-saving the file from Excel writes the
+   * displayed notation back to disk, which corrupts the value for any consumer
+   * that reads the account ID back (for example the entitlement mapping CSV fed
+   * into `--entitlement-csv`).
+   *
+   * Prefixing the value with a tab forces a text import. Readers in this
+   * codebase trim surrounding whitespace, so the marker is transparent on a
+   * round-trip. A tab is used rather than an `="..."` formula wrapper to avoid
+   * introducing a CSV formula-injection vector.
+   */
+  text?: boolean;
+}
+
 /**
  * Export an array of objects to a CSV file and trigger a browser download.
  *
  * @param filename - Name for the downloaded file (should end with .csv).
  * @param rows - Array of flat objects. Keys of the first row define columns.
- * @param columns - Optional explicit column order and header labels.
+ * @param columns - Optional explicit column order, header labels, and text flags.
  */
 export function exportToCsv(
   filename: string,
   rows: Record<string, unknown>[],
-  columns?: { key: string; header: string }[]
+  columns?: CsvColumn[]
 ) {
   if (rows.length === 0) return;
 
-  const cols = columns ?? Object.keys(rows[0]).map((k) => ({ key: k, header: k }));
+  const cols: CsvColumn[] =
+    columns ?? Object.keys(rows[0]).map((k) => ({ key: k, header: k }));
 
-  const escape = (val: unknown): string => {
-    const str = val == null ? "" : String(val);
-    // RFC 4180: if the field contains a comma, newline, or double-quote, wrap
-    // in double-quotes and escape embedded quotes.
-    if (/[",\n\r]/.test(str)) {
+  const escape = (val: unknown, forceText = false): string => {
+    const raw = val == null ? "" : String(val);
+    // A leading tab tells Excel/Numbers to import the field verbatim rather
+    // than guessing a numeric type. Skip empty values so blank cells stay blank.
+    const str = forceText && raw !== "" ? `\t${raw}` : raw;
+    // RFC 4180: if the field contains a comma, newline, tab, or double-quote,
+    // wrap in double-quotes and escape embedded quotes.
+    if (/[",\n\r\t]/.test(str)) {
       return `"${str.replace(/"/g, '""')}"`;
     }
     return str;
@@ -26,7 +51,7 @@ export function exportToCsv(
 
   const header = cols.map((c) => escape(c.header)).join(",");
   const body = rows
-    .map((row) => cols.map((c) => escape(row[c.key])).join(","))
+    .map((row) => cols.map((c) => escape(row[c.key], c.text)).join(","))
     .join("\n");
   const csv = `${header}\n${body}`;
 

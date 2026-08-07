@@ -541,7 +541,11 @@ def create_entitlements_from_csv(
     workers: int = 5,
 ) -> None:
     """Create entitlements from a columnar CSV file via the shared library."""
-    mappings = _lib_parse_csv(csv_path)
+    try:
+        mappings = _lib_parse_csv(csv_path)
+    except ValueError as exc:
+        print(f"  ERROR: {exc}")
+        return
     if not mappings:
         print("  No valid mappings in CSV.")
         return
@@ -618,7 +622,11 @@ def main():
         print("=" * 60)
 
         # Parse the CSV
-        mappings = _lib_parse_csv(args.entitlement_csv)
+        try:
+            mappings = _lib_parse_csv(args.entitlement_csv)
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
         print(f"\n  Loaded {len(mappings)} mapping(s) from {args.entitlement_csv}")
 
         if not mappings:

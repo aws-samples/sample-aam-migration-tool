@@ -41,6 +41,15 @@ interface Props {
   disabled?: boolean;
   /** "multi" renders a multi-profile picker (Policy Analysis, IAM Fed). "single" renders a single-profile dropdown (IdC). */
   profileMode?: "multi" | "single";
+  /**
+   * Whether to offer the "Entire organization" operating mode.
+   *
+   * Only meaningful for tools that can enumerate the organization's accounts on
+   * their own. IAM Federation cannot: it has no account-discovery step, so the
+   * org mode there still required the operator to type in every profile or
+   * account ID, making it indistinguishable from multi-account mode.
+   */
+  allowOrg?: boolean;
 }
 
 /**
@@ -49,14 +58,21 @@ interface Props {
  * - Single account: uses the default AWS credential chain, no extra inputs.
  * - Multi-account: choose between named profiles or assume-role with account IDs.
  */
-export function AuthMethodSelect({ state, onChange, disabled, profileMode = "multi" }: Props) {
+export function AuthMethodSelect({ state, onChange, disabled, profileMode = "multi", allowOrg = true }: Props) {
   const update = (partial: Partial<AuthState>) => onChange({ ...state, ...partial });
+
+  // Guard against rendering the org-specific inputs if org mode is not offered.
+  const isOrgMode = allowOrg && state.operatingMode === "org";
 
   return (
     <SpaceBetween size="m">
       <FormField
         label="Operating mode"
-        description="Choose whether to target a single account, multiple accounts, or the entire organization."
+        description={
+          allowOrg
+            ? "Choose whether to target a single account, multiple accounts, or the entire organization."
+            : "Choose whether to target a single account or multiple accounts."
+        }
       >
         <RadioGroup
           value={state.operatingMode}
@@ -76,13 +92,17 @@ export function AuthMethodSelect({ state, onChange, disabled, profileMode = "mul
                 "Operate against multiple specified accounts using named profiles or cross-account role assumption.",
               disabled,
             },
-            {
-              value: "org",
-              label: "Entire organization",
-              description:
-                "Scan all accounts provisioned in your Identity Center instance. This may take significantly longer and is subject to API rate limits in large organizations.",
-              disabled,
-            },
+            ...(allowOrg
+              ? [
+                  {
+                    value: "org",
+                    label: "Entire organization",
+                    description:
+                      "Scan all accounts provisioned in your Identity Center instance. This may take significantly longer and is subject to API rate limits in large organizations.",
+                    disabled,
+                  },
+                ]
+              : []),
           ]}
         />
       </FormField>
@@ -93,7 +113,7 @@ export function AuthMethodSelect({ state, onChange, disabled, profileMode = "mul
           default profile, or instance metadata). Ensure these credentials have the
           necessary read permissions for the target account.
         </Alert>
-      ) : state.operatingMode === "org" ? (
+      ) : isOrgMode ? (
         <>
           <Alert type="warning">
             <b>Organization-wide scan.</b> This will query all accounts provisioned in your
