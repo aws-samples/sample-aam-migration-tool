@@ -140,6 +140,7 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
 
     scanner = _load_scanner()
     scanner.MAX_WORKERS = workers
+    scanner.reset_skipped_resources()
     regions_arg = ",".join(regions_list) if regions_list else None
     service_filter = {s.strip().lower() for s in services} if services else None
 
@@ -337,6 +338,9 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
         # Deliberate future re-runs should be fresh; nothing left to resume.
         checkpoint.delete(ck_key)
 
+    # Collect resources that were skipped due to API errors during this scan.
+    skipped_resources = scanner.get_skipped_resources()
+
     payload = {
         "search_terms": search_terms,
         "auth_method": auth_method,
@@ -347,6 +351,8 @@ def run_scan_job(params: dict, on_progress: Optional[ProgressCb] = None) -> dict
         "management_account": management_account,
         "total_matches": len(all_matches),
         "matches": all_matches,
+        "skipped_resources": skipped_resources,
+        "total_skipped": len(skipped_resources),
         "resume": {
             "total_units": total_units,
             "skipped_units": skipped,

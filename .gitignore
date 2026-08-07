@@ -7,6 +7,9 @@ venv/
 .env
 *.whl
 
+# ─── AAM service model (pre-release, not for distribution) ───────────────────
+account-access-service-model-prod.json
+
 # ─── Node / UI build ─────────────────────────────────────────────────────────
 node_modules/
 dist/

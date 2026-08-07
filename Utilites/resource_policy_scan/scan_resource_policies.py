@@ -136,20 +136,22 @@ def check_policy(policy: str, resource_arn: str, service: str, search_terms: lis
     return None
 
 
-def safe(fn, *args, **kwargs):
+def safe(fn, *args, _resource_arn: str = "", _service: str = "", **kwargs):
     try:
         return fn(*args, **kwargs)
-    except (ClientError, BotoCoreError):
+    except (ClientError, BotoCoreError) as exc:
+        if _resource_arn or _service:
+            record_skip(_resource_arn or "unknown", _service or "unknown", exc)
         return None
 
 
-def paginate(client, method: str, key: str, **kwargs) -> list:
+def paginate(client, method: str, key: str, _service: str = "", **kwargs) -> list:
     items = []
     try:
         for page in client.get_paginator(method).paginate(**kwargs):
             items.extend(page.get(key, []))
-    except (ClientError, BotoCoreError):
-        pass
+    except (ClientError, BotoCoreError) as exc:
+        record_skip(f"{method}(paginate)", _service or method, exc)
     return items
 
 
@@ -171,8 +173,13 @@ def parallel_check(items, fetch_fn, arn_fn, service, terms, account_id=""):
     matches = []
 
     def _process(item):
-        pol = fetch_fn(item)
-        return check_policy(policy_text(pol), arn_fn(item), service, terms, account_id)
+        arn = arn_fn(item)
+        try:
+            pol = fetch_fn(item)
+        except (ClientError, BotoCoreError) as exc:
+            record_skip(arn, service, exc)
+            return None
+        return check_policy(policy_text(pol), arn, service, terms, account_id)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(_process, item): item for item in items}
@@ -192,6 +199,40 @@ def heading(title: str):
 
 _resource_count = 0
 _progress_state = {"current": 0, "total": 0, "label": "", "matches": 0}
+
+
+# ─── Skipped resource tracking ──────────────────────────────────────────────
+
+_skipped_resources: list[dict] = []
+
+
+def record_skip(resource_arn: str, service: str, exc: Exception) -> None:
+    """Record a resource that could not be scanned due to an error."""
+    error_code = "Unknown"
+    if hasattr(exc, "response"):
+        try:
+            error_code = exc.response["Error"]["Code"]
+        except (KeyError, TypeError):
+            error_code = type(exc).__name__
+    else:
+        error_code = type(exc).__name__
+
+    _skipped_resources.append({
+        "resource_arn": resource_arn,
+        "service": service,
+        "error_code": error_code,
+        "error_message": str(exc),
+    })
+
+
+def get_skipped_resources() -> list[dict]:
+    """Return the list of resources that were skipped due to errors."""
+    return list(_skipped_resources)
+
+
+def reset_skipped_resources() -> None:
+    """Clear the skipped resources list (call at start of a new scan)."""
+    _skipped_resources.clear()
 
 
 def count_resource(n: int = 1):
@@ -1025,6 +1066,7 @@ def main():
 
     global MAX_WORKERS
     MAX_WORKERS = args.workers
+    reset_skipped_resources()
 
     # Build service filter
     service_filter = None
@@ -1061,8 +1103,18 @@ def main():
     minutes, seconds = divmod(int(elapsed), 60)
     time_str = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
 
+    skipped = get_skipped_resources()
+
     print("\n" + "=" * 70)
     print(f"Scan complete. {len(all_matches)} resource(s) matched in {time_str}.")
+    if skipped:
+        print(f"  {len(skipped)} resource(s) could not be scanned (see 'skipped_resources' in output).")
+        # Summarize by error code
+        code_counts: dict[str, int] = {}
+        for s in skipped:
+            code_counts[s["error_code"]] = code_counts.get(s["error_code"], 0) + 1
+        for code, count in sorted(code_counts.items(), key=lambda x: -x[1]):
+            print(f"    {code}: {count}")
     print("=" * 70)
 
     output = {
@@ -1070,6 +1122,8 @@ def main():
         "regions_scanned": sorted(all_regions),
         "total_matches": len(all_matches),
         "matches": all_matches,
+        "skipped_resources": skipped,
+        "total_skipped": len(skipped),
     }
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
