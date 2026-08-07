@@ -25,6 +25,32 @@ ProgressCb = Callable[[dict], None]
 AAM_ENDPOINT_TEMPLATE = "https://account-access.{region}.api.aws"
 
 
+def build_aam_trust_policy(aam_source_account: str = "", aam_application_arn: str = "") -> dict:
+    """
+    Build the standard AAM trust policy document with optional confused-deputy conditions.
+
+    When aam_source_account and aam_application_arn are provided, adds
+    aws:SourceAccount and aws:SourceArn conditions to prevent confused-deputy attacks.
+    """
+    stmt: dict = {
+        "Sid": "AAMTrustPolicyStatement",
+        "Effect": "Allow",
+        "Principal": {"Service": "account-access.amazonaws.com"},
+        "Action": ["sts:AssumeRole", "sts:SetContext"],
+    }
+    if aam_source_account or aam_application_arn:
+        condition: dict = {"StringEquals": {}}
+        if aam_source_account:
+            condition["StringEquals"]["aws:SourceAccount"] = aam_source_account
+        if aam_application_arn:
+            condition["StringEquals"]["aws:SourceArn"] = aam_application_arn
+        stmt["Condition"] = condition
+    return {
+        "Version": "2012-10-17",
+        "Statement": [stmt],
+    }
+
+
 # ─── IdC Instance Discovery ──────────────────────────────────────────────────
 
 def discover_idc_instance(sso_admin_client) -> Tuple[str, str]:
@@ -61,6 +87,68 @@ def list_all_permission_sets(sso_admin_client, instance_arn: str) -> List[str]:
 
 
 # ─── Permission Set Description ───────────────────────────────────────────────
+
+def fetch_permission_set_policies(
+    sso_admin_client, instance_arn: str, ps_arn: str, ps_name: str = ""
+) -> Dict[str, Any]:
+    """Fetch only the policies for a permission set (skips DescribePermissionSet).
+
+    Use when you already have the ARN and name (e.g., from a migration plan CSV)
+    and only need the policy details for role creation/CFN generation.
+    """
+    # Inline policy
+    inline_policy = None
+    try:
+        inline_resp = sso_admin_client.get_inline_policy_for_permission_set(
+            InstanceArn=instance_arn, PermissionSetArn=ps_arn
+        )
+        if inline_resp.get("InlinePolicy"):
+            inline_policy = json.loads(inline_resp["InlinePolicy"])
+    except Exception:
+        pass
+
+    # AWS managed policies
+    aws_managed = []
+    try:
+        mp_pag = sso_admin_client.get_paginator("list_managed_policies_in_permission_set")
+        for page in mp_pag.paginate(InstanceArn=instance_arn, PermissionSetArn=ps_arn):
+            for p in page.get("AttachedManagedPolicies", []):
+                aws_managed.append({"name": p.get("Name", ""), "arn": p.get("Arn", "")})
+    except Exception:
+        pass
+
+    # Customer managed policy references
+    cmp_refs = []
+    try:
+        cmp_pag = sso_admin_client.get_paginator("list_customer_managed_policy_references_in_permission_set")
+        for page in cmp_pag.paginate(InstanceArn=instance_arn, PermissionSetArn=ps_arn):
+            for ref in page.get("CustomerManagedPolicyReferences", []):
+                cmp_refs.append({"name": ref.get("Name", ""), "path": ref.get("Path", "/")})
+    except Exception:
+        pass
+
+    # Permission boundary
+    permission_boundary = None
+    try:
+        pb_resp = sso_admin_client.get_permissions_boundary_for_permission_set(
+            InstanceArn=instance_arn, PermissionSetArn=ps_arn
+        )
+        if pb_resp.get("PermissionsBoundary"):
+            permission_boundary = pb_resp["PermissionsBoundary"]
+    except Exception:
+        pass
+
+    return {
+        "arn": ps_arn,
+        "name": ps_name or ps_arn.rsplit("/", 1)[-1],
+        "description": "",
+        "session_duration": "PT1H",
+        "inline_policy": inline_policy,
+        "aws_managed_policies": aws_managed,
+        "customer_managed_policy_references": cmp_refs,
+        "permission_boundary": permission_boundary,
+    }
+
 
 def describe_permission_set(
     sso_admin_client, instance_arn: str, ps_arn: str
@@ -105,6 +193,18 @@ def describe_permission_set(
     except Exception:
         pass
 
+    # Permission boundary
+    permission_boundary = None
+    try:
+        pb_resp = sso_admin_client.get_permissions_boundary_for_permission_set(
+            InstanceArn=instance_arn, PermissionSetArn=ps_arn
+        )
+        if pb_resp.get("PermissionsBoundary"):
+            permission_boundary = pb_resp["PermissionsBoundary"]
+    except Exception:
+        # ResourceNotFoundException is normal (no boundary set)
+        pass
+
     return {
         "arn": ps_arn,
         "name": ps.get("Name", ps_arn.rsplit("/", 1)[-1]),
@@ -113,6 +213,7 @@ def describe_permission_set(
         "inline_policy": inline_policy,
         "aws_managed_policies": aws_managed,
         "customer_managed_policy_references": cmp_refs,
+        "permission_boundary": permission_boundary,
     }
 
 
@@ -334,6 +435,27 @@ def create_role(
                 )
             except Exception as exc:
                 warnings.append(f"Failed to attach inline policy: {exc}")
+
+        # Permission boundary
+        if permission_set.get("permission_boundary"):
+            pb = permission_set["permission_boundary"]
+            # Permission boundary can be a managed policy ARN or a customer managed policy reference
+            pb_arn = ""
+            if pb.get("ManagedPolicyArn"):
+                pb_arn = pb["ManagedPolicyArn"]
+            elif pb.get("CustomerManagedPolicyReference"):
+                ref = pb["CustomerManagedPolicyReference"]
+                pb_path = ref.get("Path", "/")
+                pb_name = ref.get("Name", "")
+                pb_arn = f"arn:aws:iam::{account_id}:policy{pb_path}{pb_name}"
+            if pb_arn:
+                try:
+                    iam_client.put_role_permissions_boundary(
+                        RoleName=role_name,
+                        PermissionsBoundary=pb_arn,
+                    )
+                except Exception as exc:
+                    warnings.append(f"Failed to set permission boundary {pb_arn}: {exc}")
 
         result = {
             "role_name": role_name,

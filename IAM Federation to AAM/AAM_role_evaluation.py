@@ -319,7 +319,8 @@ NEW_TRUST_STATEMENT = {
 AAM_SERVICE_PRINCIPALS = {"account-access.amazonaws.com", "account-access-preview.amazonaws.com"}
 
 
-def update_trust_policies(saml_roles: List[Dict[str, Any]], idp_arns: List[str], account_id: str) -> None:
+def update_trust_policies(saml_roles: List[Dict[str, Any]], idp_arns: List[str], account_id: str,
+                          aam_source_account: str = "", aam_application_arn: str = "") -> None:
     """
     For each identified SAML role, prompt the user to either:
       1) ADD the new trust statement alongside the existing IDP statement
@@ -328,11 +329,14 @@ def update_trust_policies(saml_roles: List[Dict[str, Any]], idp_arns: List[str],
 
     The choice applies to ALL roles (batch operation).
     """
+    from lib import build_trust_statement
+    trust_stmt = build_trust_statement(aam_source_account, aam_application_arn)
+
     print("\n" + "=" * 60)
     print("  Trust Policy Update")
     print("=" * 60)
     print("\nNew trust policy statement to apply:")
-    print(json.dumps(NEW_TRUST_STATEMENT, indent=2))
+    print(json.dumps(trust_stmt, indent=2))
 
     print(f"\nThis will affect {len(saml_roles)} role(s).")
     print("\nOptions:")
@@ -388,7 +392,7 @@ def update_trust_policies(saml_roles: List[Dict[str, Any]], idp_arns: List[str],
         if mode == "ADD":
             # Append the new statement to the existing list
             new_doc = dict(trust_doc)
-            new_doc["Statement"] = list(trust_doc["Statement"]) + [NEW_TRUST_STATEMENT]
+            new_doc["Statement"] = list(trust_doc["Statement"]) + [trust_stmt]
         else:
             # REPLACE: remove statements that reference the old IDP, add the new one
             new_doc = dict(trust_doc)
@@ -400,7 +404,7 @@ def update_trust_policies(saml_roles: List[Dict[str, Any]], idp_arns: List[str],
                 # Keep statements that don't reference any of the selected IDPs
                 if not any(idp in federated for idp in idp_arns):
                     kept.append(stmt)
-            kept.append(NEW_TRUST_STATEMENT)
+            kept.append(trust_stmt)
             new_doc["Statement"] = kept
 
         try:
@@ -587,7 +591,8 @@ def main():
     parser.add_argument("--role-name", help="Role name to assume in each target account (for multi with assume-role).")
     parser.add_argument("--profiles", help="Comma-separated AWS profile names (for multi with profiles). Each profile is resolved to its account via GetCallerIdentity.")
     parser.add_argument("--workers", type=int, default=5, help="Max parallel workers (default 5).")
-    parser.add_argument("--aam-application-arn", help="AAM application ARN for entitlement creation.")
+    parser.add_argument("--aam-application-arn", help="AAM application ARN for entitlement creation and trust policy conditions (confused-deputy protection).")
+    parser.add_argument("--aam-source-account", help="AWS account where AAM is configured. Auto-extracted from --aam-application-arn if not specified. Used as aws:SourceAccount in the trust policy condition.")
     parser.add_argument("--apply-only", action="store_true",
                         help="Skip discovery. Apply trust policy updates + entitlement creation directly from --entitlement-csv. Requires --aam-application-arn and --entitlement-csv.")
     parser.add_argument("--mode", choices=["ADD", "REPLACE"], default="ADD",
@@ -607,6 +612,12 @@ def main():
         print("=" * 60)
         rollback_trust_policies(args.rollback)
         return
+
+    # Auto-extract source account from application ARN if not provided
+    if args.aam_application_arn and not args.aam_source_account:
+        parts = args.aam_application_arn.split(":")
+        if len(parts) >= 5 and parts[4]:
+            args.aam_source_account = parts[4]
 
     # Handle --apply-only mode (skip discovery, apply directly from CSV)
     if args.apply_only:
@@ -682,9 +693,11 @@ def main():
                 print(f"  Backup saved: {backup_file}")
                 print(f"  To rollback: python3 AAM_role_evaluation.py --rollback {backup_file}")
 
-            # Apply trust policy updates
+            # Apply trust policy updates with confused-deputy conditions
             results = _lib_migrate_parallel(
                 session_map, role_arns, args.mode, "",
+                aam_source_account=getattr(args, "aam_source_account", "") or "",
+                aam_application_arn=args.aam_application_arn or "",
                 workers=args.workers,
             )
             success = len([r for r in results if r["status"] == "success"])
@@ -761,7 +774,9 @@ def main():
             if saml_roles:
                 csv_path = generate_csv(account_id, idp_arns[0], saml_roles)
                 print(f"  CSV: {csv_path}")
-                update_trust_policies(saml_roles, idp_arns, account_id)
+                update_trust_policies(saml_roles, idp_arns, account_id,
+                                      getattr(args, "aam_source_account", "") or "",
+                                      args.aam_application_arn or "")
                 all_saml_roles.extend(saml_roles)
 
         # Entitlement creation (after all accounts processed)
@@ -805,7 +820,9 @@ def main():
     csv_path = generate_csv(account_id, idp_arns[0], saml_roles)
     print(f"\nCSV report generated: {csv_path}")
 
-    update_trust_policies(saml_roles, idp_arns, account_id)
+    update_trust_policies(saml_roles, idp_arns, account_id,
+                          getattr(args, "aam_source_account", "") or "",
+                          args.aam_application_arn or "")
 
     # Entitlement creation
     if args.aam_application_arn:

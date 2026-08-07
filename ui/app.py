@@ -242,6 +242,16 @@ def idc_discover_status():
     return jsonify(job)
 
 
+@app.post("/api/idc/resolve-plan")
+def idc_resolve_plan():
+    """Targeted discovery from a migration plan upload."""
+    body = request.get_json(silent=True) or {}
+    try:
+        return jsonify(idc.resolve_plan(body))
+    except Exception as exc:  # noqa: BLE001
+        return _json_error(str(exc), 500)
+
+
 @app.post("/api/idc/generate-iac")
 def idc_generate_iac():
     """Generate CloudFormation template(s) from cached inventory."""

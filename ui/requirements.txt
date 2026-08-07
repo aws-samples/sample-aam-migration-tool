@@ -3,6 +3,7 @@
 Flask>=3.0,<4.0
 PyYAML>=6.0
 requests>=2.31,<3.0
+defusedcsv>=2.0
 
 # Custom AAM-aware SDK wheels (includes the production `accountaccess` service
 # model). Order matters: botocore must be installed before boto3.

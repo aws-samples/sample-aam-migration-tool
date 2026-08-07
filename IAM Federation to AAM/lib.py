@@ -35,6 +35,24 @@ NEW_TRUST_STATEMENT = {
     ],
 }
 
+
+def build_trust_statement(aam_source_account: str = "", aam_application_arn: str = "") -> dict:
+    """
+    Build the AAM trust policy statement with optional confused-deputy protection.
+
+    When aam_source_account and aam_application_arn are provided, adds Condition
+    keys (aws:SourceAccount, aws:SourceArn) to prevent confused-deputy attacks.
+    """
+    stmt = dict(NEW_TRUST_STATEMENT)
+    if aam_source_account or aam_application_arn:
+        condition: dict = {"StringEquals": {}}
+        if aam_source_account:
+            condition["StringEquals"]["aws:SourceAccount"] = aam_source_account
+        if aam_application_arn:
+            condition["StringEquals"]["aws:SourceArn"] = aam_application_arn
+        stmt["Condition"] = condition
+    return stmt
+
 # Both the preview and GA service principals — used for idempotency detection
 AAM_SERVICE_PRINCIPALS = {"account-access.amazonaws.com", "account-access-preview.amazonaws.com"}
 
@@ -190,6 +208,8 @@ def migrate_trust_policy(
     role_name: str,
     mode: str,
     idp_arn: str,
+    aam_source_account: str = "",
+    aam_application_arn: str = "",
 ) -> Dict[str, Any]:
     """
     Update a single role's trust policy. Returns a result dict.
@@ -198,6 +218,7 @@ def migrate_trust_policy(
           "REPLACE" — remove IDP statements, add AAM statement.
     """
     iam_client = session.client("iam")
+    trust_stmt = build_trust_statement(aam_source_account, aam_application_arn)
 
     try:
         role_resp = iam_client.get_role(RoleName=role_name)
@@ -219,7 +240,7 @@ def migrate_trust_policy(
         # Build new trust policy
         if mode == "ADD":
             new_doc = dict(trust_doc)
-            new_doc["Statement"] = list(trust_doc["Statement"]) + [NEW_TRUST_STATEMENT]
+            new_doc["Statement"] = list(trust_doc["Statement"]) + [trust_stmt]
         else:
             kept = []
             for stmt in trust_doc["Statement"]:
@@ -228,7 +249,7 @@ def migrate_trust_policy(
                     federated = [federated]
                 if idp_arn not in federated:
                     kept.append(stmt)
-            kept.append(NEW_TRUST_STATEMENT)
+            kept.append(trust_stmt)
             new_doc = dict(trust_doc)
             new_doc["Statement"] = kept
 
@@ -257,6 +278,8 @@ def migrate_roles_parallel(
     role_arns: List[str],
     mode: str,
     idp_arn: str,
+    aam_source_account: str = "",
+    aam_application_arn: str = "",
     workers: int = 5,
     on_progress: Optional[ProgressCb] = None,
 ) -> List[Dict[str, Any]]:
@@ -283,7 +306,7 @@ def migrate_roles_parallel(
         if not session:
             return {"role_arn": role_arn, "role_name": role_name, "status": "error", "error": "No session available"}
 
-        result = migrate_trust_policy(session, role_name, mode, idp_arn)
+        result = migrate_trust_policy(session, role_name, mode, idp_arn, aam_source_account, aam_application_arn)
         result["role_arn"] = role_arn
         result["account_id"] = account_id
         return result
@@ -305,12 +328,83 @@ def migrate_roles_parallel(
     return results
 
 
+# ─── Identity Store Resolution ────────────────────────────────────────────────
+
+def resolve_principal_id(
+    identity_store_client,
+    identity_store_id: str,
+    name: str,
+    principal_type: str = "GROUP",
+) -> tuple[str, Optional[str]]:
+    """
+    Resolve a display name to an Identity Store UUID using GetGroupId/GetUserId.
+
+    Returns (uuid, None) on success, or (original_name, error_message) on failure.
+    Uses exact match via AlternateIdentifier/UniqueAttribute.
+    """
+    try:
+        if principal_type.upper() == "USER":
+            resp = identity_store_client.get_user_id(
+                IdentityStoreId=identity_store_id,
+                AlternateIdentifier={
+                    "UniqueAttribute": {
+                        "AttributePath": "userName",
+                        "AttributeValue": name,
+                    }
+                },
+            )
+            return resp["UserId"], None
+        else:
+            resp = identity_store_client.get_group_id(
+                IdentityStoreId=identity_store_id,
+                AlternateIdentifier={
+                    "UniqueAttribute": {
+                        "AttributePath": "displayName",
+                        "AttributeValue": name,
+                    }
+                },
+            )
+            return resp["GroupId"], None
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code == "ResourceNotFoundException":
+            return name, f"{'User' if principal_type.upper() == 'USER' else 'Group'} '{name}' not found in Identity Store"
+        return name, f"Resolution failed: {exc}"
+    except Exception as exc:
+        return name, f"Resolution failed: {exc}"
+
+
+def resolve_all_principals(
+    hub_session: boto3.Session,
+    mappings: List[Dict[str, str]],
+    identity_store_id: str,
+    region: str = "us-east-1",
+) -> List[Dict[str, Any]]:
+    """
+    Resolve all principal display names in mappings to Identity Store UUIDs.
+
+    Returns the mappings list with 'resolved_id' and 'resolution_error' added to each.
+    """
+    id_store = hub_session.client("identitystore", region_name=region)
+    results = []
+    for m in mappings:
+        name = m.get("principal") or m.get("group") or ""
+        principal_type = m.get("principal_type", "GROUP")
+        if not name:
+            results.append({**m, "resolved_id": "", "resolution_error": "No principal name"})
+            continue
+        resolved_id, error = resolve_principal_id(id_store, identity_store_id, name, principal_type)
+        results.append({**m, "resolved_id": resolved_id, "resolution_error": error})
+    return results
+
+
 # ─── Entitlement Creation ─────────────────────────────────────────────────────
 
 def create_entitlements(
     hub_session: boto3.Session,
     aam_application_arn: str,
     mappings: List[Dict[str, str]],
+    identity_store_id: str = "",
     region: str = "us-east-1",
     workers: int = 5,
     on_progress: Optional[ProgressCb] = None,
@@ -318,14 +412,23 @@ def create_entitlements(
     """
     Create AAM entitlements from explicit columnar mappings.
 
-    Each mapping: {group, account, role, matchedRoleArn}
-    Uses the preview endpoint by default.
+    Each mapping: {group, account, role, matchedRoleArn, principal_type}
+    Resolves display names to Identity Store UUIDs via GetGroupId/GetUserId
+    before calling CreateEntitlement.
     """
     aam_endpoint = AAM_ENDPOINT_TEMPLATE.format(region=region)
     try:
         aam_client = hub_session.client("accountaccess", region_name=region, endpoint_url=aam_endpoint)
     except Exception as exc:
         return [{"group": m.get("group", ""), "status": "error", "error": f"AAM client unavailable: {exc}"} for m in mappings]
+
+    # Resolve principal names to UUIDs if identity_store_id is provided
+    id_store = None
+    if identity_store_id:
+        try:
+            id_store = hub_session.client("identitystore", region_name=region)
+        except Exception:
+            pass
 
     results: List[Dict[str, Any]] = []
     _lock = Lock()
@@ -334,11 +437,19 @@ def create_entitlements(
 
     def create_one(m: Dict[str, str]) -> Dict[str, Any]:
         role_arn = m.get("matchedRoleArn") or ""
-        principal_id = m.get("principal") or m.get("group") or ""
+        principal_name = m.get("principal") or m.get("group") or ""
         principal_type = m.get("principal_type", "GROUP")
 
-        if not role_arn or not principal_id:
+        if not role_arn or not principal_name:
             return {"group": m.get("group", ""), "status": "skipped", "error": "Missing role ARN or principal"}
+
+        # Resolve display name to UUID
+        principal_id = principal_name
+        if id_store and identity_store_id:
+            resolved, err = resolve_principal_id(id_store, identity_store_id, principal_name, principal_type)
+            if err:
+                return {"group": m.get("group", ""), "principal": principal_name, "role_arn": role_arn, "status": "error", "error": err}
+            principal_id = resolved
 
         principal_block: dict = {}
         if principal_type.upper() == "USER":

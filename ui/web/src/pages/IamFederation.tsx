@@ -18,7 +18,7 @@ import TextFilter from "@cloudscape-design/components/text-filter";
 import Pagination from "@cloudscape-design/components/pagination";
 import { api, type CacheWrapper, type JobProgress } from "../api/client";
 import { AuthMethodSelect, INITIAL_AUTH_STATE, parseAccountIds, type AuthState } from "../components/AuthMethodSelect";
-import { exportToCsv } from "../utils/csv";
+import { exportToCsv, parseCsvLine } from "../utils/csv";
 import { formatAbsolute, formatAge } from "../utils/time";
 import { useTablePagination } from "../utils/useTablePagination";
 
@@ -79,21 +79,22 @@ export default function IamFederation() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Step 3: Entitlement mapping (columnar — auto-populated from selected roles)
-  const [entitlementMappings, setEntitlementMappings] = useState<{ id: string; group: string; accountId: string; roleName: string; roleArn: string }[]>([]);
+  const [entitlementMappings, setEntitlementMappings] = useState<{ id: string; group: string; principalType: string; accountId: string; roleName: string; roleArn: string }[]>([]);
 
   // Step 4: Migrate
   const [migrateMode, setMigrateMode] = useState<MigrateMode>("ADD");
   const [migrating, setMigrating] = useState(false);
   const [migrateResults, setMigrateResults] = useState<MigrateResult[]>([]);
   const [aamAppArn, setAamAppArn] = useState("");
+  const [aamSourceAccount, setAamSourceAccount] = useState("");
   const [aamProfile, setAamProfile] = useState<{ label: string; value: string } | null>(null);
   const [availableProfiles, setAvailableProfiles] = useState<{ label: string; value: string }[]>([]);
   const [entitlementResults, setEntitlementResults] = useState<{ group: string; principal: string; account: string; role: string; role_arn: string; status: string; error?: string }[]>([]);
 
   // Step 4: IaC
   const [iacLoading, setIacLoading] = useState(false);
-  const [iacResult, setIacResult] = useState<{ cloudformation: { content: string; path: string }; terraform: { content: string; path: string } } | null>(null);
-  const [iacModal, setIacModal] = useState<"cloudformation" | "terraform" | null>(null);
+  const [iacResult, setIacResult] = useState<{ cloudformation: { content: string; path: string }; terraform: { content: string; path: string }; templates?: Record<string, { content: string; path: string }>; entitlements_template?: { content: string; path: string } | null; accounts?: string[] } | null>(null);
+  const [iacModal, setIacModal] = useState<string | null>(null);
 
   // Load cached state on mount
   useEffect(() => {
@@ -209,7 +210,7 @@ export default function IamFederation() {
     try {
       const payload: Record<string, unknown> = {
         ...authPayload(),
-        role_arns: selectedRoles.map((r) => r.role_arn),
+        role_arns: [...new Set(entitlementMappings.filter((m) => m.roleArn).map((m) => m.roleArn))],
         mode: migrateMode,
         idp_filter: (() => {
           const f: Record<string, string[]> = {};
@@ -223,6 +224,7 @@ export default function IamFederation() {
       // Include entitlement mappings and AAM ARN if provided
       if (aamAppArn.trim()) {
         payload.aam_application_arn = aamAppArn.trim();
+        payload.aam_source_account = aamSourceAccount.trim();
         // Pass the selected profile for entitlement API calls
         if (aamProfile) {
           payload.aam_profile = aamProfile.value;
@@ -234,6 +236,7 @@ export default function IamFederation() {
           .map((m) => ({
             group: m.group.trim(),
             principal: m.group.trim(),
+            principal_type: m.principalType || "GROUP",
             account: m.accountId,
             role: m.roleName,
             matchedRoleArn: m.roleArn || `arn:aws:iam::${m.accountId}:role/${m.roleName}`,
@@ -255,9 +258,26 @@ export default function IamFederation() {
   async function generateIac() {
     setError(null); setIacLoading(true);
     try {
-      const res = await api.iamGenerateIac({
-        role_arns: selectedRoles.length ? selectedRoles.map((r) => r.role_arn) : undefined,
-      });
+      const payload: Record<string, unknown> = {
+        role_arns: [...new Set(entitlementMappings.filter((m) => m.roleArn).map((m) => m.roleArn))],
+      };
+      if (aamAppArn.trim()) {
+        payload.aam_application_arn = aamAppArn.trim();
+        payload.aam_source_account = aamSourceAccount.trim();
+      }
+      if (entitlementMappings.length > 0 && aamAppArn.trim()) {
+        payload.entitlement_mappings = entitlementMappings
+          .filter((m) => m.group.trim())
+          .map((m) => ({
+            group: m.group.trim(),
+            principal: m.group.trim(),
+            principal_type: m.principalType || "GROUP",
+            account: m.accountId,
+            role: m.roleName,
+            matchedRoleArn: m.roleArn || `arn:aws:iam::${m.accountId}:role/${m.roleName}`,
+          }));
+      }
+      const res = await api.iamGenerateIac(payload);
       setIacResult(res);
     } catch (e) {
       setError((e as Error).message);
@@ -329,13 +349,50 @@ export default function IamFederation() {
   return (
     <ContentLayout
       header={
-        <Header variant="h1" description="Migrate SAML-federated IAM roles to AAM. This tool discovers roles that trust your SAML identity provider, then updates their trust policies to add the AAM service principal — enabling AAM to assume those roles on behalf of your users. Choose ADD mode to keep the existing SAML trust alongside AAM, or REPLACE mode to remove the SAML trust entirely.">
+        <Header variant="h1" description="Migrate SAML-federated IAM roles to AAM. This tool discovers roles that trust your SAML identity provider, then updates their trust policies to add the AAM service principal — enabling AAM to assume those roles on behalf of your users. Choose ADD mode to keep the existing SAML trust alongside AAM, or REPLACE mode to remove the SAML trust entirely. You have the option of either following the step-by-step flow here or manually uploading the entitlement mapping if you already have one in Step 3.">
           IAM Federation → AAM
         </Header>
       }
     >
       <SpaceBetween size="l">
         {error && <Alert type="error" header="Error" dismissible onDismiss={() => setError(null)}>{error}</Alert>}
+
+        {/* AAM Configuration */}
+        <Container
+          header={
+            <Header variant="h2" description="Configure the AAM application. Used for trust policy conditions (confused-deputy protection) and entitlement creation.">
+              AAM Configuration
+            </Header>
+          }
+        >
+          <SpaceBetween size="m">
+            <FormField
+              label="AAM Application ARN"
+              description="Required for entitlement creation and used as aws:SourceArn in the trust policy condition."
+              constraintText="Format: arn:aws:account-access:<region>:<account>:application/<id>"
+            >
+              <Input
+                value={aamAppArn}
+                onChange={({ detail }) => {
+                  setAamAppArn(detail.value);
+                  const parts = detail.value.split(":");
+                  if (parts.length >= 5 && parts[4]) setAamSourceAccount(parts[4]);
+                }}
+                placeholder="arn:aws:account-access:us-east-1:123456789012:application/app-id"
+              />
+            </FormField>
+            <FormField
+              label="AAM Source Account"
+              description="AWS account where AAM is configured. Used as aws:SourceAccount in the trust policy. Auto-populated from the application ARN."
+            >
+              <Input
+                value={aamSourceAccount}
+                onChange={({ detail }) => setAamSourceAccount(detail.value)}
+                placeholder="123456789012"
+              />
+            </FormField>
+          </SpaceBetween>
+        </Container>
 
         {/* Credentials */}
         <Container header={<Header variant="h2">Credentials</Header>}>
@@ -454,11 +511,13 @@ export default function IamFederation() {
                   <Button iconName="download" onClick={() => {
                     exportToCsv("entitlement_mappings_template.csv", entitlementMappings.map((m) => ({
                       group: m.group,
+                      principal_type: m.principalType || "GROUP",
                       account_id: m.accountId,
                       role_name: m.roleName,
                       role_arn: m.roleArn,
                     })), [
                       { key: "group", header: "Group/Principal" },
+                      { key: "principal_type", header: "Principal Type" },
                       { key: "account_id", header: "Account ID", text: true },
                       { key: "role_name", header: "Role Name" },
                       { key: "role_arn", header: "Role ARN" },
@@ -476,32 +535,32 @@ export default function IamFederation() {
                         const text = ev.target?.result as string;
                         const lines = text.split("\n").filter((l) => l.trim());
                         if (lines.length < 2) return;
-                        // Trim again after unquoting: exported text columns carry a
-                        // leading tab inside the quotes to stop Excel coercing them.
-                        const headers = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, "").trim().toLowerCase());
+                        const headers = parseCsvLine(lines[0]).map((h) => h.trim().toLowerCase());
                         const groupIdx = headers.findIndex((h) => h.includes("group") || h.includes("principal"));
                         const accountIdx = headers.findIndex((h) => h.includes("account"));
                         const roleIdx = headers.findIndex((h) => h === "role name" || h === "role_name");
                         const arnIdx = headers.findIndex((h) => h.includes("role arn") || h === "role_arn");
+                        const typeIdx = headers.findIndex((h) => h === "type" || h === "principal type" || h === "principal_type");
                         const uploaded: typeof entitlementMappings = [];
                         for (let i = 1; i < lines.length; i++) {
-                          const cols = lines[i].split(",").map((c) => c.trim().replace(/^"|"$/g, "").trim());
+                          const cols = parseCsvLine(lines[i]);
                           const group = groupIdx >= 0 ? cols[groupIdx] || "" : "";
                           const acct = accountIdx >= 0 ? cols[accountIdx] || "" : "";
                           const role = roleIdx >= 0 ? cols[roleIdx] || "" : "";
                           const arn = arnIdx >= 0 ? cols[arnIdx] || "" : "";
+                          const principalType = typeIdx >= 0 ? (cols[typeIdx] || "GROUP").toUpperCase() : "GROUP";
                           if (!acct && !role) continue;
-                          uploaded.push({ id: `${acct}#${role}#${group}#${i}`, group, accountId: acct, roleName: role, roleArn: arn });
+                          uploaded.push({ id: `${acct}#${role}#${group}#${i}`, group, principalType, accountId: acct, roleName: role, roleArn: arn });
                         }
                         if (uploaded.length) setEntitlementMappings(uploaded);
                       };
                       reader.readAsText(file);
                     };
                     input.click();
-                  }}>Upload CSV</Button>
+                  }}>Upload CSV (overwrites current mappings)</Button>
                   <Button onClick={() => {
                     // Add a blank row
-                    setEntitlementMappings((prev) => [...prev, { id: `new-${Date.now()}`, group: "", accountId: "", roleName: "", roleArn: "" }]);
+                    setEntitlementMappings((prev) => [...prev, { id: `new-${Date.now()}`, group: "", principalType: "GROUP", accountId: "", roleName: "", roleArn: "" }]);
                   }}>Add row</Button>
                 </SpaceBetween>
               }
@@ -519,14 +578,21 @@ export default function IamFederation() {
             )}
             {selectedRoles.length > 0 && (
               <Button onClick={() => {
-                const newMappings = selectedRoles.map((r) => ({
-                  id: `${r.account_id}#${r.role_name}#${Date.now()}`,
-                  group: "",
-                  accountId: r.account_id,
-                  roleName: r.role_name,
-                  roleArn: r.role_arn,
-                }));
-                setEntitlementMappings((prev) => [...prev, ...newMappings]);
+                // Only add roles that aren't already in the mapping
+                const existingKeys = new Set(entitlementMappings.map((m) => `${m.accountId}#${m.roleName}`));
+                const newMappings = selectedRoles
+                  .filter((r) => !existingKeys.has(`${r.account_id}#${r.role_name}`))
+                  .map((r) => ({
+                    id: `${r.account_id}#${r.role_name}#${Date.now()}`,
+                    group: "",
+                    principalType: "GROUP",
+                    accountId: r.account_id,
+                    roleName: r.role_name,
+                    roleArn: r.role_arn,
+                  }));
+                if (newMappings.length > 0) {
+                  setEntitlementMappings((prev) => [...prev, ...newMappings]);
+                }
               }}>
                 Auto-populate from selected roles ({selectedRoles.length})
               </Button>
@@ -543,9 +609,19 @@ export default function IamFederation() {
                     <Input
                       value={m.group}
                       onChange={({ detail }) => setEntitlementMappings((prev) => prev.map((x) => x.id === m.id ? { ...x, group: detail.value } : x))}
-                      placeholder="e.g. admins, engineers"
+                      placeholder="One group or user per row"
                     />
                   ), minWidth: 200 },
+                  { id: "type", header: "Type", cell: (m) => (
+                    <select
+                      value={m.principalType}
+                      onChange={(e) => setEntitlementMappings((prev) => prev.map((x) => x.id === m.id ? { ...x, principalType: e.target.value } : x))}
+                      style={{ padding: "4px 8px", borderRadius: "4px", border: "1px solid #aab7b8" }}
+                    >
+                      <option value="GROUP">GROUP</option>
+                      <option value="USER">USER</option>
+                    </select>
+                  ), minWidth: 100 },
                   { id: "account", header: "Account ID", cell: (m) => (
                     <Input
                       value={m.accountId}
@@ -594,17 +670,6 @@ export default function IamFederation() {
               ]}
             />
 
-            <FormField
-              label="AAM Application ARN"
-              description="Required for entitlement creation. If left empty, only trust policies will be updated (no entitlements created)."
-            >
-              <Input
-                value={aamAppArn}
-                onChange={({ detail }) => setAamAppArn(detail.value)}
-                placeholder="arn:aws:account-access:us-west-2:123456789012:application/app-id"
-              />
-            </FormField>
-
             {aamAppArn.trim() && (
               <FormField
                 label="Entitlement credentials"
@@ -620,9 +685,21 @@ export default function IamFederation() {
               </FormField>
             )}
 
-            {entitlementMappings.length > 0 && aamAppArn.trim() && (
+            {entitlementMappings.length > 0 && (
               <Alert type="info">
-                <b>{entitlementMappings.filter((m) => m.group.trim()).length}</b> entitlement(s) will be created after trust policy migration (from Step 3 mappings with a group/principal assigned).
+                {(() => {
+                  const withGroup = entitlementMappings.filter((m) => m.group.trim());
+                  const withoutGroup = entitlementMappings.filter((m) => !m.group.trim() && m.roleArn);
+                  const parts: string[] = [];
+                  if (withGroup.length) parts.push(`${withGroup.length} role(s) will have trust policy updated + entitlement created`);
+                  if (withoutGroup.length) parts.push(`${withoutGroup.length} role(s) will have trust policy updated only (no group/principal assigned)`);
+                  return parts.join(". ") + ".";
+                })()}
+              </Alert>
+            )}
+            {!aamAppArn.trim() && entitlementMappings.some((m) => m.group.trim()) && (
+              <Alert type="warning">
+                AAM Application ARN is not configured. Trust policies will be updated but no entitlements will be created. Fill in the AAM Configuration section above to enable entitlement creation.
               </Alert>
             )}
             {!aamAppArn.trim() && (
@@ -631,10 +708,14 @@ export default function IamFederation() {
               </Alert>
             )}
 
-            <Button variant="primary" loading={migrating} disabled={!selectedRoles.length} onClick={runMigration}>
-              {aamAppArn.trim() && entitlementMappings.filter((m) => m.group.trim()).length > 0
-                ? `Migrate ${selectedRoles.length} role(s) + create ${entitlementMappings.filter((m) => m.group.trim()).length} entitlement(s)`
-                : `Migrate ${selectedRoles.length} role(s)`}
+            <Button variant="primary" loading={migrating} disabled={!entitlementMappings.some((m) => m.roleArn)} onClick={runMigration}>
+              {(() => {
+                const allRoles = new Set(entitlementMappings.filter((m) => m.roleArn).map((m) => m.roleArn));
+                const withEntitlements = entitlementMappings.filter((m) => m.group.trim()).length;
+                if (aamAppArn.trim() && withEntitlements > 0)
+                  return `Migrate ${allRoles.size} role(s) + create ${withEntitlements} entitlement(s)`;
+                return `Migrate ${allRoles.size} role(s)`;
+              })()}
             </Button>
 
             {migrateResults.length > 0 && (
@@ -700,14 +781,29 @@ export default function IamFederation() {
           }
         >
           <SpaceBetween size="m">
-            <Button variant="primary" loading={iacLoading} disabled={!roles.length} onClick={generateIac}>
+            <Button variant="primary" loading={iacLoading} disabled={!roles.length && !entitlementMappings.some((m) => m.group.trim())} onClick={generateIac}>
               Generate templates
             </Button>
             {iacResult && (
-              <SpaceBetween direction="horizontal" size="xs">
-                <Button onClick={() => setIacModal("cloudformation")}>View CloudFormation</Button>
-                <Button onClick={() => setIacModal("terraform")}>View Terraform</Button>
-                <StatusIndicator type="success">{iacResult.cloudformation.path}</StatusIndicator>
+              <SpaceBetween size="s">
+                <Alert type="warning">
+                  <b>Do not deploy this CloudFormation template directly.</b> These roles already exist in your account.
+                  Deploying will fail with a resource conflict. Use this template to update your existing Infrastructure as Code
+                  (e.g., import into your existing CloudFormation stacks, Terraform state, or CI/CD pipeline).
+                  The entitlement resources can be deployed as a separate CloudFormation stack, but only after the role trust policies have been updated.
+                </Alert>
+                <SpaceBetween direction="horizontal" size="xs">
+                  {iacResult.accounts && iacResult.accounts.length > 1 ? (
+                    iacResult.accounts.map((acct) => (
+                      <Button key={acct} onClick={() => setIacModal(acct)}>Roles — Account {acct}</Button>
+                    ))
+                  ) : (
+                    <Button onClick={() => setIacModal("cloudformation")}>View Roles Template</Button>
+                  )}
+                  {iacResult.entitlements_template && (
+                    <Button onClick={() => setIacModal("__entitlements__")}>View Entitlements Template</Button>
+                  )}
+                </SpaceBetween>
               </SpaceBetween>
             )}
           </SpaceBetween>
@@ -719,13 +815,25 @@ export default function IamFederation() {
         visible={!!iacModal}
         size="max"
         onDismiss={() => setIacModal(null)}
-        header={iacModal === "cloudformation" ? "CloudFormation Template" : "Terraform Configuration"}
+        header={
+          iacModal === "__entitlements__" ? "CloudFormation — AAM Entitlements (Management Account)"
+          : iacModal === "terraform" ? "Terraform Configuration"
+          : iacModal === "cloudformation" ? "CloudFormation — Roles"
+          : iacModal ? `CloudFormation — Roles (Account ${iacModal})`
+          : "Template"
+        }
         footer={<Box float="right"><Button variant="primary" onClick={() => setIacModal(null)}>Close</Button></Box>}
       >
         {iacResult && iacModal && (
           <Box variant="code">
             <pre style={{ margin: 0, maxHeight: "70vh", overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-              {iacModal === "cloudformation" ? iacResult.cloudformation.content : iacResult.terraform.content}
+              {iacModal === "__entitlements__"
+                ? iacResult.entitlements_template?.content || ""
+                : iacModal === "terraform"
+                ? iacResult.terraform.content
+                : iacModal === "cloudformation"
+                ? iacResult.cloudformation.content
+                : iacResult.templates?.[iacModal]?.content || ""}
             </pre>
           </Box>
         )}

@@ -51,10 +51,14 @@ def _load_lib():
         module = importlib.util.module_from_spec(spec)
         sys.modules["iam_federation_lib"] = module
         spec.loader.exec_module(module)
+    # Also register as "lib" so AAM_role_evaluation.py's `from lib import ...` resolves.
+    sys.modules.setdefault("lib", module)
     return module
 
 
 def _load_eval():
+    # Ensure lib.py is loaded first — AAM_role_evaluation.py imports from it.
+    _load_lib()
     spec = importlib.util.spec_from_file_location("AAM_role_evaluation", _EVAL_PATH)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load evaluation script from {_EVAL_PATH}")
@@ -263,6 +267,8 @@ NEW_TRUST_STATEMENT = {
     ],
 }
 
+AAM_SERVICE_PRINCIPALS = {"account-access.amazonaws.com", "account-access-preview.amazonaws.com"}
+
 
 def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
     """
@@ -371,19 +377,34 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
             role_resp = iam_cl.get_role(RoleName=role_name)
             trust_doc = role_resp["Role"]["AssumeRolePolicyDocument"]
 
-            existing_sids = {s.get("Sid") for s in trust_doc.get("Statement", [])}
-            if NEW_TRUST_STATEMENT["Sid"] in existing_sids:
-                return {
-                    "role_arn": role_arn,
-                    "role_name": role_name,
-                    "status": "skipped",
-                    "reason": "Already has AAM trust statement",
-                    "timestamp": _now(),
-                }
+            # Check for AAM service principal (not just Sid)
+            for stmt in trust_doc.get("Statement", []):
+                svc = stmt.get("Principal", {}).get("Service", "")
+                if isinstance(svc, str):
+                    svc = [svc]
+                if any(s in AAM_SERVICE_PRINCIPALS for s in svc):
+                    return {
+                        "role_arn": role_arn,
+                        "role_name": role_name,
+                        "status": "skipped",
+                        "reason": "Already has AAM service principal in trust policy",
+                        "timestamp": _now(),
+                    }
+
+            # Build trust statement with confused-deputy conditions
+            trust_stmt = dict(NEW_TRUST_STATEMENT)
+            aam_src_acct = params.get("aam_source_account", "")
+            aam_app_arn = params.get("aam_application_arn", "")
+            if aam_src_acct or aam_app_arn:
+                trust_stmt["Condition"] = {"StringEquals": {}}
+                if aam_src_acct:
+                    trust_stmt["Condition"]["StringEquals"]["aws:SourceAccount"] = aam_src_acct
+                if aam_app_arn:
+                    trust_stmt["Condition"]["StringEquals"]["aws:SourceArn"] = aam_app_arn
 
             if mode == "ADD":
                 new_doc = dict(trust_doc)
-                new_doc["Statement"] = list(trust_doc["Statement"]) + [NEW_TRUST_STATEMENT]
+                new_doc["Statement"] = list(trust_doc["Statement"]) + [trust_stmt]
             else:
                 # REPLACE: remove statements trusting any of this account's selected IDPs
                 idps_to_remove = set(idp_filter.get(account_id, []))
@@ -396,7 +417,7 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
                         federated = [federated]
                     if not idps_to_remove.intersection(federated):
                         kept.append(stmt)
-                kept.append(NEW_TRUST_STATEMENT)
+                kept.append(trust_stmt)
                 new_doc = dict(trust_doc)
                 new_doc["Statement"] = kept
 
@@ -522,34 +543,11 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
                     _slog.record(exc, context="create_identitystore_client", resource=identity_store_id)
 
             def resolve_principal_id(name: str, principal_type: str) -> tuple[str, str | None]:
-                """Resolve a display name to an Identity Store UUID.
-
-                Returns (uuid, None) on success, or (original_name, error_msg) on failure.
-                """
+                """Resolve a display name to an Identity Store UUID via GetGroupId/GetUserId."""
                 if not id_store or not identity_store_id:
                     return name, "Identity Store not available — cannot resolve name to ID"
-
-                try:
-                    if principal_type == "USER":
-                        resp = id_store.list_users(
-                            IdentityStoreId=identity_store_id,
-                            Filters=[{"AttributePath": "UserName", "AttributeValue": name}],
-                        )
-                        users = resp.get("Users", [])
-                        if users:
-                            return users[0]["UserId"], None
-                        return name, f"User '{name}' not found in Identity Store"
-                    else:
-                        resp = id_store.list_groups(
-                            IdentityStoreId=identity_store_id,
-                            Filters=[{"AttributePath": "DisplayName", "AttributeValue": name}],
-                        )
-                        groups = resp.get("Groups", [])
-                        if groups:
-                            return groups[0]["GroupId"], None
-                        return name, f"Group '{name}' not found in Identity Store"
-                except Exception as exc:
-                    return name, f"Resolution failed: {exc}"
+                lib = _load_lib()
+                return lib.resolve_principal_id(id_store, identity_store_id, name, principal_type)
 
             for m in entitlement_mappings:
                 role_arn = m.get("matchedRoleArn", "")
@@ -669,59 +667,235 @@ def generate_iac(params: dict) -> dict:
     """
     Generate CloudFormation and Terraform templates from the cached discovery.
 
-    Uses the generate_iac_templates module's logic but writes to the cache
-    directory rather than the script's directory.
+    Produces per-account role templates and a separate entitlements template
+    for the AAM management account.
     """
+    import yaml as _yaml
+    from collections import defaultdict
+
     iac_mod = _load_iac()
 
-    # Build the roles dict from cache (same format as parse_csv returns)
     cached = cache.read_cache(config.IAM_FEDERATION_CACHE)
-    if not cached or not cached.get("data"):
-        raise ValueError("No discovery data cached. Run discovery first.")
-
-    roles_data = cached["data"].get("roles", [])
-    if not roles_data:
-        raise ValueError("No roles found in cached discovery.")
+    roles_data = []
+    if cached and cached.get("data"):
+        roles_data = cached["data"].get("roles", [])
 
     # Filter to only requested roles if specified
     requested_arns = params.get("role_arns")
-    if requested_arns:
-        roles_data = [r for r in roles_data if r.get("role_arn") in requested_arns]
+    # Also include roles from entitlement mappings
+    entitlement_role_arns = {m.get("matchedRoleArn") for m in (params.get("entitlement_mappings") or []) if m.get("matchedRoleArn")}
+    if requested_arns or entitlement_role_arns:
+        all_requested = set(requested_arns or []) | entitlement_role_arns
+        roles_data = [r for r in roles_data if r.get("role_arn") in all_requested]
 
-    # Build the dict format generate_iac_templates expects: {role_name: [policies]}
+    # Allow generation even without roles if entitlement mappings are provided
+    entitlement_mappings = params.get("entitlement_mappings") or []
+    aam_application_arn = params.get("aam_application_arn") or ""
+    aam_source_account = params.get("aam_source_account", "")
+    if not roles_data and not entitlement_mappings:
+        raise ValueError("No roles or entitlement mappings to generate templates for.")
+
+    # Group roles by account
+    roles_by_account: dict[str, list[dict]] = defaultdict(list)
+    for r in roles_data:
+        if r.get("error"):
+            continue
+        acct = r.get("account_id", "unknown")
+        roles_by_account[acct].append(r)
+
+    # Trust policy statement
+    trust_stmt: dict = {
+        "Sid": "AAMTrustPolicyStatement",
+        "Effect": "Allow",
+        "Principal": {"Service": "account-access.amazonaws.com"},
+        "Action": ["sts:AssumeRole", "sts:SetContext"],
+    }
+    if aam_source_account or aam_application_arn:
+        cond: dict = {"StringEquals": {}}
+        if aam_source_account:
+            cond["StringEquals"]["aws:SourceAccount"] = aam_source_account
+        if aam_application_arn:
+            cond["StringEquals"]["aws:SourceArn"] = aam_application_arn
+        trust_stmt["Condition"] = cond
+
+    def sanitize(name: str) -> str:
+        import re
+        return re.sub(r"[^a-zA-Z0-9]", "", name)
+
+    def build_roles_template(account_id: str, roles: list[dict]) -> str:
+        """Build a CloudFormation template for roles in one account."""
+        resources: dict = {}
+        for r in roles:
+            role_name = r["role_name"]
+            logical_id = sanitize(role_name) + "Role"
+            role_props: dict = {
+                "RoleName": role_name,
+                "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [trust_stmt]},
+                "Tags": [{"Key": "ManagedBy", "Value": "Truffle-IAMFed-Migration"}],
+            }
+
+            managed_arns: list = []
+            inline_policies: list = []
+            for p in r.get("policies", []):
+                if p["policy_type"] == "AWS Managed":
+                    managed_arns.append(f"arn:aws:iam::aws:policy/{p['policy_name']}")
+                elif p["policy_type"] == "Inline":
+                    inline_policies.append({
+                        "PolicyName": p["policy_name"],
+                        "PolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": ["*"], "Resource": "*"}]},
+                    })
+                else:
+                    # Customer managed
+                    managed_arns.append({"Fn::Sub": f"arn:aws:iam::${{AWS::AccountId}}:policy/{p['policy_name']}"})
+
+            if managed_arns:
+                role_props["ManagedPolicyArns"] = managed_arns
+            if inline_policies:
+                role_props["Policies"] = inline_policies
+
+            resources[logical_id] = {"Type": "AWS::IAM::Role", "Properties": role_props}
+
+        template = {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Description": f"IAM roles for account {account_id} migrated from SAML federation to AAM. Generated by Truffle.",
+            "Resources": resources,
+        }
+        return _yaml.safe_dump(template, sort_keys=False, default_flow_style=False)
+
+    def build_entitlements_template() -> str:
+        """Build a separate CloudFormation template for AAM entitlements (management account)."""
+        if not aam_application_arn or not entitlement_mappings:
+            return ""
+        resources: dict = {}
+        seen_ent: set = set()
+
+        for i, m in enumerate(entitlement_mappings):
+            group = m.get("group", "")
+            role_arn = m.get("matchedRoleArn", "")
+            principal_type = m.get("principal_type", "GROUP")
+            if not group or not role_arn:
+                continue
+            principal_id = resolved_principals.get(group, group)
+            id_key = "UserId" if principal_type.upper() == "USER" else "GroupId"
+            logical = sanitize(f"{group}{i}") + "Ent"
+            while logical in seen_ent:
+                logical += "x"
+            seen_ent.add(logical)
+            resources[logical] = {
+                "Type": "AWS::AccountAccess::Entitlement",
+                "Properties": {
+                    "ApplicationArn": aam_application_arn,
+                    "Entitlement": {
+                        "PrincipalRole": {
+                            "Principal": {"IdentityCenter": {id_key: principal_id}},
+                            "RoleArn": role_arn,
+                        },
+                    },
+                },
+            }
+
+        if not resources:
+            return ""
+
+        template = {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Description": "AAM entitlements for IAM Federation migration. Deploy in the AAM management account. Generated by Truffle.",
+            "Resources": resources,
+        }
+        return _yaml.safe_dump(template, sort_keys=False, default_flow_style=False)
+
+    # Resolve principals for entitlements
+    resolved_principals: dict = {}
+    if aam_application_arn and entitlement_mappings:
+        lib = _load_lib()
+        hub_session = build_session(None)
+        idc_region = params.get("aam_region") or config.IDC_REGION or "us-west-2"
+        identity_store_id = ""
+        try:
+            sso_admin = hub_session.client("sso-admin", region_name=idc_region)
+            for page in sso_admin.get_paginator("list_instances").paginate():
+                for inst in page.get("Instances", []):
+                    identity_store_id = inst.get("IdentityStoreId", "")
+                    break
+                if identity_store_id:
+                    break
+        except Exception:
+            pass
+        if identity_store_id:
+            try:
+                id_store = hub_session.client("identitystore", region_name=idc_region)
+                for m in entitlement_mappings:
+                    group = m.get("group", "")
+                    if group and group not in resolved_principals:
+                        principal_type = m.get("principal_type", "GROUP")
+                        resolved, err = lib.resolve_principal_id(id_store, identity_store_id, group, principal_type)
+                        if not err:
+                            resolved_principals[group] = resolved
+            except Exception:
+                pass
+
+    # Generate per-account role templates
+    os.makedirs(config.CACHE_DIR, exist_ok=True)
+    templates: dict[str, dict] = {}
+    accounts = sorted(roles_by_account.keys())
+
+    for account_id in accounts:
+        acct_roles = roles_by_account[account_id]
+        content = build_roles_template(account_id, acct_roles)
+        if len(accounts) == 1:
+            filename = "aam_roles_cloudformation.yaml"
+        else:
+            filename = f"aam_roles_{account_id}.yaml"
+        cfn_path = os.path.join(config.CACHE_DIR, filename)
+        with open(cfn_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        templates[account_id] = {"path": cfn_path, "content": content}
+
+    # Generate entitlements template (separate, for AAM management account)
+    entitlements_template_data: dict | None = None
+    ent_content = build_entitlements_template()
+    if ent_content:
+        ent_path = os.path.join(config.CACHE_DIR, "aam_entitlements_cloudformation.yaml")
+        with open(ent_path, "w", encoding="utf-8") as f:
+            f.write(ent_content)
+        entitlements_template_data = {"path": ent_path, "content": ent_content}
+
+    # Also generate Terraform (single file, all roles — kept for backward compat)
     roles_dict: dict[str, list[dict]] = {}
     for r in roles_data:
         if r.get("error"):
             continue
         role_name = r["role_name"]
-        policies = []
-        for p in r.get("policies", []):
-            policies.append({
-                "policy_name": p["policy_name"],
-                "policy_type": p["policy_type"],
-            })
+        policies = [{"policy_name": p["policy_name"], "policy_type": p["policy_type"]} for p in r.get("policies", [])]
         roles_dict[role_name] = policies
 
-    if not roles_dict:
-        raise ValueError("No valid roles to generate templates for.")
-
-    # Generate to cache directory
-    cfn_path = os.path.join(config.CACHE_DIR, "aam_roles_cloudformation.yaml")
     tf_path = os.path.join(config.CACHE_DIR, "aam_roles_terraform.tf")
+    if roles_dict:
+        iac_mod.generate_terraform(
+            roles_dict, tf_path,
+            aam_source_account=aam_source_account,
+            aam_application_arn=aam_application_arn,
+        )
+    else:
+        with open(tf_path, "w", encoding="utf-8") as f:
+            f.write("# AAM entitlements generated by Truffle IAM Federation tool.\n")
 
-    iac_mod.generate_cloudformation(roles_dict, cfn_path)
-    iac_mod.generate_terraform(roles_dict, tf_path)
-
-    # Read the generated content to return to the UI
-    with open(cfn_path, "r", encoding="utf-8") as f:
-        cfn_content = f.read()
     with open(tf_path, "r", encoding="utf-8") as f:
         tf_content = f.read()
 
+    # Build combined cloudformation content for backward compat (first account or all)
+    cfn_content = ""
+    if templates:
+        first_key = next(iter(templates))
+        cfn_content = templates[first_key]["content"]
+
     return {
         "roles_count": len(roles_dict),
+        "templates": templates,
+        "entitlements_template": entitlements_template_data,
+        "accounts": accounts,
         "cloudformation": {
-            "path": cfn_path,
+            "path": next(iter(templates.values()))["path"] if templates else "",
             "content": cfn_content,
         },
         "terraform": {

@@ -213,6 +213,17 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
         except Exception as exc:
             _slog.record(exc, context="list_customer_managed_policy_references_in_permission_set", resource=ps_arn)
 
+        # Permission boundary
+        permission_boundary = None
+        try:
+            pb_resp = sso_admin.get_permissions_boundary_for_permission_set(
+                InstanceArn=instance_arn, PermissionSetArn=ps_arn
+            )
+            if pb_resp.get("PermissionsBoundary"):
+                permission_boundary = pb_resp["PermissionsBoundary"]
+        except Exception:
+            pass  # ResourceNotFoundException is normal (no boundary set)
+
         with _describe_lock:
             _describe_done[0] += 1
             if _describe_done[0] % 5 == 0 or _describe_done[0] == total_ps:
@@ -227,6 +238,7 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
             "inline_policy": inline_policy,
             "aws_managed_policies": aws_managed,
             "customer_managed_policy_references": cmp_refs,
+            "permission_boundary": permission_boundary,
         }
 
     workers = int(params.get("workers", MAX_WORKERS))
@@ -345,23 +357,55 @@ def run_inventory(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
 
 # ─── Generate IaC ────────────────────────────────────────────────────────────
 
+def _iso8601_to_seconds(duration: str) -> int:
+    """Convert an ISO 8601 duration like PT1H, PT4H30M, PT12H to seconds."""
+    import re as _re
+    m = _re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", duration, _re.IGNORECASE)
+    if not m:
+        return 0
+    hours = int(m.group(1) or 0)
+    minutes = int(m.group(2) or 0)
+    seconds = int(m.group(3) or 0)
+    return hours * 3600 + minutes * 60 + seconds
+
+
 def generate_iac(params: dict) -> dict:
     """
-    Generate CloudFormation templates from cached inventory.
-
-    For multi-account scenarios (assignments span multiple accounts), produces
-    one template per account. For single-account, produces a single template.
-    Each template contains only the roles and entitlements for that account.
+    Generate CloudFormation templates from cached inventory or provided role mappings.
     """
     import re
+    import yaml as _yaml
 
     cached = cache.read_cache(config.IDC_CACHE)
-    if not cached or not cached.get("data"):
-        raise ValueError("No inventory cached. Run discovery first.")
-
-    data = cached["data"]
-    permission_sets = data.get("permission_sets", [])
-    assignments = data.get("assignments", [])
+    if cached and cached.get("data"):
+        data = cached["data"]
+        permission_sets = data.get("permission_sets", [])
+        assignments = data.get("assignments", [])
+    else:
+        # No cache — build from role_mappings in the request payload
+        role_mappings_input = params.get("role_mappings") or []
+        if not role_mappings_input:
+            raise ValueError("No inventory cached and no role_mappings provided. Run discovery first or upload a migration plan.")
+        permission_sets = []
+        seen_ps: set = set()
+        for rm in role_mappings_input:
+            ps_name = rm.get("psName", "")
+            if ps_name and ps_name not in seen_ps:
+                seen_ps.add(ps_name)
+                permission_sets.append({
+                    "arn": rm.get("psArn", f"unknown/{ps_name}"),
+                    "name": ps_name,
+                    "description": "",
+                    "session_duration": "PT1H",
+                    "inline_policy": None,
+                    "aws_managed_policies": [],
+                    "customer_managed_policy_references": [],
+                    "permission_boundary": None,
+                })
+        assignments = [{"permission_set_arn": rm.get("psArn", ""), "account_id": rm.get("accountId", ""),
+                        "principal_type": "GROUP", "principal_id": rm.get("principal", ""),
+                        "principal_display_name": rm.get("principal", ""),
+                        "permission_set_name": rm.get("psName", "")} for rm in role_mappings_input if rm.get("principal")]
 
     if not permission_sets:
         raise ValueError("No permission sets in cached inventory.")
@@ -369,6 +413,7 @@ def generate_iac(params: dict) -> dict:
     role_path = params.get("role_path") or "/aam/"
     role_name_template = params.get("role_name_template") or "AAM-{name}"
     aam_application_arn = params.get("aam_application_arn")
+    aam_source_account = params.get("aam_source_account") or ""
 
     # Filter to selected permission sets if specified
     selected_ps_arns = params.get("selected_permission_sets")
@@ -392,29 +437,50 @@ def generate_iac(params: dict) -> dict:
         accounts = [data.get("hub_account_id", "unknown")]
 
     role_map: dict = {}  # ps_arn -> role_name
+    # Use explicit role mappings from the frontend if provided (user-edited names),
+    # otherwise fall back to the template pattern.
+    role_mappings_input = params.get("role_mappings") or []
+    role_map_from_user = {}
+    for rm in role_mappings_input:
+        ps_arn = rm.get("psArn", "")
+        rn = rm.get("roleName", "")
+        if ps_arn and rn:
+            role_map_from_user[ps_arn] = rn
+        elif rm.get("psName") and rn:
+            # Match by name if ARN not available
+            for ps in permission_sets:
+                if ps["name"] == rm["psName"]:
+                    role_map_from_user[ps["arn"]] = rn
+
     for ps in permission_sets:
-        role_name = role_name_template.replace("{name}", ps["name"])
-        role_map[ps["arn"]] = role_name
+        if ps["arn"] in role_map_from_user:
+            role_map[ps["arn"]] = role_map_from_user[ps["arn"]]
+        else:
+            role_map[ps["arn"]] = role_name_template.replace("{name}", ps["name"])
 
     def build_template_for_account(account_id: str, account_assignments: list) -> str:
-        """Build a CloudFormation YAML string for one account."""
-        # Permission sets relevant to this account
+        """Build a CloudFormation YAML string for one account's roles (no entitlements)."""
+        import yaml as _yaml
+
         ps_arns_for_account = {a["permission_set_arn"] for a in account_assignments}
         account_ps = [ps for ps in permission_sets if ps["arn"] in ps_arns_for_account]
 
-        lines = []
-        lines.append("AWSTemplateFormatVersion: '2010-09-09'")
-        lines.append("Description: >-")
-        lines.append(f"  IAM roles for account {account_id} migrated from IdC permission sets to AAM.")
-        lines.append("  Generated by Truffle IdC-to-AAM tool.")
-        lines.append("")
-        lines.append("Parameters:")
-        lines.append("  TrustServicePrincipal:")
-        lines.append("    Type: String")
-        lines.append("    Default: account-access.amazonaws.com")
-        lines.append("    Description: The service principal for the new trust relationship.")
-        lines.append("")
-        lines.append("Resources:")
+        # Trust statement with conditions
+        trust_stmt: dict = {
+            "Sid": "AAMTrustPolicyStatement",
+            "Effect": "Allow",
+            "Principal": {"Service": "account-access.amazonaws.com"},
+            "Action": ["sts:AssumeRole", "sts:SetContext"],
+        }
+        if aam_source_account or aam_application_arn:
+            cond: dict = {"StringEquals": {}}
+            if aam_source_account:
+                cond["StringEquals"]["aws:SourceAccount"] = aam_source_account
+            if aam_application_arn:
+                cond["StringEquals"]["aws:SourceArn"] = aam_application_arn
+            trust_stmt["Condition"] = cond
+
+        resources: dict = {}
 
         for ps in account_ps:
             role_name = role_map.get(ps["arn"], "")
@@ -422,71 +488,102 @@ def generate_iac(params: dict) -> dict:
                 continue
             logical_id = sanitize(ps["name"]) + "Role"
 
-            lines.append("")
-            lines.append(f"  {logical_id}:")
-            lines.append("    Type: AWS::IAM::Role")
-            lines.append("    Properties:")
-            lines.append(f"      RoleName: {role_name}")
-            lines.append(f"      Path: {role_path}")
-            lines.append("      AssumeRolePolicyDocument:")
-            lines.append("        Version: '2012-10-17'")
-            lines.append("        Statement:")
-            lines.append("          - Sid: AAMTrustPolicyStatement")
-            lines.append("            Effect: Allow")
-            lines.append("            Principal:")
-            lines.append("              Service: !Ref TrustServicePrincipal")
-            lines.append("            Action:")
-            lines.append("              - sts:AssumeRole")
-            lines.append("              - sts:SetContext")
+            role_props: dict = {
+                "RoleName": role_name,
+                "Path": role_path,
+                "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [trust_stmt]},
+                "Tags": [
+                    {"Key": "ManagedBy", "Value": "Truffle-IdC-Migration"},
+                    {"Key": "SourcePermissionSet", "Value": ps["name"]},
+                ],
+            }
 
-            managed = ps.get("aws_managed_policies", [])
-            if managed:
-                lines.append("      ManagedPolicyArns:")
-                for p in managed:
-                    lines.append(f"        - {p['arn']}")
+            # MaxSessionDuration from the permission set's session duration (ISO 8601 → seconds)
+            session_dur = ps.get("session_duration", "")
+            if session_dur:
+                secs = _iso8601_to_seconds(session_dur)
+                if secs and secs != 3600:  # 3600 is the IAM default, skip if unchanged
+                    role_props["MaxSessionDuration"] = secs
 
-            cmp_refs = ps.get("customer_managed_policy_references", [])
-            if cmp_refs:
-                if not managed:
-                    lines.append("      ManagedPolicyArns:")
-                for ref in cmp_refs:
-                    path = ref.get("path", "/")
-                    name = ref["name"]
-                    lines.append(f"        - !Sub arn:aws:iam::${{AWS::AccountId}}:policy{path}{name}")
+            # Managed policies
+            managed_arns = [p["arn"] for p in ps.get("aws_managed_policies", [])]
+            for ref in ps.get("customer_managed_policy_references", []):
+                path = ref.get("path", "/")
+                managed_arns.append({"Fn::Sub": f"arn:aws:iam::${{AWS::AccountId}}:policy{path}{ref['name']}"})
+            if managed_arns:
+                role_props["ManagedPolicyArns"] = managed_arns
 
+            # Inline policy
             if ps.get("inline_policy"):
-                lines.append("      Policies:")
-                lines.append(f"        - PolicyName: {role_name}-inline")
-                lines.append("          PolicyDocument:")
-                policy_json = json.dumps(ps["inline_policy"], indent=12)
-                for j, pline in enumerate(policy_json.split("\n")):
-                    lines.append(f"            {pline}")
+                role_props["Policies"] = [{
+                    "PolicyName": f"{role_name}-inline",
+                    "PolicyDocument": ps["inline_policy"],
+                }]
 
-            lines.append("      Tags:")
-            lines.append("        - Key: ManagedBy")
-            lines.append("          Value: Truffle-IdC-Migration")
-            lines.append(f"        - Key: SourcePermissionSet")
-            lines.append(f"          Value: {ps['name']}")
+            # Permission boundary
+            if ps.get("permission_boundary"):
+                pb = ps["permission_boundary"]
+                if pb.get("ManagedPolicyArn"):
+                    role_props["PermissionsBoundary"] = pb["ManagedPolicyArn"]
+                elif pb.get("CustomerManagedPolicyReference"):
+                    ref = pb["CustomerManagedPolicyReference"]
+                    pb_path = ref.get("Path", "/")
+                    pb_name = ref.get("Name", "")
+                    role_props["PermissionsBoundary"] = {"Fn::Sub": f"arn:aws:iam::${{AWS::AccountId}}:policy{pb_path}{pb_name}"}
 
-        if aam_application_arn and account_assignments:
-            lines.append("")
-            lines.append("  # ─── AAM Entitlements ─────────────────────────────────────────")
-            for i, a in enumerate(account_assignments):
-                ps_arn = a["permission_set_arn"]
-                rn = role_map.get(ps_arn, "")
-                if not rn:
-                    continue
-                logical = sanitize(f"{a['principal_display_name']}{a['permission_set_name']}")[:50]
-                lines.append("")
-                lines.append(f"  Entitlement{logical}{i}:")
-                lines.append("    Type: AWS::AccountAccess::Entitlement")
-                lines.append("    Properties:")
-                lines.append(f"      ApplicationArn: {aam_application_arn}")
-                lines.append(f"      RoleArn: !GetAtt {sanitize(a['permission_set_name'])}Role.Arn")
-                lines.append(f"      PrincipalType: {a['principal_type']}")
-                lines.append(f"      PrincipalId: {a['principal_id']}")
+            resources[logical_id] = {"Type": "AWS::IAM::Role", "Properties": role_props}
 
-        return "\n".join(lines) + "\n"
+        template = {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Description": f"IAM roles for account {account_id} migrated from IdC to AAM. Generated by Truffle.",
+            "Resources": resources,
+        }
+
+        return _yaml.safe_dump(template, sort_keys=False, default_flow_style=False)
+
+    def build_entitlements_template(all_assignments: list) -> str:
+        """Build a separate CloudFormation template for AAM entitlements (deployed in the management account)."""
+        import yaml as _yaml
+
+        resources: dict = {}
+        seen_ent: set = set()
+
+        for i, a in enumerate(all_assignments):
+            ps_arn = a["permission_set_arn"]
+            rn = role_map.get(ps_arn, "")
+            if not rn:
+                continue
+            account_id = a.get("account_id", "")
+            logical = sanitize(f"{a['principal_display_name']}{account_id}{i}")[:50] + "Ent"
+            while logical in seen_ent:
+                logical += "x"
+            seen_ent.add(logical)
+            id_key = "UserId" if a["principal_type"] == "USER" else "GroupId"
+            # Construct the full role ARN since the role lives in a different account/template
+            role_arn = f"arn:aws:iam::{account_id}:role{role_path}{rn}"
+            resources[logical] = {
+                "Type": "AWS::AccountAccess::Entitlement",
+                "Properties": {
+                    "ApplicationArn": aam_application_arn,
+                    "Entitlement": {
+                        "PrincipalRole": {
+                            "Principal": {"IdentityCenter": {id_key: a["principal_id"]}},
+                            "RoleArn": role_arn,
+                        },
+                    },
+                },
+            }
+
+        if not resources:
+            return ""
+
+        template = {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Description": "AAM entitlements for IdC migration. Deploy in the AAM management account. Generated by Truffle.",
+            "Resources": resources,
+        }
+
+        return _yaml.safe_dump(template, sort_keys=False, default_flow_style=False)
 
     # Generate templates
     os.makedirs(config.CACHE_DIR, exist_ok=True)
@@ -504,10 +601,22 @@ def generate_iac(params: dict) -> dict:
             f.write(content)
         templates[account_id] = {"path": cfn_path, "content": content}
 
+    # Generate a separate entitlements template for the AAM management account
+    entitlements_template: dict | None = None
+    if aam_application_arn and assignments:
+        ent_content = build_entitlements_template(assignments)
+        if ent_content:
+            ent_filename = "idc_entitlements_cloudformation.yaml"
+            ent_path = os.path.join(config.CACHE_DIR, ent_filename)
+            with open(ent_path, "w", encoding="utf-8") as f:
+                f.write(ent_content)
+            entitlements_template = {"path": ent_path, "content": ent_content}
+
     return {
         "roles_count": len(permission_sets),
         "entitlements_count": len(assignments) if aam_application_arn else 0,
         "templates": templates,
+        "entitlements_template": entitlements_template,
         "accounts": accounts,
         "role_map": role_map,
     }
@@ -532,12 +641,35 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
         dict with per-role results and summary.
     """
     cached = cache.read_cache(config.IDC_CACHE)
-    if not cached or not cached.get("data"):
-        raise ValueError("No inventory cached. Run discovery first.")
-
-    data = cached["data"]
-    permission_sets = data.get("permission_sets", [])
-    assignments = data.get("assignments", [])
+    if cached and cached.get("data"):
+        data = cached["data"]
+        permission_sets = data.get("permission_sets", [])
+        assignments = data.get("assignments", [])
+    else:
+        # No cache — build from role_mappings in the request payload
+        role_mappings_input = params.get("role_mappings") or []
+        if not role_mappings_input:
+            raise ValueError("No inventory cached and no role_mappings provided. Run discovery first or upload a migration plan.")
+        permission_sets = []
+        seen_ps: set = set()
+        for rm in role_mappings_input:
+            ps_name = rm.get("psName", "")
+            if ps_name and ps_name not in seen_ps:
+                seen_ps.add(ps_name)
+                permission_sets.append({
+                    "arn": rm.get("psArn", f"unknown/{ps_name}"),
+                    "name": ps_name,
+                    "description": "",
+                    "session_duration": "PT1H",
+                    "inline_policy": None,
+                    "aws_managed_policies": [],
+                    "customer_managed_policy_references": [],
+                    "permission_boundary": None,
+                })
+        assignments = [{"permission_set_arn": rm.get("psArn", ""), "account_id": rm.get("accountId", ""),
+                        "principal_type": "GROUP", "principal_id": rm.get("principal", ""),
+                        "principal_display_name": rm.get("principal", ""),
+                        "permission_set_name": rm.get("psName", "")} for rm in role_mappings_input if rm.get("principal")]
 
     role_path = params.get("role_path") or "/aam/"
     role_name_template = params.get("role_name_template") or "AAM-{name}"
@@ -617,15 +749,22 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
     results: list[dict] = []
     workers = int(params.get("workers", MAX_WORKERS))
 
-    trust_policy = json.dumps({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Sid": "AAMTrustPolicyStatement",
-            "Effect": "Allow",
-            "Principal": {"Service": "account-access.amazonaws.com"},
-            "Action": ["sts:AssumeRole", "sts:SetContext"],
-        }],
-    })
+    # Build the trust policy with confused-deputy conditions
+    aam_source_account = params.get("aam_source_account") or ""
+    aam_app_arn = params.get("aam_application_arn") or ""
+    trust_stmt: dict = {
+        "Sid": "AAMTrustPolicyStatement",
+        "Effect": "Allow",
+        "Principal": {"Service": "account-access.amazonaws.com"},
+        "Action": ["sts:AssumeRole", "sts:SetContext"],
+    }
+    if aam_source_account or aam_app_arn:
+        trust_stmt["Condition"] = {"StringEquals": {}}
+        if aam_source_account:
+            trust_stmt["Condition"]["StringEquals"]["aws:SourceAccount"] = aam_source_account
+        if aam_app_arn:
+            trust_stmt["Condition"]["StringEquals"]["aws:SourceArn"] = aam_app_arn
+    trust_policy = json.dumps({"Version": "2012-10-17", "Statement": [trust_stmt]})
 
     def emit(msg: str):
         if on_progress:
@@ -691,7 +830,7 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
                     raise
 
             # Create the role
-            iam.create_role(
+            create_kwargs = dict(
                 RoleName=role_name,
                 Path=role_path,
                 AssumeRolePolicyDocument=trust_policy,
@@ -699,6 +838,12 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
                 Tags=[{"Key": "ManagedBy", "Value": "Truffle-IdC-Migration"},
                       {"Key": "SourcePermissionSet", "Value": ps["name"]}],
             )
+            session_dur = ps.get("session_duration", "")
+            if session_dur:
+                secs = _iso8601_to_seconds(session_dur)
+                if secs and secs != 3600:
+                    create_kwargs["MaxSessionDuration"] = secs
+            iam.create_role(**create_kwargs)
 
             # Attach AWS managed policies
             for p in ps.get("aws_managed_policies", []):
@@ -936,3 +1081,172 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
 def get_state() -> Optional[dict]:
     """Return cached inventory (permission sets + assignments), or None."""
     return cache.read_cache(config.IDC_CACHE)
+
+
+# ─── Targeted discovery (resolve migration plan) ─────────────────────────────
+
+def resolve_plan(params: dict) -> dict:
+    """
+    Targeted discovery from a migration plan upload.
+
+    For each permission set referenced in the plan:
+      - DescribePermissionSet + fetch policies (managed, inline, CMP, boundary)
+    For each principal name:
+      - Resolve to Identity Store UUID via GetGroupId/GetUserId
+
+    Populates the cache and returns enriched data ready for the UI.
+
+    params:
+      - role_mappings: list of {psName, psArn (optional), roleName, principal, accountId, principal_type}
+      - region: IdC region
+      - auth fields (for session resolution)
+    """
+    from botocore.config import Config as BotoConfig
+
+    role_mappings_input = params.get("role_mappings") or []
+    if not role_mappings_input:
+        raise ValueError("role_mappings is required")
+
+    region = params.get("region") or "us-east-1"
+    session = _resolve_hub_session(params)
+
+    boto_cfg = BotoConfig(retries={"mode": "adaptive", "max_attempts": 5}, max_pool_connections=10)
+    sso_admin = session.client("sso-admin", region_name=region, config=boto_cfg)
+    identity_store = session.client("identitystore", region_name=region, config=boto_cfg)
+
+    # Discover IdC instance
+    instances = []
+    for page in sso_admin.get_paginator("list_instances").paginate():
+        instances.extend(page.get("Instances", []))
+    if not instances:
+        raise RuntimeError("No IAM Identity Center instance found")
+
+    instance_arn = instances[0]["InstanceArn"]
+    identity_store_id = instances[0]["IdentityStoreId"]
+
+    # Collect unique permission set references from the plan
+    ps_names = {rm.get("psName", "") for rm in role_mappings_input if rm.get("psName")}
+    ps_arns_input = {rm.get("psArn", "") for rm in role_mappings_input if rm.get("psArn") and rm["psArn"].startswith("arn:")}
+
+    # If we have ARNs, use them directly. Otherwise look up by name.
+    ps_arns_to_describe: list[str] = list(ps_arns_input)
+
+    if ps_names and not ps_arns_to_describe:
+        # Need to list all PS to find ARNs by name
+        all_ps_arns = []
+        for page in sso_admin.get_paginator("list_permission_sets").paginate(InstanceArn=instance_arn):
+            all_ps_arns.extend(page.get("PermissionSets", []))
+        # Describe each to match by name
+        for arn in all_ps_arns:
+            try:
+                resp = sso_admin.describe_permission_set(InstanceArn=instance_arn, PermissionSetArn=arn)
+                name = resp["PermissionSet"].get("Name", "")
+                if name in ps_names:
+                    ps_arns_to_describe.append(arn)
+            except Exception:
+                pass
+
+    # Fetch policies for each permission set. Also call DescribePermissionSet to
+    # get the description and session duration (needed for the UI table and for
+    # setting MaxSessionDuration on the created role).
+    _idc_lib = _load_idc_lib()
+    permission_sets = []
+    for ps_arn in ps_arns_to_describe:
+        # Find the name from the role_mappings input
+        ps_name = ""
+        for rm in role_mappings_input:
+            if rm.get("psArn") == ps_arn:
+                ps_name = rm.get("psName", "")
+                break
+        ps_data = _idc_lib.fetch_permission_set_policies(sso_admin, instance_arn, ps_arn, ps_name)
+        # Enrich with description + session_duration from DescribePermissionSet
+        try:
+            desc_resp = sso_admin.describe_permission_set(
+                InstanceArn=instance_arn, PermissionSetArn=ps_arn
+            )
+            ps_meta = desc_resp.get("PermissionSet", {})
+            ps_data["description"] = ps_meta.get("Description", "")
+            ps_data["session_duration"] = ps_meta.get("SessionDuration", "PT1H")
+            if not ps_data["name"] or ps_data["name"] == ps_arn.rsplit("/", 1)[-1]:
+                ps_data["name"] = ps_meta.get("Name", ps_data["name"])
+        except Exception:
+            pass
+        permission_sets.append(ps_data)
+
+    # Build a name→ARN lookup
+    ps_name_to_arn = {ps["name"]: ps["arn"] for ps in permission_sets}
+
+    # Resolve principal names to UUIDs
+    resolved_mappings = []
+    for rm in role_mappings_input:
+        principal_name = rm.get("principal", "")
+        principal_type = rm.get("principal_type") or rm.get("principalType") or "GROUP"
+        ps_name = rm.get("psName", "")
+        ps_arn = rm.get("psArn", "") or ps_name_to_arn.get(ps_name, "")
+
+        # Resolve principal to UUID
+        principal_id = principal_name
+        resolution_error = None
+        if principal_name:
+            try:
+                if principal_type.upper() == "USER":
+                    resp = identity_store.get_user_id(
+                        IdentityStoreId=identity_store_id,
+                        AlternateIdentifier={"UniqueAttribute": {"AttributePath": "userName", "AttributeValue": principal_name}},
+                    )
+                    principal_id = resp["UserId"]
+                else:
+                    resp = identity_store.get_group_id(
+                        IdentityStoreId=identity_store_id,
+                        AlternateIdentifier={"UniqueAttribute": {"AttributePath": "displayName", "AttributeValue": principal_name}},
+                    )
+                    principal_id = resp["GroupId"]
+            except Exception as exc:
+                resolution_error = str(exc)
+                # Keep the display name as fallback
+
+        resolved_mappings.append({
+            "key": f"{ps_arn}#{rm.get('accountId', '')}#{principal_id}",
+            "psArn": ps_arn,
+            "psName": ps_name,
+            "roleName": rm.get("roleName", f"AAM-{ps_name}"),
+            "principal": principal_name,
+            "principal_id": principal_id,
+            "accountId": rm.get("accountId", ""),
+            "principal_type": principal_type,
+            "resolution_error": resolution_error,
+        })
+
+    # Build assignments from the resolved mappings (for cache + UI)
+    assignments = []
+    for rm in resolved_mappings:
+        if rm["principal_id"] and rm["psArn"] and rm["accountId"]:
+            assignments.append({
+                "permission_set_arn": rm["psArn"],
+                "permission_set_name": rm["psName"],
+                "account_id": rm["accountId"],
+                "principal_type": rm.get("principal_type", "GROUP"),
+                "principal_id": rm["principal_id"],
+                "principal_display_name": rm["principal"],
+            })
+
+    # Write to cache so generate_iac/apply_roles can use it
+    account_id = session.client("sts").get_caller_identity()["Account"]
+    payload = {
+        "instance_arn": instance_arn,
+        "identity_store_id": identity_store_id,
+        "hub_account_id": account_id,
+        "account_scope": "plan-upload",
+        "permission_sets": permission_sets,
+        "assignments": assignments,
+        "total_permission_sets": len(permission_sets),
+        "total_assignments": len(assignments),
+    }
+    cache.write_cache(config.IDC_CACHE, payload)
+
+    return {
+        "permission_sets": permission_sets,
+        "assignments": assignments,
+        "resolved_mappings": resolved_mappings,
+        "errors": [rm for rm in resolved_mappings if rm.get("resolution_error")],
+    }

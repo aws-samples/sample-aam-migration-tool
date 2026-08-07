@@ -19,7 +19,7 @@ import TextFilter from "@cloudscape-design/components/text-filter";
 import { api, type CacheWrapper, type JobProgress } from "../api/client";
 import { INITIAL_AUTH_STATE, parseAccountIds, type AuthState } from "../components/AuthMethodSelect";
 import { ProfileMultiSelect } from "../components/ProfileSelect";
-import { exportToCsv } from "../utils/csv";
+import { exportToCsv, parseCsvLine } from "../utils/csv";
 import { formatAbsolute, formatAge } from "../utils/time";
 import { useTablePagination } from "../utils/useTablePagination";
 
@@ -31,6 +31,7 @@ interface PermissionSet {
   inline_policy: unknown | null;
   aws_managed_policies: { name: string; arn: string }[];
   customer_managed_policy_references: { name: string; path: string }[];
+  permission_boundary?: { ManagedPolicyArn?: string; CustomerManagedPolicyReference?: { Name: string; Path: string } } | null;
 }
 
 interface Assignment {
@@ -74,9 +75,11 @@ export default function Idc() {
   // IaC generation
   const [creationMode, setCreationMode] = useState<"generate-iac" | "apply">("generate-iac");
   const [iacLoading, setIacLoading] = useState(false);
-  const [iacResult, setIacResult] = useState<{ templates: Record<string, { content: string; path: string }>; accounts: string[]; roles_count: number; entitlements_count: number } | null>(null);
+  const [iacResult, setIacResult] = useState<{ templates: Record<string, { content: string; path: string }>; entitlements_template?: { content: string; path: string } | null; accounts: string[]; roles_count: number; entitlements_count: number } | null>(null);
   const [iacModalAccount, setIacModalAccount] = useState<string | null>(null);
+  // AAM Configuration (used for trust policy conditions + entitlement creation)
   const [aamAppArn, setAamAppArn] = useState("");
+  const [aamSourceAccount, setAamSourceAccount] = useState("");
 
   // Apply mode
   const [applying, setApplying] = useState(false);
@@ -87,8 +90,9 @@ export default function Idc() {
   const [entitlementResults, setEntitlementResults] = useState<{ principal: string; principal_type: string; account_id: string; role_arn: string; status: string; error?: string }[]>([]);
 
   // Migration plan (editable role name mapping)
-  const [roleMappings, setRoleMappings] = useState<{ key: string; psArn: string; psName: string; roleName: string; principal: string; accountId: string }[]>([]);
+  const [roleMappings, setRoleMappings] = useState<{ key: string; psArn: string; psName: string; roleName: string; principal: string; accountId: string; principalType: string }[]>([]);
   const [rolePath, setRolePath] = useState("/aam/");
+  const [resolving, setResolving] = useState(false);
 
   // Load cached state on mount
   useEffect(() => {
@@ -104,6 +108,7 @@ export default function Idc() {
           roleName: `AAM-${a.permission_set_name}`,
           principal: a.principal_display_name,
           accountId: a.account_id,
+          principalType: a.principal_type,
         })));
       }
     });
@@ -166,8 +171,9 @@ export default function Idc() {
       mappings = mappings.filter((m) => selectedArns.has(m.psArn));
     }
     if (selectedAssignments.length > 0) {
-      const selectedKeys = new Set(selectedAssignments.map((a) => `${a.permission_set_arn}#${a.account_id}#${a.principal_id}`));
-      mappings = mappings.filter((m) => selectedKeys.has(m.key));
+      // Match on the full assignment key: permission_set_arn + account_id + principal
+      const selectedKeys = new Set(selectedAssignments.map((a) => `${a.permission_set_arn}#${a.account_id}#${a.principal_display_name}`));
+      mappings = mappings.filter((m) => selectedKeys.has(`${m.psArn}#${m.accountId}#${m.principal}`));
     }
     return mappings;
   })();
@@ -222,6 +228,7 @@ export default function Idc() {
           roleName: `AAM-${a.permission_set_name}`,
           principal: a.principal_display_name,
           accountId: a.account_id,
+          principalType: a.principal_type,
         })));
       } else if (job.status === "error") {
         stopPolling(); localStorage.removeItem(DISCOVER_JOB_KEY);
@@ -269,6 +276,11 @@ export default function Idc() {
       }
       if (aamAppArn.trim()) {
         payload.aam_application_arn = aamAppArn.trim();
+        payload.aam_source_account = aamSourceAccount.trim();
+      }
+      // Pass role mappings so backend can work without cached inventory
+      if (roleMappings.length) {
+        payload.role_mappings = roleMappings;
       }
       const res = await api.idcGenerateIac(payload);
       setIacResult(res);
@@ -334,6 +346,11 @@ export default function Idc() {
       }
       if (aamAppArn.trim()) {
         payload.aam_application_arn = aamAppArn.trim();
+        payload.aam_source_account = aamSourceAccount.trim();
+      }
+      // Pass role mappings so backend can work without cached inventory
+      if (roleMappings.length) {
+        payload.role_mappings = roleMappings;
       }
       const { job_id } = await api.idcApply(payload);
       stopApplyPolling();
@@ -372,7 +389,7 @@ export default function Idc() {
       { key: "principal_display_name", header: "Principal" },
       { key: "principal_type", header: "Type" },
       { key: "permission_set_name", header: "Permission Set" },
-      { key: "account_id", header: "Account" },
+      { key: "account_id", header: "Account", text: true },
       { key: "principal_id", header: "Principal ID" },
     ]);
   }
@@ -446,6 +463,44 @@ export default function Idc() {
           </SpaceBetween>
         </Container>
 
+        {/* AAM Configuration */}
+        <Container
+          header={
+            <Header variant="h2" description="Configure the AAM application details. These are used to build the trust policy conditions (confused-deputy protection) and to create entitlements.">
+              AAM Configuration
+            </Header>
+          }
+        >
+          <SpaceBetween size="m">
+            <FormField
+              label="AAM Application ARN"
+              description="The ARN of your pre-existing AAM application. Required for entitlement creation and used as the aws:SourceArn condition in the trust policy."
+              constraintText="Format: arn:aws:account-access:<region>:<account>:application/<id>"
+            >
+              <Input
+                value={aamAppArn}
+                onChange={({ detail }) => {
+                  setAamAppArn(detail.value);
+                  // Auto-extract account from ARN
+                  const parts = detail.value.split(":");
+                  if (parts.length >= 5 && parts[4]) setAamSourceAccount(parts[4]);
+                }}
+                placeholder="arn:aws:account-access:us-east-1:123456789012:application/app-id"
+              />
+            </FormField>
+            <FormField
+              label="AAM Source Account"
+              description="The AWS account where AAM is configured. Used as the aws:SourceAccount condition in the trust policy. Auto-populated from the application ARN."
+            >
+              <Input
+                value={aamSourceAccount}
+                onChange={({ detail }) => setAamSourceAccount(detail.value)}
+                placeholder="123456789012"
+              />
+            </FormField>
+          </SpaceBetween>
+        </Container>
+
         {/* Step 1 — Run inventory */}
         <Container
           header={
@@ -484,15 +539,14 @@ export default function Idc() {
         </Container>
 
         {/* Step 2 — Permission sets */}
-        {inventory && (
-          <Container
+        <Container
             header={
               <Header
                 variant="h2"
                 description="Step 2 — select the permission sets to migrate. Only selected permission sets will be included in role creation. Leave empty to include all."
-                counter={selectedPS.length ? `(${selectedPS.length} of ${inventory.permission_sets.length} selected)` : `(${inventory.permission_sets.length})`}
+                counter={selectedPS.length ? `(${selectedPS.length} of ${inventory?.permission_sets.length || 0} selected)` : `(${inventory?.permission_sets.length || 0})`}
                 actions={
-                  <Button iconName="download" onClick={handleExportPS} disabled={!inventory.permission_sets.length}>Export CSV</Button>
+                  <Button iconName="download" onClick={handleExportPS} disabled={!inventory?.permission_sets.length}>Export CSV</Button>
                 }
               >
                 Permission Sets
@@ -522,16 +576,21 @@ export default function Idc() {
                   { id: "managed", header: "AWS Managed Policies", cell: (ps) => ps.aws_managed_policies.map((p) => p.name).join(", ") || "—", minWidth: 200 },
                   { id: "cmp", header: "Customer Managed Policies", cell: (ps) => ps.customer_managed_policy_references.map((r) => r.name).join(", ") || "—", minWidth: 180 },
                   { id: "inline", header: "Inline", cell: (ps) => ps.inline_policy ? "Yes" : "No", minWidth: 70 },
+                  { id: "boundary", header: "Permission Boundary", cell: (ps) => {
+                    if (!ps.permission_boundary) return "—";
+                    const pb = ps.permission_boundary;
+                    if (pb.ManagedPolicyArn) return pb.ManagedPolicyArn;
+                    if (pb.CustomerManagedPolicyReference) return pb.CustomerManagedPolicyReference.Name || pb.CustomerManagedPolicyReference.Path || "Custom";
+                    return "Yes";
+                  }, minWidth: 160 },
                   { id: "duration", header: "Session Duration (ISO 8601)", cell: (ps) => ps.session_duration, minWidth: 80 },
                 ]}
               />
             </SpaceBetween>
           </Container>
-        )}
 
         {/* Step 2b — Assignments */}
-        {inventory && inventory.assignments.length > 0 && (
-          <Container
+        <Container
             header={
               <Header
                 variant="h2"
@@ -571,11 +630,9 @@ export default function Idc() {
               />
             </SpaceBetween>
           </Container>
-        )}
 
         {/* Step 3 — Migration plan (role name mapping) */}
-        {inventory && filteredRoleMappings.length > 0 && (
-          <Container
+        <Container
             header={
               <Header
                 variant="h2"
@@ -584,21 +641,37 @@ export default function Idc() {
                 actions={
                   <SpaceBetween direction="horizontal" size="xs">
                     <Button iconName="download" onClick={() => {
-                      exportToCsv("migration_plan.csv", roleMappings.map((m) => ({
-                        permission_set_name: m.psName,
-                        permission_set_arn: m.psArn,
-                        role_name: m.roleName,
-                        role_path: rolePath,
-                        principal: m.principal,
-                        account_id: m.accountId,
-                        full_role_arn: `arn:aws:iam::${m.accountId || "<ACCOUNT>"}:role${rolePath}${m.roleName}`,
-                      })), [
+                      exportToCsv("migration_plan.csv", roleMappings.map((m) => {
+                        // Look up policies from inventory if available
+                        const ps = inventory?.permission_sets.find((p) => p.arn === m.psArn);
+                        return {
+                          permission_set_name: m.psName,
+                          permission_set_arn: m.psArn,
+                          permission_set_description: ps?.description || "",
+                          role_name: m.roleName,
+                          role_path: rolePath,
+                          principal: m.principal,
+                          principal_type: m.principalType || "GROUP",
+                          account_id: m.accountId,
+                          aws_managed_policies: ps ? ps.aws_managed_policies.map((p) => p.arn).join("; ") : "",
+                          customer_managed_policies: ps ? ps.customer_managed_policy_references.map((r) => `${r.path}${r.name}`).join("; ") : "",
+                          has_inline_policy: ps?.inline_policy ? "Yes" : "",
+                          permission_boundary: ps?.permission_boundary ? (ps.permission_boundary.ManagedPolicyArn || ps.permission_boundary.CustomerManagedPolicyReference?.Name || "") : "",
+                          full_role_arn: `arn:aws:iam::${m.accountId || "<ACCOUNT>"}:role${rolePath}${m.roleName}`,
+                        };
+                      }), [
                         { key: "permission_set_name", header: "Permission Set" },
                         { key: "permission_set_arn", header: "Permission Set ARN" },
+                        { key: "permission_set_description", header: "Description" },
                         { key: "role_name", header: "Role Name" },
                         { key: "role_path", header: "Role Path" },
                         { key: "principal", header: "Principal" },
-                        { key: "account_id", header: "Account ID" },
+                        { key: "principal_type", header: "Principal Type" },
+                        { key: "account_id", header: "Account ID", text: true },
+                        { key: "aws_managed_policies", header: "AWS Managed Policies" },
+                        { key: "customer_managed_policies", header: "Customer Managed Policies" },
+                        { key: "has_inline_policy", header: "Has Inline Policy" },
+                        { key: "permission_boundary", header: "Permission Boundary" },
                         { key: "full_role_arn", header: "Full Role ARN (template)" },
                       ]);
                     }}>Download CSV</Button>
@@ -615,29 +688,88 @@ export default function Idc() {
                           const lines = text.split("\n").filter((l) => l.trim());
                           if (lines.length < 2) return;
                           // Parse CSV: expect headers including "Permission Set ARN" and "Role Name"
-                          const headers = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, ""));
+                          const headers = parseCsvLine(lines[0]);
                           const arnIdx = headers.findIndex((h) => h.toLowerCase().includes("permission set arn") || h.toLowerCase() === "permission_set_arn");
                           const roleIdx = headers.findIndex((h) => h.toLowerCase().includes("role name") || h.toLowerCase() === "role_name");
+                          const psNameIdx = headers.findIndex((h) => (h.toLowerCase() === "permission set" || h.toLowerCase() === "permission_set_name" || h.toLowerCase() === "permission set name") && !h.toLowerCase().includes("arn"));
                           const principalIdx = headers.findIndex((h) => h.toLowerCase() === "principal");
+                          const principalTypeIdx = headers.findIndex((h) => h.toLowerCase() === "principal type" || h.toLowerCase() === "principal_type" || h.toLowerCase() === "type");
                           const accountIdx = headers.findIndex((h) => h.toLowerCase().includes("account") && h.toLowerCase() !== "full role arn (template)");
                           if (arnIdx === -1 || roleIdx === -1) { setError("CSV must have 'Permission Set ARN' and 'Role Name' columns."); return; }
                           const uploaded: typeof roleMappings = [];
+                          const parseErrors: string[] = [];
                           for (let i = 1; i < lines.length; i++) {
-                            const cols = lines[i].split(",").map((c) => c.trim().replace(/^"|"$/g, ""));
+                            const cols = parseCsvLine(lines[i]);
                             const arn = cols[arnIdx] || "";
                             const rn = cols[roleIdx] || "";
+                            const psName = psNameIdx >= 0 ? cols[psNameIdx] || "" : "";
                             const principal = principalIdx >= 0 ? cols[principalIdx] || "" : "";
+                            const principalType = principalTypeIdx >= 0 ? cols[principalTypeIdx] || "GROUP" : "GROUP";
                             const acctId = accountIdx >= 0 ? cols[accountIdx] || "" : "";
-                            if (!arn) continue;
+                            if (!arn && !rn && !principal) continue; // skip empty rows
+                            // Validate required fields
+                            const missing: string[] = [];
+                            if (!arn) missing.push("Permission Set ARN");
+                            if (!rn) missing.push("Role Name");
+                            if (!acctId) missing.push("Account ID");
+                            if (!principal) missing.push("Principal");
+                            if (missing.length) {
+                              parseErrors.push(`Row ${i + 1}: missing ${missing.join(", ")}`);
+                              continue;
+                            }
                             const existing = roleMappings.find((m) => m.psArn === arn);
-                            uploaded.push({ key: `${arn}#${acctId}#${principal}`, psArn: arn, psName: existing?.psName || arn.split("/").pop() || "", roleName: rn, principal: principal || existing?.principal || "", accountId: acctId || existing?.accountId || "" });
+                            uploaded.push({ key: `${arn}#${acctId}#${principal}`, psArn: arn, psName: psName || existing?.psName || arn.split("/").pop() || "", roleName: rn, principal, accountId: acctId, principalType });
                           }
-                          if (uploaded.length) setRoleMappings(uploaded);
+                          if (parseErrors.length) {
+                            setError(`CSV validation errors:\n${parseErrors.join("\n")}`);
+                            if (!uploaded.length) return;
+                          }
+                          if (uploaded.length) {
+                            // Reset selections since the plan may differ
+                            setSelectedPS([]);
+                            setSelectedAssignments([]);
+                            // Call backend to resolve permission set policies + principal UUIDs
+                            setError(null);
+                            setResolving(true);
+                            api.idcResolvePlan({ role_mappings: uploaded, region }).then((res) => {
+                              // Update role mappings with resolved data (correct keys with UUIDs)
+                              setRoleMappings(res.resolved_mappings.map((rm) => ({
+                                key: rm.key,
+                                psArn: rm.psArn,
+                                psName: rm.psName,
+                                roleName: rm.roleName,
+                                principal: rm.principal,
+                                accountId: rm.accountId,
+                                principalType: rm.principal_type,
+                              })));
+                              // Update inventory from the enriched cache
+                              if (res.permission_sets.length || res.assignments.length) {
+                                setInventory({
+                                  instance_arn: "",
+                                  hub_account_id: "",
+                                  account_scope: "plan-upload",
+                                  permission_sets: res.permission_sets as PermissionSet[],
+                                  assignments: res.assignments as Assignment[],
+                                  total_permission_sets: res.permission_sets.length,
+                                  total_assignments: res.assignments.length,
+                                });
+                              }
+                              if (res.errors.length) {
+                                const errorDetails = (res.errors as any[]).map((e: any) => `${e.principal}: ${e.resolution_error}`).join("\n");
+                                setError(`Resolution errors:\n${errorDetails}`);
+                              }
+                            }).catch((e) => {
+                              // Fallback: use uploaded data as-is if resolve fails
+                              setRoleMappings(uploaded);
+                              setError(`Plan uploaded but resolution failed: ${(e as Error).message}`);
+                            }).finally(() => setResolving(false));
+                          }
                         };
                         reader.readAsText(file);
                       };
                       input.click();
                     }}>Upload CSV</Button>
+                    {resolving && <StatusIndicator type="loading">Resolving policies and principals...</StatusIndicator>}
                   </SpaceBetween>
                 }
               >
@@ -669,34 +801,17 @@ export default function Idc() {
                       }}
                     />
                   ), minWidth: 200 },
-                  { id: "principal", header: "Principal", cell: (r) => (
-                    <Input
-                      value={r.principal}
-                      onChange={({ detail }) => {
-                        setRoleMappings((prev) => prev.map((m) => m.key === r.key ? { ...m, principal: detail.value } : m));
-                      }}
-                      placeholder="group or user name"
-                    />
-                  ), minWidth: 150 },
-                  { id: "account", header: "Account ID", cell: (r) => (
-                    <Input
-                      value={r.accountId}
-                      onChange={({ detail }) => {
-                        setRoleMappings((prev) => prev.map((m) => m.key === r.key ? { ...m, accountId: detail.value } : m));
-                      }}
-                      placeholder="123456789012"
-                    />
-                  ), minWidth: 130 },
+                  { id: "principal", header: "Principal", cell: (r) => r.principal || "—", minWidth: 150 },
+                  { id: "type", header: "Type", cell: (r) => r.principalType || "—", minWidth: 80 },
+                  { id: "account", header: "Account ID", cell: (r) => r.accountId || "—", minWidth: 130 },
                   { id: "path", header: "Role Path", cell: () => rolePath, minWidth: 80 },
                 ]}
               />
             </SpaceBetween>
           </Container>
-        )}
 
         {/* Step 4 — Role & Entitlement Creation */}
-        {inventory && (
-          <Container
+        <Container
             header={
               <Header variant="h2" description="Step 4 — create IAM roles and AAM entitlements. The AAM application ARN is required so that entitlements can be properly created within Account Access Manager.">
                 Role &amp; Entitlement Creation
@@ -713,21 +828,9 @@ export default function Idc() {
                 ]}
               />
 
-              <FormField
-                label="AAM Application ARN"
-                description="Required. The ARN of your pre-existing AAM application. Entitlements are created against this application to preserve who-can-access-what."
-                constraintText="This must be created before using this tool. The tool does not create AAM applications."
-              >
-                <Input
-                  value={aamAppArn}
-                  onChange={({ detail }) => setAamAppArn(detail.value)}
-                  placeholder="arn:aws:account-access:us-east-1:123456789012:application/app-id"
-                />
-              </FormField>
-
               {creationMode === "generate-iac" ? (
                 <>
-                  <Button variant="primary" loading={iacLoading} disabled={!inventory.permission_sets.length || !aamAppArn.trim()} onClick={generateIac}>
+                  <Button variant="primary" loading={iacLoading} disabled={!roleMappings.length || !aamAppArn.trim()} onClick={generateIac}>
                     Generate template {selectedPS.length ? `(${selectedPS.length} permission sets` : "(all"}{selectedAssignments.length ? `, ${selectedAssignments.length} assignments)` : ")"}
                   </Button>
                   {iacResult && (
@@ -738,9 +841,14 @@ export default function Idc() {
                       <SpaceBetween direction="horizontal" size="xs">
                         {iacResult.accounts.map((acct) => (
                           <Button key={acct} onClick={() => setIacModalAccount(acct)}>
-                            {iacResult.accounts.length > 1 ? `Account ${acct}` : "View CloudFormation"}
+                            {iacResult.accounts.length > 1 ? `Roles — Account ${acct}` : "View Roles Template"}
                           </Button>
                         ))}
+                        {iacResult.entitlements_template && (
+                          <Button onClick={() => setIacModalAccount("__entitlements__")}>
+                            View Entitlements Template
+                          </Button>
+                        )}
                       </SpaceBetween>
                     </SpaceBetween>
                   )}
@@ -809,7 +917,7 @@ export default function Idc() {
                       </SpaceBetween>
                     </Container>
                   )}
-                  <Button variant="primary" loading={applying} disabled={!inventory.permission_sets.length || !aamAppArn.trim()} onClick={runApply}>
+                  <Button variant="primary" loading={applying} disabled={!roleMappings.length || !aamAppArn.trim()} onClick={runApply}>
                     Apply {selectedPS.length ? `(${selectedPS.length} permission sets` : "(all"}{selectedAssignments.length ? `, ${selectedAssignments.length} assignments)` : ")"}
                   </Button>
                   {applying && applyProgress && (
@@ -870,7 +978,6 @@ export default function Idc() {
               )}
             </SpaceBetween>
           </Container>
-        )}
       </SpaceBetween>
 
       {/* IaC template modal (per-account) */}
@@ -878,13 +985,15 @@ export default function Idc() {
         visible={!!iacModalAccount}
         size="max"
         onDismiss={() => setIacModalAccount(null)}
-        header={iacModalAccount ? `CloudFormation — Account ${iacModalAccount}` : "CloudFormation"}
+        header={iacModalAccount === "__entitlements__" ? "CloudFormation — AAM Entitlements (Management Account)" : iacModalAccount ? `CloudFormation — Roles (Account ${iacModalAccount})` : "CloudFormation"}
         footer={<Box float="right"><Button variant="primary" onClick={() => setIacModalAccount(null)}>Close</Button></Box>}
       >
-        {iacResult && iacModalAccount && iacResult.templates[iacModalAccount] && (
+        {iacResult && iacModalAccount && (
           <Box variant="code">
             <pre style={{ margin: 0, maxHeight: "70vh", overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-              {iacResult.templates[iacModalAccount].content}
+              {iacModalAccount === "__entitlements__"
+                ? iacResult.entitlements_template?.content || ""
+                : iacResult.templates[iacModalAccount]?.content || ""}
             </pre>
           </Box>
         )}

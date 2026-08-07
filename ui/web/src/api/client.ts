@@ -120,6 +120,11 @@ export const api = {
     }),
   idcDiscoverStatus: (jobId: string) =>
     request<JobStatus>(`/api/idc/discover/status?job_id=${encodeURIComponent(jobId)}`),
+  idcResolvePlan: (payload: unknown) =>
+    request<{ permission_sets: unknown[]; assignments: unknown[]; resolved_mappings: { key: string; psArn: string; psName: string; roleName: string; principal: string; principal_id: string; accountId: string; principal_type: string; resolution_error: string | null }[]; errors: unknown[] }>(
+      "/api/idc/resolve-plan",
+      { method: "POST", body: JSON.stringify(payload) }
+    ),
   idcGenerateIac: (payload: unknown) =>
     request<{ roles_count: number; entitlements_count: number; templates: Record<string, { path: string; content: string }>; accounts: string[]; role_map: Record<string, string> }>(
       "/api/idc/generate-iac",

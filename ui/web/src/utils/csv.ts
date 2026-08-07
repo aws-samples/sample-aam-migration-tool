@@ -20,6 +20,54 @@ export interface CsvColumn {
 }
 
 /**
+ * Parse a single CSV line respecting RFC 4180 quoted fields.
+ *
+ * Handles commas inside double-quoted fields and escaped double-quotes ("").
+ * Returns an array of field values with surrounding quotes and whitespace trimmed.
+ */
+export function parseCsvLine(line: string): string[] {
+  const fields: string[] = [];
+  let i = 0;
+  while (i <= line.length) {
+    if (i === line.length) { fields.push(""); break; }
+    // Skip leading whitespace
+    while (i < line.length && line[i] === " ") i++;
+    if (i < line.length && line[i] === '"') {
+      // Quoted field
+      i++; // skip opening quote
+      let value = "";
+      while (i < line.length) {
+        if (line[i] === '"') {
+          if (i + 1 < line.length && line[i + 1] === '"') {
+            // Escaped quote
+            value += '"';
+            i += 2;
+          } else {
+            // End of quoted field
+            i++; // skip closing quote
+            break;
+          }
+        } else {
+          value += line[i];
+          i++;
+        }
+      }
+      fields.push(value.trim());
+      // Skip to comma or end
+      while (i < line.length && line[i] !== ",") i++;
+      i++; // skip comma
+    } else {
+      // Unquoted field
+      const start = i;
+      while (i < line.length && line[i] !== ",") i++;
+      fields.push(line.slice(start, i).trim());
+      i++; // skip comma
+    }
+  }
+  return fields;
+}
+
+/**
  * Export an array of objects to a CSV file and trigger a browser download.
  *
  * @param filename - Name for the downloaded file (should end with .csv).
