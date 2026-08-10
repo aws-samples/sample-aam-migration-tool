@@ -31,7 +31,6 @@ Use this to identify policies that reference your IdP before migration.
 
 - Read-only — never modifies policies
 - Parallelized across accounts and services
-- Checkpointed — interrupted scans resume where they left off
 - Supports single-account, multi-account, and organization-wide scans
 
 ### 2. IAM Federation → AAM
@@ -46,7 +45,7 @@ Discovers SAML-federated IAM roles and migrates their trust policies to include 
 - Multi-account with `--profiles` or `--account-ids` + `--role-name`
 - Parallelized discovery and migration
 - Trust policy backup before any modification
-- Per-account CloudFormation and Terraform template generation
+- Per-account CloudFormation generation
 
 ### 3. IdC → AAM
 
@@ -224,7 +223,7 @@ account-access:GetApplication
 
 ---
 
-## What the Customer Must Do (Not Handled by This Tool)
+## What You Must Do (Not Handled by This Tool)
 
 1. **Create the AAM application** — The tool creates entitlements against an application but never creates the application itself.
 2. **Pre-create customer managed policies** — If your IdC permission sets reference CMPs, those policies must exist in each target account with the same name and path.
@@ -241,8 +240,6 @@ account-access:GetApplication
 - **Local-only execution** — runs entirely on your machine. No data is sent externally. Results cached in `ui/cache/`.
 - **No rollback automation** — apply mode logs what it changed but doesn't provide one-click undo.
 - **IdC API throttling** — org-wide scans may hit rate limits (20 TPS). The tool uses adaptive retry with exponential backoff.
-- **Inline policy size limits** — IAM roles have a 10,240-character limit. Large IdC inline policies may need conversion to CMPs.
-- **AAM SDK** — custom boto3 wheels required for entitlement creation. Included in repo root. Generate-IaC mode works with standard boto3.
 - **Customer managed policy propagation** — CMPs referenced by permission sets must exist in target accounts before role creation.
 
 ---
@@ -281,8 +278,7 @@ truffle/
 ## Design Tenets
 
 - **Lightweight** — minimal dependencies, no Docker/containers required
-- **Fast** — parallel API calls, per-unit checkpointing, incremental progress
+- **Fast** — parallel API calls where possible
 - **AWS console look and feel** — Cloudscape design system
 - **Local-first** — runs on your machine, uses your credentials, caches locally
-- **Safe by default** — generate-IaC (read-only) is always the default; apply mode requires explicit action
-- **Single source of truth** — `lib.py` modules shared between CLI and UI; bug fixes propagate to both
+- **Safe by default** — apply mode requires explicit action
