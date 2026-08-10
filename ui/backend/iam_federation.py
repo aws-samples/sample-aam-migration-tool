@@ -328,7 +328,7 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
         if session:
             try:
                 resp = session.client("iam").get_role(RoleName=role_name)
-                backup_data[role_name] = resp["Role"]["AssumeRolePolicyDocument"]
+                backup_data[role_arn] = resp["Role"]["AssumeRolePolicyDocument"]
             except Exception:
                 pass
     if backup_data:

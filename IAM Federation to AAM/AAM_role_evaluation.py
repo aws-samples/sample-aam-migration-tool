@@ -249,6 +249,7 @@ def generate_csv(
 def backup_trust_policies(saml_roles: List[Dict[str, Any]], account_id: str) -> str:
     """
     Save the current trust policy for each role to a timestamped JSON file.
+    Keys are full role ARNs for uniqueness across accounts.
     Returns the backup file path.
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -257,10 +258,11 @@ def backup_trust_policies(saml_roles: List[Dict[str, Any]], account_id: str) -> 
     backup_data = {}
     for entry in saml_roles:
         role_name = entry["role_name"]
+        role_arn = entry.get("role_arn", f"arn:aws:iam::{account_id}:role/{role_name}")
         # Re-fetch live trust policy to ensure accuracy
         role = iam_resource.Role(role_name)
         role.reload()
-        backup_data[role_name] = role.assume_role_policy_document
+        backup_data[role_arn] = role.assume_role_policy_document
 
     with open(backup_file, "w", encoding="utf-8") as f:
         json.dump(backup_data, f, indent=2)
@@ -288,7 +290,9 @@ def rollback_trust_policies(backup_file: str) -> None:
 
     success = 0
     errors = 0
-    for role_name, trust_doc in backup_data.items():
+    for key, trust_doc in backup_data.items():
+        # Support both ARN keys (new format) and plain role name keys (legacy backups)
+        role_name = key.split("/")[-1] if key.startswith("arn:") else key
         try:
             iam_client.update_assume_role_policy(
                 RoleName=role_name,
