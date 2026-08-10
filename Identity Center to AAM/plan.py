@@ -106,13 +106,112 @@ class MigrationPlanModule:
     # ── Consume ──────────────────────────────────────────────────────────────
 
     def consume(self, path: str) -> list[MigrationPlanRow]:
+        """Read an edited plan (XLSX or CSV). Validates required columns/fields
+        and rejects invalid IAM role names (Req 5.6, 5.8, 5.9).
+
+        CSV files use flexible header matching (column order doesn't matter).
+        Accepted CSV headers map to the canonical fields as follows:
+          - Permission Set ARN / permission_set_arn / PermissionSetArn
+          - Permission Set / permission_set_name / PermissionSetName (optional if ARN present)
+          - Role Name / role_name / RoleName
+          - Account ID / account_id / AccountIds / Account (optional)
+          - Principal / Principals (optional)
+          - Principal Type / principal_type / Type (optional)
+        """
+        if not os.path.isfile(path):
+            raise PlanError(f"migration plan not found: {path}")
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".csv":
+            return self._consume_csv(path)
+        else:
+            return self._consume_xlsx(path)
+
+    def _consume_csv(self, path: str) -> list[MigrationPlanRow]:
+        """Read a CSV migration plan with flexible header matching."""
+        import csv
+
+        with open(path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None:
+                raise PlanError("migration plan CSV is empty (no header row)")
+
+            # Flexible header resolution — map canonical fields to actual column names
+            def _find_col(*candidates: str) -> str | None:
+                for col in reader.fieldnames:  # type: ignore[union-attr]
+                    col_lower = col.lower().strip()
+                    for c in candidates:
+                        if col_lower == c.lower():
+                            return col
+                return None
+
+            arn_col = _find_col("permission set arn", "permission_set_arn", "permissionsetarn")
+            name_col = _find_col("permission set", "permission set name", "permission_set_name", "permissionsetname")
+            role_col = _find_col("role name", "role_name", "rolename")
+            account_col = _find_col("account id", "account_id", "accountids", "account")
+            principal_col = _find_col("principal", "principals")
+            type_col = _find_col("principal type", "principal_type", "type")
+
+            if not arn_col:
+                raise PlanError("migration plan CSV is missing required column: 'Permission Set ARN'")
+            if not role_col:
+                raise PlanError("migration plan CSV is missing required column: 'Role Name'")
+
+            plan_rows: list[MigrationPlanRow] = []
+            for row_num, row in enumerate(reader, start=2):
+                ps_arn = (row.get(arn_col) or "").strip()
+                role_name = (row.get(role_col) or "").strip()
+
+                if not ps_arn and not role_name:
+                    continue  # skip empty rows
+
+                if not ps_arn:
+                    raise PlanError(f"migration plan row {row_num} is missing required field 'Permission Set ARN'")
+                if not role_name:
+                    raise PlanError(f"migration plan row {row_num} is missing required field 'Role Name'")
+
+                if not IAM_ROLE_NAME_RE.match(role_name):
+                    raise PlanError(
+                        f"migration plan row {row_num}: RoleName {role_name!r} is invalid "
+                        f"for an IAM role name (allowed: 1-64 chars of [A-Za-z0-9_+=,.@-])"
+                    )
+
+                ps_name = (row.get(name_col) or "").strip() if name_col else ""
+                if not ps_name:
+                    # Derive from the ARN (last segment after /)
+                    ps_name = ps_arn.rsplit("/", 1)[-1]
+
+                # Build principals tuple: combine principal + type if available
+                principals: tuple[str, ...] = ()
+                principal_val = (row.get(principal_col) or "").strip() if principal_col else ""
+                if principal_val:
+                    ptype = (row.get(type_col) or "GROUP").strip().upper() if type_col else "GROUP"
+                    principals = (f"{ptype}:{principal_val}",)
+
+                # Account IDs
+                account_ids: tuple[str, ...] = ()
+                account_val = (row.get(account_col) or "").strip() if account_col else ""
+                if account_val:
+                    account_ids = (account_val,)
+
+                plan_rows.append(
+                    MigrationPlanRow(
+                        permission_set_arn=ps_arn,
+                        permission_set_name=ps_name,
+                        role_name=role_name,
+                        principals=principals,
+                        account_ids=account_ids,
+                    )
+                )
+
+        self.audit.log_success("migration_plan_consumed", path, rows=len(plan_rows))
+        return plan_rows
+
+    def _consume_xlsx(self, path: str) -> list[MigrationPlanRow]:
         """Read an edited plan XLSX. Validates required columns/fields lazily as
         each row is processed (Req 5.6, 5.8) and rejects invalid IAM role names
         (Req 5.9)."""
         from openpyxl import load_workbook  # lazy import
-
-        if not os.path.isfile(path):
-            raise PlanError(f"migration plan not found: {path}")
 
         wb = load_workbook(path, read_only=True, data_only=True)
         ws = wb.active

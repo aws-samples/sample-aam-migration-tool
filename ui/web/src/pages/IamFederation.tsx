@@ -360,7 +360,7 @@ export default function IamFederation() {
         {/* AAM Configuration */}
         <Container
           header={
-            <Header variant="h2" description="Configure the AAM application. Used for trust policy conditions (confused-deputy protection) and entitlement creation.">
+            <Header variant="h2" description="Configure the AAM application. Used for trust policy updates and entitlement creation.">
               AAM Configuration
             </Header>
           }
@@ -368,7 +368,7 @@ export default function IamFederation() {
           <SpaceBetween size="m">
             <FormField
               label="AAM Application ARN"
-              description="Required for entitlement creation and used as aws:SourceArn in the trust policy condition."
+              description="Required for entitlement creation and trust policy updates."
               constraintText="Format: arn:aws:account-access:<region>:<account>:application/<id>"
             >
               <Input
@@ -622,20 +622,8 @@ export default function IamFederation() {
                       <option value="USER">USER</option>
                     </select>
                   ), minWidth: 100 },
-                  { id: "account", header: "Account ID", cell: (m) => (
-                    <Input
-                      value={m.accountId}
-                      onChange={({ detail }) => setEntitlementMappings((prev) => prev.map((x) => x.id === m.id ? { ...x, accountId: detail.value } : x))}
-                      placeholder="123456789012"
-                    />
-                  ), minWidth: 140 },
-                  { id: "role", header: "Role Name", cell: (m) => (
-                    <Input
-                      value={m.roleName}
-                      onChange={({ detail }) => setEntitlementMappings((prev) => prev.map((x) => x.id === m.id ? { ...x, roleName: detail.value } : x))}
-                      placeholder="PowerUser"
-                    />
-                  ), minWidth: 150 },
+                  { id: "account", header: "Account ID", cell: (m) => m.accountId || "—", minWidth: 140 },
+                  { id: "role", header: "Role Name", cell: (m) => m.roleName || "—", minWidth: 150 },
                   { id: "arn", header: "Role ARN", cell: (m) => m.roleArn || `arn:aws:iam::${m.accountId}:role/${m.roleName}`, minWidth: 250 },
                   { id: "remove", header: "", cell: (m) => (
                     <Button variant="inline-link" onClick={() => setEntitlementMappings((prev) => prev.filter((x) => x.id !== m.id))}>Remove</Button>
@@ -804,6 +792,9 @@ export default function IamFederation() {
                     <Button onClick={() => setIacModal("__entitlements__")}>View Entitlements Template</Button>
                   )}
                 </SpaceBetween>
+                <Box variant="small" color="text-body-secondary">
+                  Templates saved to: {iacResult.cloudformation?.path?.replace(/\/[^/]+$/, "/") || "cache/"}
+                </Box>
               </SpaceBetween>
             )}
           </SpaceBetween>

@@ -115,6 +115,18 @@ equivalent IAM roles with AAM trust policies and entitlements.
 - **Role path** — IAM path for created roles (default: `/aam/`)
 - **Permission set selection** — which permission sets to create roles for
 
+### CSV Upload Formats
+
+Both tools support uploading a CSV to define mappings directly (skip or supplement discovery).
+
+**IdC Migration Plan CSV** — upload in the migration plan section. See [Identity Center to AAM README — Migration plan CSV format](../Identity%20Center%20to%20AAM/README.md#migration-plan-csv-format) for the full column reference.
+
+Required columns: `Permission Set ARN`, `Role Name`, `Account ID`, `Principal`. Column order does not matter.
+
+**IAM Federation Entitlement CSV** — upload in the entitlement mapping section. See [IAM Federation README — Columnar CSV](../IAM%20Federation%20to%20AAM/README.md#columnar-csv-recommended) for the full column reference.
+
+Required columns: `Group/Principal`, `Account ID`, `Role Name`. Column order does not matter.
+
 ---
 
 ## Important Notes

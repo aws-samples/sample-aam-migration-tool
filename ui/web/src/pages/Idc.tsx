@@ -262,7 +262,9 @@ export default function Idc() {
   async function generateIac() {
     setError(null); setIacLoading(true);
     try {
-      const payload: Record<string, unknown> = {};
+      const payload: Record<string, unknown> = {
+        role_path: rolePath,
+      };
       if (selectedPS.length) {
         payload.selected_permission_sets = selectedPS.map((ps) => ps.arn);
       }
@@ -466,7 +468,7 @@ export default function Idc() {
         {/* AAM Configuration */}
         <Container
           header={
-            <Header variant="h2" description="Configure the AAM application details. These are used to build the trust policy conditions (confused-deputy protection) and to create entitlements.">
+            <Header variant="h2" description="Configure the AAM application details. These are used to build the trust policy and to create entitlements.">
               AAM Configuration
             </Header>
           }
@@ -474,7 +476,7 @@ export default function Idc() {
           <SpaceBetween size="m">
             <FormField
               label="AAM Application ARN"
-              description="The ARN of your pre-existing AAM application. Required for entitlement creation and used as the aws:SourceArn condition in the trust policy."
+              description="The ARN of your pre-existing AAM application. Required for entitlement creation and trust policy updates."
               constraintText="Format: arn:aws:account-access:<region>:<account>:application/<id>"
             >
               <Input
@@ -695,6 +697,7 @@ export default function Idc() {
                           const principalIdx = headers.findIndex((h) => h.toLowerCase() === "principal");
                           const principalTypeIdx = headers.findIndex((h) => h.toLowerCase() === "principal type" || h.toLowerCase() === "principal_type" || h.toLowerCase() === "type");
                           const accountIdx = headers.findIndex((h) => h.toLowerCase().includes("account") && h.toLowerCase() !== "full role arn (template)");
+                          const rolePathIdx = headers.findIndex((h) => h.toLowerCase() === "role path" || h.toLowerCase() === "role_path");
                           if (arnIdx === -1 || roleIdx === -1) { setError("CSV must have 'Permission Set ARN' and 'Role Name' columns."); return; }
                           const uploaded: typeof roleMappings = [];
                           const parseErrors: string[] = [];
@@ -725,6 +728,11 @@ export default function Idc() {
                             if (!uploaded.length) return;
                           }
                           if (uploaded.length) {
+                            // Update role path from CSV if present
+                            if (rolePathIdx >= 0) {
+                              const firstPath = parseCsvLine(lines[1])[rolePathIdx]?.trim();
+                              if (firstPath) setRolePath(firstPath);
+                            }
                             // Reset selections since the plan may differ
                             setSelectedPS([]);
                             setSelectedAssignments([]);
@@ -838,6 +846,9 @@ export default function Idc() {
                       <StatusIndicator type="success">
                         {iacResult.roles_count} role(s), {iacResult.entitlements_count} entitlement(s) across {iacResult.accounts.length} account(s)
                       </StatusIndicator>
+                      <Box variant="small" color="text-body-secondary">
+                        Templates saved to: {Object.values(iacResult.templates)[0]?.path?.replace(/\/[^/]+$/, "/") || "cache/"}
+                      </Box>
                       <SpaceBetween direction="horizontal" size="xs">
                         {iacResult.accounts.map((acct) => (
                           <Button key={acct} onClick={() => setIacModalAccount(acct)}>

@@ -189,7 +189,7 @@ export default function PolicyAnalysis() {
         {error && <Alert type="error" header="Scan failed" dismissible onDismiss={() => setError(null)}>{error}</Alert>}
 
         <Container header={<Header variant="h2">Credentials</Header>}>
-          <AuthMethodSelect state={auth} onChange={setAuth} disabled={running} profileMode="multi" />
+          <AuthMethodSelect state={auth} onChange={setAuth} disabled={running} profileMode="multi" allowOrg={false} />
         </Container>
 
         <Container header={<Header variant="h2">Scan scope</Header>}>

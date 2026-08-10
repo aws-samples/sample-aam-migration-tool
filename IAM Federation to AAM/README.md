@@ -119,12 +119,22 @@ python AAM_role_evaluation.py --rollback <backup_file>
 The `--entitlement-csv` flag accepts a CSV with explicit columns:
 
 ```csv
-Group/Principal,Account ID,Role Name,Role ARN
-admins,111111111111,PowerUser,arn:aws:iam::111111111111:role/PowerUser
-devs,222222222222,ReadOnly,arn:aws:iam::222222222222:role/ReadOnly
+Group/Principal,Principal Type,Account ID,Role Name,Role ARN
+admins,GROUP,111111111111,PowerUser,arn:aws:iam::111111111111:role/PowerUser
+jane@example.com,USER,222222222222,ReadOnly,arn:aws:iam::222222222222:role/ReadOnly
 ```
 
-The "Role ARN" column is optional — if omitted, it's constructed from Account ID + Role Name.
+**Column order does not matter** — headers are matched by name, not position.
+
+| Column | Required | Description |
+|--------|----------|-------------|
+| Group/Principal | Yes | The IdC group display name or user name to create the entitlement for. |
+| Principal Type | No | `GROUP` or `USER`. Defaults to `GROUP` if omitted. |
+| Account ID | Yes | 12-digit AWS account ID where the role exists. |
+| Role Name | Yes | IAM role name (used to construct ARN if Role ARN is omitted). |
+| Role ARN | No | Full role ARN. Constructed from Account ID + Role Name if omitted. |
+
+This format is identical to what the UI exports from the entitlement mapping table.
 
 ### Pattern-based (legacy)
 

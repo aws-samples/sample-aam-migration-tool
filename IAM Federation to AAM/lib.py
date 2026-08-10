@@ -555,9 +555,12 @@ def parse_entitlement_csv(csv_path: str) -> List[Dict[str, str]]:
             account = ""
             role = ""
             role_arn = ""
+            principal_type = "GROUP"
             for key, val in row.items():
                 key_lower = key.lower().strip()
-                if "group" in key_lower or "principal" in key_lower:
+                if key_lower in ("type", "principal type", "principal_type"):
+                    principal_type = (val or "GROUP").strip().upper()
+                elif "group" in key_lower or "principal" in key_lower:
                     group = (val or "").strip()
                 elif "account" in key_lower:
                     account = (val or "").strip()
@@ -579,6 +582,7 @@ def parse_entitlement_csv(csv_path: str) -> List[Dict[str, str]]:
             mappings.append({
                 "group": group,
                 "principal": group,
+                "principal_type": principal_type,
                 "account": account,
                 "role": role,
                 "matchedRoleArn": role_arn,

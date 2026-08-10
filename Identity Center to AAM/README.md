@@ -13,7 +13,7 @@ The tool runs in clear, sequential phases:
 
 ```
 inventory  →  migration plan  →  role creation  →  entitlements  →  mapping report
-(read-only)   (editable XLSX)    (apply | iac)      (AAM)            (XLSX/CSV/JSON)
+(read-only)   (editable XLSX/CSV) (apply | iac)     (AAM)            (XLSX/CSV/JSON)
 ```
 
 In `apply` mode the tool asks for an explicit confirmation before it changes
@@ -61,7 +61,7 @@ It is one of three components in the larger Truffle migration toolkit.
 |------|---------|
 | **Hub account** | The account you run from — holds the IdC instance and AAM. Resolved automatically via STS. |
 | **Spoke / target account** | An account the tool reaches into (multi-account mode) by assuming a role. |
-| **Migration plan** | An editable XLSX mapping each permission set to a target IAM role name (1:1). The source of truth for role names. |
+| **Migration plan** | An editable XLSX or CSV mapping each permission set to a target IAM role name (1:1). The source of truth for role names. |
 | **Apply mode** | Creates IAM roles live via the IAM API. |
 | **Generate-iac mode** (default) | Emits a CloudFormation template (roles + AAM entitlements) and mutates nothing. |
 | **AAM application** | An operator-managed prerequisite. You create it beforehand and pass its ARN; the tool never creates it. |
@@ -203,8 +203,30 @@ Run `python idc_to_aam.py --help` for the live list.
 ### Migration plan
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--plan` | — | Path to an edited migration plan XLSX to consume. When omitted, defaults are generated from the inventory. |
+| `--plan` | — | Path to an edited migration plan (XLSX or CSV) to consume. When omitted, defaults are generated from the inventory. |
 | `--plan-output` | `migration_plan_<run_id>.xlsx` | Where to write the generated plan. |
+
+#### Migration plan CSV format
+
+The `--plan` flag accepts both XLSX (legacy) and CSV files. CSV is the recommended format for the UI workflow. **Column order does not matter** — headers are matched by name.
+
+```csv
+Permission Set ARN,Role Name,Account ID,Principal,Principal Type
+arn:aws:sso:::permissionSet/ssoins-abc/ps-123,AAM-AdminAccess,111111111111,admins,GROUP
+arn:aws:sso:::permissionSet/ssoins-abc/ps-456,AAM-ReadOnly,111111111111,jane@example.com,USER
+```
+
+| Column | Required | Description |
+|--------|----------|-------------|
+| Permission Set ARN | Yes | The full ARN of the IdC permission set being migrated. |
+| Role Name | Yes | Target IAM role name (1-64 chars, `[A-Za-z0-9_+=,.@-]`). |
+| Account ID | No | 12-digit AWS account ID where the role will be created. |
+| Principal | No | IdC group display name or user name for entitlement creation. |
+| Principal Type | No | `GROUP` or `USER`. Defaults to `GROUP` if omitted. |
+| Permission Set | No | Human-readable name (derived from ARN if omitted). |
+| Role Path | No | IAM path for the role (e.g., `/aam/`). First row's value is used. |
+
+This format is identical to what the UI exports from the migration plan table.
 
 ### AAM
 | Flag | Default | Description |
