@@ -22,6 +22,7 @@ Requirements:
 import boto3
 import json
 import defusedcsv as csv
+import csv as _csv_writer_mod
 import sys
 import os
 from datetime import datetime
@@ -212,18 +213,19 @@ def generate_csv(
 ) -> str:
     """
     Generate a CSV with columns:
-        Role Name, Policy Name, Policy Type, Trust Policy Name
+        Role Name, Policy Name, Policy Type, Permission Boundary, Trust Policy Name
     Returns the output file path.
     """
     if output_file is None:
         output_file = f"AAM_role_evaluation_{account_id}.csv"
 
-    header = ["Role Name", "Policy Name", "Policy Type", "Trust Policy Name"]
+    header = ["Role Name", "Policy Name", "Policy Type", "Permission Boundary", "Trust Policy Name"]
     rows: List[List[str]] = []
 
     for entry in saml_roles:
         role_name = entry["role_name"]
         trust_name = extract_trust_policy_name(entry["trust_policy_document"])
+        pb_arn = entry.get("permission_boundary_arn", "") or ""
 
         attached = get_attached_policies(role_name)
         inline = get_inline_policies(role_name)
@@ -232,14 +234,43 @@ def generate_csv(
         if all_policies:
             for pol in all_policies:
                 rows.append(
-                    [role_name, pol["policy_name"], pol["policy_type"], trust_name]
+                    [role_name, pol["policy_name"], pol["policy_type"], pb_arn, trust_name]
                 )
         else:
             # Role has no policies attached — still record it
-            rows.append([role_name, "(none)", "N/A", trust_name])
+            rows.append([role_name, "(none)", "N/A", pb_arn, trust_name])
 
     with open(output_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+        writer = _csv_writer_mod.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+    return output_file
+
+
+def generate_entitlement_template(
+    account_id: str,
+    saml_roles: List[Dict[str, Any]],
+    output_file: str | None = None,
+) -> str:
+    """
+    Generate a pre-filled entitlement mapping CSV template from discovered roles.
+    The Group/Principal and Principal Type columns are left empty for the user to fill in.
+    Returns the output file path.
+    """
+    if output_file is None:
+        output_file = f"entitlement_mappings_{account_id}.csv"
+
+    header = ["Group/Principal", "Principal Type", "Account ID", "Role Name", "Role ARN"]
+    rows: List[List[str]] = []
+
+    for entry in saml_roles:
+        role_name = entry["role_name"]
+        role_arn = entry.get("role_arn", f"arn:aws:iam::{account_id}:role/{role_name}")
+        rows.append(["", "", account_id, role_name, role_arn])
+
+    with open(output_file, "w", newline="", encoding="utf-8") as f:
+        writer = _csv_writer_mod.writer(f)
         writer.writerow(header)
         writer.writerows(rows)
 
@@ -471,75 +502,16 @@ def assume_role_session(account_id: str, role_name: str) -> "boto3.Session":
 # Entitlement creation — delegates to lib.py
 # ---------------------------------------------------------------------------
 
-def create_entitlements_from_groups(
-    saml_roles: List[Dict[str, Any]],
-    account_id: str,
-    aam_application_arn: str,
-    group_names_file: str,
-    group_pattern: str,
-    region: str = "us-east-1",
-    workers: int = 5,
-) -> None:
-    """
-    Parse group names using the pattern, match to discovered roles, and create
-    AAM entitlements via the shared library.
-    """
-    import re
-
-    with open(group_names_file, "r", encoding="utf-8") as f:
-        groups = [line.strip() for line in f if line.strip()]
-
-    if not groups:
-        print("  No group names found in file.")
-        return
-
-    escaped = group_pattern.replace("{principal}", "(?P<principal>.+?)")
-    escaped = escaped.replace("{account}", "(?P<account>\\d+)")
-    escaped = escaped.replace("{role}", "(?P<role>.+)")
-    regex = re.compile(f"^{escaped}$")
-
-    role_lookup = {r["role_name"]: r for r in saml_roles}
-    role_lookup_lower = {r["role_name"].lower(): r for r in saml_roles}
-
-    mappings = []
-    for g in groups:
-        match = regex.match(g)
-        if match:
-            d = match.groupdict()
-            role_name = d.get("role", "")
-            matched_role = role_lookup.get(role_name) or role_lookup_lower.get(role_name.lower())
-            if matched_role:
-                mappings.append({
-                    "group": g,
-                    "principal": d.get("principal", ""),
-                    "account": d.get("account", account_id),
-                    "role": role_name,
-                    "matchedRoleArn": matched_role.get("role_arn") or f"arn:aws:iam::{d.get('account', account_id)}:role/{role_name}",
-                })
-
-    print(f"\n  Parsed {len(groups)} group(s), {len(mappings)} matched to discovered roles.")
-    if not mappings:
-        print("  No matches to create entitlements for.")
-        return
-
-    print(f"\n  Creating {len(mappings)} entitlement(s) against {aam_application_arn}")
-    hub_session = boto3.Session()
-    results = _lib_create_entitlements(
-        hub_session, aam_application_arn, mappings, region=region, workers=workers,
-    )
-
-    for r in results:
-        if r["status"] == "created":
-            print(f"  \u2713 {r.get('group', '')} \u2192 {r.get('role_arn', '')}")
-        elif r["status"] == "already exists":
-            print(f"  \u23ed {r.get('group', '')} (already exists)")
-        else:
-            print(f"  \u2717 {r.get('group', '')}: {r.get('error', '')}")
-
-    success = len([r for r in results if r["status"] == "created"])
-    existing = len([r for r in results if r["status"] == "already exists"])
-    errors = len([r for r in results if r["status"] == "error"])
-    print(f"\n  Entitlement creation complete: {success} created, {existing} existing, {errors} failed.")
+def _discover_identity_store_id(session: "boto3.Session", region: str = "us-east-1") -> str:
+    """Discover the Identity Store ID from the IdC instance. Returns empty string on failure."""
+    try:
+        sso_admin = session.client("sso-admin", region_name=region)
+        for page in sso_admin.get_paginator("list_instances").paginate():
+            for inst in page.get("Instances", []):
+                return inst.get("IdentityStoreId", "")
+    except Exception:
+        pass
+    return ""
 
 
 def create_entitlements_from_csv(
@@ -560,8 +532,11 @@ def create_entitlements_from_csv(
 
     print(f"\n  Creating {len(mappings)} entitlement(s) from CSV against {aam_application_arn}")
     hub_session = boto3.Session()
+    identity_store_id = _discover_identity_store_id(hub_session, region)
+    if not identity_store_id:
+        print("  WARNING: Could not discover Identity Store — principal names will not be resolved to UUIDs.")
     results = _lib_create_entitlements(
-        hub_session, aam_application_arn, mappings, region=region, workers=workers,
+        hub_session, aam_application_arn, mappings, identity_store_id=identity_store_id, region=region, workers=workers,
     )
 
     for r in results:
@@ -576,6 +551,132 @@ def create_entitlements_from_csv(
     existing = len([r for r in results if r["status"] == "already exists"])
     errors = len([r for r in results if r["status"] == "error"])
     print(f"\n  Entitlement creation complete: {success} created, {existing} existing, {errors} failed.")
+
+
+def _generate_iac_from_roles(
+    roles_by_account: Dict[str, List[Dict[str, Any]]],
+    entitlement_csv_path: str | None,
+    aam_application_arn: str,
+    aam_source_account: str,
+    region: str,
+) -> None:
+    """Generate per-account CloudFormation templates for roles + a separate entitlements template."""
+    import yaml
+
+    from lib import build_trust_statement, resolve_principal_id, parse_entitlement_csv
+    import re
+
+    def sanitize(name: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9]", "", name)
+
+    trust_stmt = build_trust_statement(aam_source_account, aam_application_arn)
+
+    print("\n" + "=" * 60)
+    print("  Generate IaC — CloudFormation Templates")
+    print("=" * 60)
+
+    # Per-account role templates
+    for account_id, roles in sorted(roles_by_account.items()):
+        resources: dict = {}
+        for entry in roles:
+            role_name = entry["role_name"]
+            logical_id = sanitize(role_name) + "Role"
+            role_props: dict = {
+                "RoleName": role_name,
+                "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [trust_stmt]},
+                "Tags": [{"Key": "ManagedBy", "Value": "Truffle-IAMFed-Migration"}],
+            }
+            managed_arns: list = []
+            inline_policies: list = []
+            for p in entry.get("policies", []):
+                if p["policy_type"] == "AWS Managed":
+                    managed_arns.append(f"arn:aws:iam::aws:policy/{p['policy_name']}")
+                elif p["policy_type"] == "Inline":
+                    inline_policies.append({
+                        "PolicyName": p["policy_name"],
+                        "PolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": ["*"], "Resource": "*"}]},
+                    })
+                else:
+                    managed_arns.append({"Fn::Sub": f"arn:aws:iam::${{AWS::AccountId}}:policy/{p['policy_name']}"})
+            if managed_arns:
+                role_props["ManagedPolicyArns"] = managed_arns
+            if inline_policies:
+                role_props["Policies"] = inline_policies
+            # Permission boundary
+            pb_arn = entry.get("permission_boundary_arn")
+            if pb_arn:
+                role_props["PermissionsBoundary"] = pb_arn
+            resources[logical_id] = {"Type": "AWS::IAM::Role", "Properties": role_props}
+
+        template = {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Description": f"IAM roles for account {account_id} migrated from SAML federation to AAM. Generated by Truffle.",
+            "Resources": resources,
+        }
+        filename = f"aam_roles_{account_id}.yaml" if len(roles_by_account) > 1 else "aam_roles_cloudformation.yaml"
+        with open(filename, "w", encoding="utf-8") as f:
+            yaml.safe_dump(template, f, sort_keys=False, default_flow_style=False)
+        print(f"  Roles template: {filename} ({len(roles)} role(s))")
+
+    # Entitlements template (separate, for AAM management account)
+    if aam_application_arn and entitlement_csv_path:
+        try:
+            mappings = parse_entitlement_csv(entitlement_csv_path)
+        except ValueError as exc:
+            print(f"  WARNING: Could not parse entitlement CSV: {exc}")
+            mappings = []
+
+        if mappings:
+            # Resolve principals
+            hub_session = boto3.Session()
+            identity_store_id = _discover_identity_store_id(hub_session, region)
+            id_store = hub_session.client("identitystore", region_name=region) if identity_store_id else None
+
+            ent_resources: dict = {}
+            seen: set = set()
+            for i, m in enumerate(mappings):
+                group = m.get("group", "")
+                role_arn = m.get("matchedRoleArn", "")
+                principal_type = m.get("principal_type", "GROUP")
+                if not group or not role_arn:
+                    continue
+                # Resolve UUID
+                principal_id = group
+                if id_store and identity_store_id:
+                    resolved, err = resolve_principal_id(id_store, identity_store_id, group, principal_type)
+                    if not err:
+                        principal_id = resolved
+                id_key = "userId" if principal_type.upper() == "USER" else "groupId"
+                logical = sanitize(f"{group}{i}") + "Ent"
+                while logical in seen:
+                    logical += "x"
+                seen.add(logical)
+                ent_resources[logical] = {
+                    "Type": "AWS::AccountAccess::Entitlement",
+                    "Properties": {
+                        "ApplicationArn": aam_application_arn,
+                        "Entitlement": {
+                            "PrincipalRole": {
+                                "Principal": {"IdentityCenter": {id_key: principal_id}},
+                                "RoleArn": role_arn,
+                            },
+                        },
+                    },
+                }
+
+            if ent_resources:
+                ent_template = {
+                    "AWSTemplateFormatVersion": "2010-09-09",
+                    "Description": "AAM entitlements for IAM Federation migration. Deploy in the AAM management account. Generated by Truffle.",
+                    "Resources": ent_resources,
+                }
+                ent_filename = "aam_entitlements_cloudformation.yaml"
+                with open(ent_filename, "w", encoding="utf-8") as f:
+                    yaml.safe_dump(ent_template, f, sort_keys=False, default_flow_style=False)
+                print(f"  Entitlements template: {ent_filename} ({len(ent_resources)} entitlement(s))")
+                print("  Deploy this in the AAM management account AFTER role trust policies are updated.")
+
+    print("\n  No changes were made to your AWS environment.")
 
 
 # ---------------------------------------------------------------------------
@@ -601,10 +702,11 @@ def main():
                         help="Skip discovery. Apply trust policy updates + entitlement creation directly from --entitlement-csv. Requires --aam-application-arn and --entitlement-csv.")
     parser.add_argument("--mode", choices=["ADD", "REPLACE"], default="ADD",
                         help="Trust policy update mode for --apply-only. ADD (default): keep SAML trust, add AAM. REPLACE: remove SAML trust.")
-    parser.add_argument("--group-names-file", help="File with IdP group names (one per line) for entitlement mapping.")
-    parser.add_argument("--group-pattern", default="{principal}_{account}_{role}",
-                        help="Pattern to parse group names. Placeholders: {principal}, {account}, {role}.")
-    parser.add_argument("--entitlement-csv", help="Columnar CSV with Group, Account, Role columns for direct entitlement mapping (alternative to --group-names-file).")
+    parser.add_argument("--entitlement-csv", help="Columnar CSV with Group/Principal, Principal Type, Account ID, Role Name, Role ARN columns for entitlement mapping.")
+    parser.add_argument("--generate-iac", action="store_true",
+                        help="Generate CloudFormation templates (per-account for roles, separate for entitlements) instead of applying changes live. Mutually exclusive with interactive trust policy updates.")
+    parser.add_argument("--role-evaluation-csv",
+                        help="Path to a previously generated role evaluation CSV (from discovery). Used with --generate-iac to skip re-running discovery.")
     parser.add_argument("--region", default="us-east-1", help="AWS region for AAM calls.")
 
     args = parser.parse_args()
@@ -718,6 +820,83 @@ def main():
         print("\nDone.")
         return
 
+    # Handle --generate-iac with --role-evaluation-csv (no discovery needed)
+    if args.generate_iac and args.role_evaluation_csv:
+        import csv as _csv_mod
+        from collections import defaultdict as _defaultdict
+
+        print("=" * 60)
+        print("  AAM Role Evaluation — Generate IaC (from existing CSV)")
+        print("=" * 60)
+        print(f"\n  Reading role evaluation from: {args.role_evaluation_csv}")
+
+        # Parse the CSV: group policies by (account_id, role_name)
+        roles_by_account: Dict[str, List[Dict[str, Any]]] = _defaultdict(list)
+        role_seen: Dict[str, Dict[str, Any]] = {}  # key: "acct#role_name" -> entry
+        with open(args.role_evaluation_csv, "r", encoding="utf-8") as f:
+            reader = _csv_mod.DictReader(f)
+            for row in reader:
+                # Flexible column matching
+                acct = ""
+                role_name = ""
+                role_arn = ""
+                policy_name = ""
+                policy_type = ""
+                pb_arn = ""
+                for key, val in row.items():
+                    k = key.lower().strip()
+                    if k == "account id" or k == "account_id":
+                        acct = (val or "").strip()
+                    elif k == "role name" or k == "role_name":
+                        role_name = (val or "").strip()
+                    elif k == "role arn" or k == "role_arn":
+                        role_arn = (val or "").strip()
+                    elif k == "policy name" or k == "policy_name":
+                        policy_name = (val or "").strip()
+                    elif k == "policy type" or k == "policy_type":
+                        policy_type = (val or "").strip()
+                    elif k == "permission boundary" or k == "permission_boundary":
+                        pb_arn = (val or "").strip()
+
+                if not role_name:
+                    continue
+                # For single-account CSVs without Account ID column, use default
+                if not acct:
+                    acct = boto3.client("sts").get_caller_identity()["Account"]
+                if not role_arn:
+                    role_arn = f"arn:aws:iam::{acct}:role/{role_name}"
+
+                role_key = f"{acct}#{role_name}"
+                if role_key not in role_seen:
+                    entry = {
+                        "role_name": role_name,
+                        "role_arn": role_arn,
+                        "account_id": acct,
+                        "policies": [],
+                        "permission_boundary_arn": pb_arn,
+                    }
+                    role_seen[role_key] = entry
+                    roles_by_account[acct].append(entry)
+
+                if policy_name and policy_name != "(none)":
+                    role_seen[role_key]["policies"].append({
+                        "policy_name": policy_name,
+                        "policy_type": policy_type,
+                    })
+
+        total_roles = sum(len(r) for r in roles_by_account.values())
+        print(f"  Loaded {total_roles} role(s) across {len(roles_by_account)} account(s)")
+
+        _generate_iac_from_roles(
+            dict(roles_by_account),
+            args.entitlement_csv,
+            args.aam_application_arn or "",
+            getattr(args, "aam_source_account", "") or "",
+            args.region,
+        )
+        print("\nDone.")
+        return
+
     print("=" * 60)
     print("  AAM Role Evaluation — SAML Federated Role Report")
     print("=" * 60)
@@ -776,28 +955,78 @@ def main():
             print(f"  SAML-federated roles found: {len(saml_roles)}")
 
             if saml_roles:
-                csv_path = generate_csv(account_id, idp_arns[0], saml_roles)
-                print(f"  CSV: {csv_path}")
-                update_trust_policies(saml_roles, idp_arns, account_id,
-                                      getattr(args, "aam_source_account", "") or "",
-                                      args.aam_application_arn or "")
+                if not args.generate_iac:
+                    update_trust_policies(saml_roles, idp_arns, account_id,
+                                          getattr(args, "aam_source_account", "") or "",
+                                          args.aam_application_arn or "")
+                # Tag each role with its account_id for the consolidated report
+                for r in saml_roles:
+                    r.setdefault("account_id", account_id)
                 all_saml_roles.extend(saml_roles)
 
-        # Entitlement creation (after all accounts processed)
-        if args.aam_application_arn and all_saml_roles:
-            print("\n" + "=" * 60)
-            print("  AAM Entitlement Creation")
-            print("=" * 60)
-            first_account = account_sessions[0][2] if account_sessions else ""
-            if args.entitlement_csv:
-                create_entitlements_from_csv(
-                    args.aam_application_arn, args.entitlement_csv, args.region, args.workers,
-                )
-            elif args.group_names_file:
-                create_entitlements_from_groups(
-                    all_saml_roles, first_account, args.aam_application_arn,
-                    args.group_names_file, args.group_pattern, args.region, args.workers,
-                )
+        # Generate consolidated reports across all accounts
+        if all_saml_roles:
+            # Consolidated role evaluation CSV
+            csv_path = f"AAM_role_evaluation_multi.csv"
+            header = ["Account ID", "Role Name", "Role ARN", "Policy Name", "Policy Type", "Permission Boundary", "Trust Policy Name"]
+            rows = []
+            for entry in all_saml_roles:
+                role_name = entry["role_name"]
+                acct = entry.get("account_id", "")
+                role_arn = entry.get("role_arn", f"arn:aws:iam::{acct}:role/{role_name}")
+                trust_name = extract_trust_policy_name(entry["trust_policy_document"])
+                pb_arn = entry.get("permission_boundary_arn", "") or ""
+                policies = entry.get("policies", [])
+                if policies:
+                    for pol in policies:
+                        rows.append([acct, role_name, role_arn, pol.get("policy_name", ""), pol.get("policy_type", ""), pb_arn, trust_name])
+                else:
+                    rows.append([acct, role_name, role_arn, "(none)", "N/A", pb_arn, trust_name])
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = _csv_writer_mod.writer(f)
+                writer.writerow(header)
+                writer.writerows(rows)
+            print(f"\n  Consolidated role report: {csv_path}")
+
+            # Consolidated entitlement mapping template
+            ent_path = "entitlement_mappings_multi.csv"
+            ent_header = ["Group/Principal", "Principal Type", "Account ID", "Role Name", "Role ARN"]
+            ent_rows = []
+            for entry in all_saml_roles:
+                role_name = entry["role_name"]
+                acct = entry.get("account_id", "")
+                role_arn = entry.get("role_arn", f"arn:aws:iam::{acct}:role/{role_name}")
+                ent_rows.append(["", "", acct, role_name, role_arn])
+            with open(ent_path, "w", newline="", encoding="utf-8") as f:
+                writer = _csv_writer_mod.writer(f)
+                writer.writerow(ent_header)
+                writer.writerows(ent_rows)
+            print(f"  Consolidated entitlement template: {ent_path}")
+            print("  Fill in the Group/Principal and Principal Type columns, then pass to --entitlement-csv")
+
+        if args.generate_iac and all_saml_roles:
+            # Group roles by account for per-account template generation
+            roles_by_acct: Dict[str, List] = {}
+            for r in all_saml_roles:
+                acct = r.get("account_id", "unknown")
+                roles_by_acct.setdefault(acct, []).append(r)
+            _generate_iac_from_roles(
+                roles_by_acct,
+                args.entitlement_csv,
+                args.aam_application_arn or "",
+                getattr(args, "aam_source_account", "") or "",
+                args.region,
+            )
+        elif not args.generate_iac:
+            # Entitlement creation (after all accounts processed)
+            if args.aam_application_arn and all_saml_roles:
+                print("\n" + "=" * 60)
+                print("  AAM Entitlement Creation")
+                print("=" * 60)
+                if args.entitlement_csv:
+                    create_entitlements_from_csv(
+                        args.aam_application_arn, args.entitlement_csv, args.region, args.workers,
+                    )
         print("\nDone.")
         return
 
@@ -824,24 +1053,33 @@ def main():
     csv_path = generate_csv(account_id, idp_arns[0], saml_roles)
     print(f"\nCSV report generated: {csv_path}")
 
-    update_trust_policies(saml_roles, idp_arns, account_id,
-                          getattr(args, "aam_source_account", "") or "",
-                          args.aam_application_arn or "")
+    ent_template_path = generate_entitlement_template(account_id, saml_roles)
+    print(f"Entitlement mapping template: {ent_template_path}")
+    print("  Fill in the Group/Principal and Principal Type columns, then pass to --entitlement-csv")
 
-    # Entitlement creation
-    if args.aam_application_arn:
-        print("\n" + "=" * 60)
-        print("  AAM Entitlement Creation")
-        print("=" * 60)
-        if args.entitlement_csv:
-            create_entitlements_from_csv(
-                args.aam_application_arn, args.entitlement_csv, args.region, args.workers,
-            )
-        elif args.group_names_file:
-            create_entitlements_from_groups(
-                saml_roles, account_id, args.aam_application_arn,
-                args.group_names_file, args.group_pattern, args.region, args.workers,
-            )
+    if args.generate_iac:
+        # Generate IaC instead of applying live changes
+        _generate_iac_from_roles(
+            {account_id: saml_roles},
+            args.entitlement_csv,
+            args.aam_application_arn or "",
+            getattr(args, "aam_source_account", "") or "",
+            args.region,
+        )
+    else:
+        update_trust_policies(saml_roles, idp_arns, account_id,
+                              getattr(args, "aam_source_account", "") or "",
+                              args.aam_application_arn or "")
+
+        # Entitlement creation
+        if args.aam_application_arn:
+            print("\n" + "=" * 60)
+            print("  AAM Entitlement Creation")
+            print("=" * 60)
+            if args.entitlement_csv:
+                create_entitlements_from_csv(
+                    args.aam_application_arn, args.entitlement_csv, args.region, args.workers,
+                )
 
     print("\nDone.")
 

@@ -1184,26 +1184,31 @@ def resolve_plan(params: dict) -> dict:
         ps_name = rm.get("psName", "")
         ps_arn = rm.get("psArn", "") or ps_name_to_arn.get(ps_name, "")
 
-        # Resolve principal to UUID
+        # Resolve principal to UUID (skip if already a UUID)
         principal_id = principal_name
         resolution_error = None
         if principal_name:
-            try:
-                if principal_type.upper() == "USER":
-                    resp = identity_store.get_user_id(
-                        IdentityStoreId=identity_store_id,
-                        AlternateIdentifier={"UniqueAttribute": {"AttributePath": "userName", "AttributeValue": principal_name}},
-                    )
-                    principal_id = resp["UserId"]
-                else:
-                    resp = identity_store.get_group_id(
-                        IdentityStoreId=identity_store_id,
-                        AlternateIdentifier={"UniqueAttribute": {"AttributePath": "displayName", "AttributeValue": principal_name}},
-                    )
-                    principal_id = resp["GroupId"]
-            except Exception as exc:
-                resolution_error = str(exc)
-                # Keep the display name as fallback
+            import re as _re
+            _UUID_RE = _re.compile(r"^([0-9a-f]{10}-)?[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$")
+            if _UUID_RE.match(principal_name):
+                principal_id = principal_name
+            else:
+                try:
+                    if principal_type.upper() == "USER":
+                        resp = identity_store.get_user_id(
+                            IdentityStoreId=identity_store_id,
+                            AlternateIdentifier={"UniqueAttribute": {"AttributePath": "userName", "AttributeValue": principal_name}},
+                        )
+                        principal_id = resp["UserId"]
+                    else:
+                        resp = identity_store.get_group_id(
+                            IdentityStoreId=identity_store_id,
+                            AlternateIdentifier={"UniqueAttribute": {"AttributePath": "displayName", "AttributeValue": principal_name}},
+                        )
+                        principal_id = resp["GroupId"]
+                except Exception as exc:
+                    resolution_error = str(exc)
+                    # Keep the display name as fallback
 
         resolved_mappings.append({
             "key": f"{ps_arn}#{rm.get('accountId', '')}#{principal_id}",

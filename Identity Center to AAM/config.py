@@ -276,14 +276,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--aam-idc-instance-arn",
         help="Override IdC instance ARN. Auto-discovered if not supplied.",
     )
-    p.add_argument(
-        "--aam-region",
-        dest="aam_region",
-        help=(
-            "Region for the AAM client, when it differs from --region (the IdC "
-            "region). Defaults to --region."
-        ),
-    )
 
     # Audit
     p.add_argument(
@@ -364,6 +356,16 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _extract_region_from_arn(arn: str | None) -> str | None:
+    """Extract the region from an ARN like arn:aws:account-access:us-west-2:..."""
+    if not arn:
+        return None
+    parts = arn.split(":")
+    if len(parts) >= 4 and parts[3]:
+        return parts[3]
+    return None
+
+
 def parse_args(argv: Sequence[str]) -> Config:
     parser = _build_parser()
     ns = parser.parse_args(list(argv))
@@ -399,7 +401,7 @@ def parse_args(argv: Sequence[str]) -> Config:
         aam_application_arn=ns.aam_application_arn,
         validate_aam_application=bool(ns.validate_aam_application),
         aam_idc_instance_arn=ns.aam_idc_instance_arn,
-        aam_region=ns.aam_region,
+        aam_region=_extract_region_from_arn(ns.aam_application_arn),
         audit_to_cloudwatch=bool(ns.audit_to_cloudwatch),
         cloudwatch_log_group=ns.cloudwatch_log_group,
         audit_to_file=bool(ns.audit_to_file),

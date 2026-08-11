@@ -169,6 +169,15 @@ def discover_federated_roles(
                         provider_name = fed.split("/")[-1] if "/" in fed else fed
                         trust_summary.append(f"Federated:{provider_name}")
 
+                # Permission boundary
+                permission_boundary_arn = None
+                try:
+                    pb = role.meta.data.get("PermissionsBoundary")
+                    if pb:
+                        permission_boundary_arn = pb.get("PermissionsBoundaryArn", "")
+                except Exception:
+                    pass
+
                 return {
                     "role_name": role_name,
                     "role_arn": f"arn:aws:iam::{account_id}:role/{role_name}",
@@ -177,6 +186,7 @@ def discover_federated_roles(
                     "trust_policy_document": trust_doc,
                     "trust_summary": "; ".join(trust_summary),
                     "policies": attached + inline,
+                    "permission_boundary_arn": permission_boundary_arn,
                 }
         return None
 
@@ -339,9 +349,17 @@ def resolve_principal_id(
     """
     Resolve a display name to an Identity Store UUID using GetGroupId/GetUserId.
 
+    If the input already matches the UUID pattern expected by AAM, it is returned
+    as-is without making an API call.
+
     Returns (uuid, None) on success, or (original_name, error_message) on failure.
     Uses exact match via AlternateIdentifier/UniqueAttribute.
     """
+    # Skip resolution if the input is already a valid Identity Store UUID
+    import re
+    _UUID_RE = re.compile(r"^([0-9a-f]{10}-)?[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$")
+    if _UUID_RE.match(name):
+        return name, None
     try:
         if principal_type.upper() == "USER":
             resp = identity_store_client.get_user_id(
@@ -416,6 +434,10 @@ def create_entitlements(
     Resolves display names to Identity Store UUIDs via GetGroupId/GetUserId
     before calling CreateEntitlement.
     """
+    # Auto-detect region from the application ARN if it differs from the provided region
+    arn_parts = aam_application_arn.split(":")
+    if len(arn_parts) >= 4 and arn_parts[3]:
+        region = arn_parts[3]
     aam_endpoint = AAM_ENDPOINT_TEMPLATE.format(region=region)
     try:
         aam_client = hub_session.client("accountaccess", region_name=region, endpoint_url=aam_endpoint)

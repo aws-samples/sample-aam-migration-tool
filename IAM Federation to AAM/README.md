@@ -41,6 +41,26 @@ python AAM_role_evaluation.py \
   --aam-application-arn "arn:aws:account-access:us-east-1:123456:application/app-id" \
   --entitlement-csv entitlement_mappings.csv \
   --region us-east-1
+
+# Generate IaC templates (no live changes)
+# Step 1: Run discovery to get the role report and entitlement template
+python AAM_role_evaluation.py --workers 5
+
+# Step 2: Fill in the generated entitlement_mappings_<account>.csv template,
+#          then re-run with --generate-iac to produce CloudFormation templates
+#          (uses the discovery CSV — no API calls needed)
+python AAM_role_evaluation.py \
+  --generate-iac \
+  --role-evaluation-csv AAM_role_evaluation_075384444871.csv \
+  --entitlement-csv entitlement_mappings_075384444871.csv \
+  --aam-application-arn "arn:aws:account-access:us-west-2:075384444871:application/app-id"
+
+# Multi-account: same pattern with the consolidated CSV
+python AAM_role_evaluation.py \
+  --generate-iac \
+  --role-evaluation-csv AAM_role_evaluation_multi.csv \
+  --entitlement-csv entitlement_mappings_multi.csv \
+  --aam-application-arn "arn:aws:account-access:us-west-2:075384444871:application/app-id"
 ```
 
 ---
@@ -51,8 +71,10 @@ python AAM_role_evaluation.py \
 2. **Prompts you to select** which provider to evaluate against
 3. **Scans all IAM roles** (parallelized) and filters to those with a trust policy referencing the selected provider
 4. **Generates a CSV report** with role names, attached policies, and trust policy details
-5. **Offers to update trust policies** — ADD (keep SAML, add AAM) or REPLACE (remove SAML, add AAM only)
-6. **Creates AAM entitlements** (optional) from a group-to-role mapping
+5. **Generates an entitlement mapping template** — pre-filled CSV with Account ID, Role Name, and Role ARN for you to add principals
+6. **Offers to update trust policies** — ADD (keep SAML, add AAM) or REPLACE (remove SAML, add AAM only)
+7. **Creates AAM entitlements** (optional) from the entitlement mapping CSV
+8. **Generates IaC** (optional, `--generate-iac`) — produces per-account CloudFormation templates instead of applying live changes
 
 ---
 
@@ -60,7 +82,8 @@ python AAM_role_evaluation.py \
 
 | Phase | Changes? | What happens |
 |-------|----------|-------------|
-| Discovery + CSV | No | Read-only. Lists providers and roles. |
+| Discovery + CSV | No | Read-only. Lists providers and roles. Generates entitlement mapping template. |
+| Generate IaC (`--generate-iac`) | No | Produces per-account CloudFormation templates for roles + a separate entitlements template. No AWS changes. |
 | Trust policy update (ADD) | Yes | Appends AAM service principal statement. SAML trust remains. |
 | Trust policy update (REPLACE) | Yes | Removes SAML trust statement, adds AAM statement. |
 | Entitlement creation | Yes | Creates `account-access:Entitlement` resources in the hub account. |
@@ -94,14 +117,19 @@ python AAM_role_evaluation.py --rollback <backup_file>
 | `--apply-only` | off | Skip discovery. Apply trust policy updates + entitlement creation directly from `--entitlement-csv`. |
 | `--mode` | `ADD` | Trust policy update mode: `ADD` (keep SAML, add AAM) or `REPLACE` (remove SAML). |
 
+### IaC generation
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--generate-iac` | off | Generate per-account CloudFormation templates instead of applying changes live. Mutually exclusive with interactive trust policy updates. |
+| `--role-evaluation-csv` | — | Path to a previously generated role evaluation CSV (from discovery). Skips re-running discovery when used with `--generate-iac`. |
+
 ### Entitlement creation
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--aam-application-arn` | — | AAM application ARN. Required for entitlement creation. |
-| `--entitlement-csv` | — | Columnar CSV with Group, Account, Role columns. Direct mapping. |
-| `--group-names-file` | — | File with IdP group names (one per line). Used with `--group-pattern`. |
-| `--group-pattern` | `{principal}_{account}_{role}` | Pattern to parse group names into entitlement mappings. |
+| `--entitlement-csv` | — | Columnar CSV with Group/Principal, Principal Type, Account ID, Role Name, Role ARN columns. |
 | `--region` | `us-east-1` | AWS region for AAM API calls. |
 
 ### Other
@@ -135,23 +163,6 @@ jane@example.com,USER,222222222222,ReadOnly,arn:aws:iam::222222222222:role/ReadO
 | Role ARN | No | Full role ARN. Constructed from Account ID + Role Name if omitted. |
 
 This format is identical to what the UI exports from the entitlement mapping table.
-
-### Pattern-based (legacy)
-
-The `--group-names-file` + `--group-pattern` approach parses group names using a pattern:
-
-```bash
-python AAM_role_evaluation.py \
-  --aam-application-arn "arn:..." \
-  --group-names-file groups.txt \
-  --group-pattern "{principal}_{account}_{role}"
-```
-
-Where `groups.txt` contains:
-```
-admins_111111111111_PowerUser
-devs_222222222222_ReadOnly
-```
 
 ---
 
