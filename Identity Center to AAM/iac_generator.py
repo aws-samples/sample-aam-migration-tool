@@ -51,7 +51,8 @@ class IaCGenerator:
     def trust_policy_document(self) -> dict:
         """Return the AssumeRolePolicyDocument. When the operator supplies a
         trust policy file, use it; otherwise emit the canonical AAM trust policy
-        (Req 9.3)."""
+        (Req 9.3). Injects confused-deputy conditions (aws:SourceAccount,
+        aws:SourceArn) when --aam-application-arn is provided."""
         if self._trust_policy_cache is not None:
             return self._trust_policy_cache
 
@@ -69,6 +70,23 @@ class IaCGenerator:
                     }
                 ],
             }
+
+        # Inject confused-deputy conditions when AAM application ARN is available
+        if self.cfg.aam_application_arn:
+            app_arn = self.cfg.aam_application_arn
+            # Extract source account from the application ARN (arn:aws:account-access:<region>:<account>:application/...)
+            parts = app_arn.split(":")
+            source_account = parts[4] if len(parts) >= 5 else ""
+            for stmt in doc.get("Statement", []):
+                principal = stmt.get("Principal", {})
+                svc = principal.get("Service", "")
+                if svc == AAM_TRUST_SERVICE_PRINCIPAL or svc == "account-access.amazonaws.com":
+                    condition = stmt.setdefault("Condition", {})
+                    str_eq = condition.setdefault("StringEquals", {})
+                    if source_account:
+                        str_eq["aws:SourceAccount"] = source_account
+                    str_eq["aws:SourceArn"] = app_arn
+
         self._trust_policy_cache = doc
         return doc
 

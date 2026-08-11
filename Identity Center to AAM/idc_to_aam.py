@@ -31,6 +31,7 @@ from entitlement_creator import EntitlementCreator
 from iac_generator import IaCGenerator
 from inventory import InventoryModule
 from mapping_reporter import MappingReporter
+from models import AccountAssignmentRecord, Inventory, PermissionSetRecord
 from plan import MigrationPlanModule, PlanError
 from role_creator import RoleCreator
 
@@ -55,14 +56,18 @@ def print_inventory_summary(inventory) -> None:
     print()
 
 
-def confirm_apply(hub_account_id: str) -> bool:
+def confirm_apply(hub_account_id: str, target_accounts: tuple[str, ...] = ()) -> bool:
     """Up-front confirmation shown before anything runs in apply mode, because
     apply is the only path that changes the live AWS environment (Req 13)."""
     print()
     print("\u26a0\ufe0f  This will make changes to your AWS environment.")
-    print(
-        f"   It will create IAM roles and AAM entitlements in account {hub_account_id}."
-    )
+    if target_accounts and len(target_accounts) > 1:
+        print(f"   It will create IAM roles and AAM entitlements in {len(target_accounts)} accounts:")
+        for acct in target_accounts:
+            print(f"     - {acct}")
+    else:
+        acct = target_accounts[0] if target_accounts else hub_account_id
+        print(f"   It will create IAM roles and AAM entitlements in account {acct}.")
     try:
         ans = input("   Are you sure you want to continue? Type 'yes' to proceed: ").strip().lower()
     except EOFError:
@@ -100,7 +105,6 @@ def main(argv: Sequence[str]) -> int:
             inv_data = _json.load(f)
 
         # Reconstruct an Inventory from the JSON
-        from models import Inventory, PermissionSetRecord, AccountAssignmentRecord
         inventory = Inventory.from_json_data(inv_data) if hasattr(Inventory, "from_json_data") else Inventory(
             hub_account_id=inv_data.get("hub_account_id", hub.account_id),
             idc_instance_arn=inv_data.get("idc_instance_arn", ""),
@@ -135,13 +139,13 @@ def main(argv: Sequence[str]) -> int:
         apply_mode = True
         # Skip confirmation prompt or honor --auto-approve
         if not cfg.auto_approve:
-            if not confirm_apply(hub.account_id):
+            if not confirm_apply(hub.account_id, cfg.account_ids):
                 print("Cancelled. No changes were made.")
                 return 0
     else:
         # Normal flow: ask up front, then run discovery
         if apply_mode and not cfg.auto_approve:
-            if not confirm_apply(hub.account_id):
+            if not confirm_apply(hub.account_id, cfg.account_ids):
                 print("Cancelled. No changes were made to your AWS environment.")
                 return 0
 
@@ -155,36 +159,87 @@ def main(argv: Sequence[str]) -> int:
     )
 
     try:
+        # ── Phase 2 (early): Consume plan if provided ────────────────────────
+        # When a plan is supplied, we parse it first so we can run targeted
+        # discovery (only the permission sets + accounts in the plan).
+        plan_module = MigrationPlanModule(cfg, audit)
+        plan_rows = None
+        role_names: dict[str, str] = {}
+        if cfg.plan_path:
+            try:
+                plan_rows = plan_module.consume(cfg.plan_path)
+                role_names = plan_module.role_name_for(plan_rows)
+            except PlanError as exc:
+                audit.log_failure("migration_plan", cfg.plan_path or cfg.run_id, exc)
+                print(f"Migration plan error: {exc}", file=sys.stderr)
+                return 2
+
         # ── Phase 1: Inventory ────────────────────────────────────────────────
         if cfg.apply_only:
             # Already loaded above from --inventory-input
             pass
+        elif plan_rows:
+            # Plan-supplied path: run targeted discovery using only the PS ARNs
+            # and account IDs from the plan. IdC remains the source of truth for
+            # assignments (who has access) — the plan only controls which
+            # permission sets and accounts are in scope.
+            target_ps_arns = list(role_names.keys())
+            target_accounts_from_plan: list[str] = []
+            for row in plan_rows:
+                for acct in row.account_ids:
+                    if acct not in target_accounts_from_plan:
+                        target_accounts_from_plan.append(acct)
+
+            inventory = InventoryModule(hub, cfg, audit).run(
+                ps_arns_override=target_ps_arns,
+                account_ids_override=target_accounts_from_plan or None,
+            )
+            print_inventory_summary(inventory)
         else:
             inventory = InventoryModule(hub, cfg, audit).run()
             print_inventory_summary(inventory)
 
-        # ── Phase 2: Migration plan (generate or consume) ────────────────────
-        plan_module = MigrationPlanModule(cfg, audit)
-        try:
-            if cfg.plan_path:
-                plan_rows = plan_module.consume(cfg.plan_path)
-            else:
+        # ── Phase 2 (continued): Generate plan if not supplied ────────────────
+        if not plan_rows:
+            try:
                 plan_module.generate(inventory, cfg.plan_output_path)
                 plan_rows = plan_module.rows_from_inventory(inventory)
-            role_names = plan_module.role_name_for(plan_rows)
-        except PlanError as exc:
-            audit.log_failure("migration_plan", cfg.plan_path or cfg.run_id, exc)
-            print(f"Migration plan error: {exc}", file=sys.stderr)
-            return 2
+                role_names = plan_module.role_name_for(plan_rows)
+            except PlanError as exc:
+                audit.log_failure("migration_plan", cfg.plan_path or cfg.run_id, exc)
+                print(f"Migration plan error: {exc}", file=sys.stderr)
+                return 2
 
         iac_generator = IaCGenerator(cfg, audit)
+
+        # Build a profile→account_id mapping if profiles were provided
+        profile_to_account: dict[str, str] = {}
+        account_to_profile: dict[str, str] = {}
+        if cfg.profiles:
+            import boto3 as _boto3
+            for profile in cfg.profiles:
+                try:
+                    sess = _boto3.Session(profile_name=profile, region_name=cfg.region)
+                    acct = sess.client("sts").get_caller_identity()["Account"]
+                    profile_to_account[profile] = acct
+                    account_to_profile[acct] = profile
+                except Exception as exc:
+                    print(f"  Warning: could not resolve profile '{profile}': {exc}")
 
         def session_factory(account_id: str):
             if cfg.account_scope == "single":
                 return hub.session
+            # If profiles are provided, use the matching profile for this account
+            if account_to_profile and account_id in account_to_profile:
+                import boto3 as _boto3
+                return _boto3.Session(profile_name=account_to_profile[account_id], region_name=cfg.region)
+            # If the account is the hub account, reuse the hub session
+            if account_id == hub.account_id:
+                return hub.session
+            # Otherwise assume role
             return assume_spoke_session(
                 account_id=account_id,
-                role_name=cfg.role_name,
+                role_name=cfg.role_name or "OrganizationAccountAccessRole",
                 run_id=cfg.run_id,
                 region=cfg.region,
                 workers=cfg.workers,

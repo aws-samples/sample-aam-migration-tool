@@ -228,6 +228,22 @@ arn:aws:sso:::permissionSet/ssoins-abc/ps-456,AAM-ReadOnly,111111111111,jane@exa
 
 This format is identical to what the UI exports from the migration plan table.
 
+#### Important: IdC as the source of truth for assignments
+
+When a `--plan` is supplied, the tool still queries IdC for the actual assignments
+(who has access to what). The plan controls **which permission sets and accounts
+are in scope** and defines the **target role names**, but it does not override
+the assignment data from IdC.
+
+This means:
+- If a principal listed in the plan no longer has an assignment in IdC, no
+  entitlement will be created for them (IdC is authoritative).
+- If additional principals have been assigned since the plan was generated,
+  they WILL be included in the migration (the tool discovers all current
+  assignments for the scoped permission sets and accounts).
+- To restrict entitlements to only specific principals, manage the assignments
+  in IdC before running the migration.
+
 ### AAM
 | Flag | Default | Description |
 |------|---------|-------------|

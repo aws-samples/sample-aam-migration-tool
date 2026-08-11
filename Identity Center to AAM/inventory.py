@@ -345,14 +345,21 @@ class InventoryModule:
             arns.extend(page.get("PermissionSets", []))
         return arns
 
-    def run(self) -> Inventory:
+    def run(
+        self,
+        ps_arns_override: list[str] | None = None,
+        account_ids_override: list[str] | None = None,
+    ) -> Inventory:
         instance_arn, identity_store_id = self.discover_idc_instance()
         self.audit.log_success("discover_idc_instance", instance_arn, identity_store_id=identity_store_id)
 
         account_scope = self.cfg.account_scope  # "single" | "multi" | "org"
         target_account_ids: list[str] = []
 
-        if account_scope == "single":
+        if account_ids_override:
+            # Use the override (from a supplied plan) instead of config-based scoping
+            target_account_ids = account_ids_override
+        elif account_scope == "single":
             # Single-account: use the hub account ID as the sole target.
             target_account_ids = [self.hub.account_id]
         elif account_scope == "multi":
@@ -360,7 +367,15 @@ class InventoryModule:
             target_account_ids = list(self.cfg.account_ids)
 
         # ── Determine permission sets to describe ────────────────────────────
-        if account_scope in ("single", "multi"):
+        if ps_arns_override:
+            # Targeted discovery: only describe the specific PS ARNs from the plan
+            ps_arns = ps_arns_override
+            self.audit.log_success(
+                "list_permission_sets_from_plan",
+                instance_arn,
+                count=len(ps_arns),
+            )
+        elif account_scope in ("single", "multi"):
             # Optimized path: only list permission sets provisioned to the
             # target account(s). Avoids scanning the entire IdC instance.
             ps_arns_set: set[str] = set()
@@ -415,7 +430,7 @@ class InventoryModule:
                     instance_arn,
                     arn,
                     identity_store_id,
-                    target_account_ids if account_scope in ("single", "multi") else None,
+                    target_account_ids if (account_ids_override or account_scope in ("single", "multi")) else None,
                 ): arn
                 for arn in ps_arns
             }

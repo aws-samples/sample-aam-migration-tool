@@ -56,7 +56,24 @@ class RoleCreator:
         with open(self.cfg.trust_policy_path, "r", encoding="utf-8") as f:
             text = f.read()
         # Validate JSON shape early.
-        json.loads(text)
+        doc = json.loads(text)
+
+        # Inject confused-deputy conditions when AAM application ARN is available
+        if self.cfg.aam_application_arn:
+            app_arn = self.cfg.aam_application_arn
+            parts = app_arn.split(":")
+            source_account = parts[4] if len(parts) >= 5 else ""
+            for stmt in doc.get("Statement", []):
+                principal = stmt.get("Principal", {})
+                svc = principal.get("Service", "")
+                if svc == "account-access.amazonaws.com":
+                    condition = stmt.setdefault("Condition", {})
+                    str_eq = condition.setdefault("StringEquals", {})
+                    if source_account:
+                        str_eq["aws:SourceAccount"] = source_account
+                    str_eq["aws:SourceArn"] = app_arn
+            text = json.dumps(doc)
+
         self._trust_policy_doc = text
         return text
 

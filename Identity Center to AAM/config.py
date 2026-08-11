@@ -464,16 +464,20 @@ def validate(cfg: Config) -> None:
             f"--account-scope must be 'single', 'multi', or 'org', got {cfg.account_scope!r}"
         )
     if cfg.account_scope == "multi":
-        # multi requires either profiles or (account_ids + role_name)
-        if not cfg.account_ids and not cfg.profiles:
+        # Multi-account requires --account-ids for discovery (to know which
+        # accounts to query permission sets for).
+        if not cfg.account_ids:
             raise ConfigError(
-                "--account-ids (with --role-name) or --profiles is required when --account-scope is 'multi'"
+                "--account-ids is required when --account-scope is 'multi' "
+                "(specifies which accounts to discover permission sets for)"
             )
-        if cfg.account_ids and not cfg.role_name:
-            raise ConfigError(
-                "--role-name is required when --account-scope is 'multi' with --account-ids"
-            )
-
+        # For apply mode, also need credentials for target accounts
+        if cfg.role_creation_mode == "apply":
+            if not cfg.profiles and not cfg.role_name:
+                raise ConfigError(
+                    "apply mode with --account-scope multi requires either "
+                    "--profiles or --role-name to authenticate into target accounts"
+                )
     # Out-of-scope short-circuit: skip the role/AAM checks (Req 16.5).
     if cfg.out_of_scope_request:
         return
