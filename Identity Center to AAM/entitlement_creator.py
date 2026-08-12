@@ -41,8 +41,7 @@ class EntitlementCreator:
     component never calls CreateApplication; it references the ARN supplied via
     ``--aam-application-arn`` and optionally validates it via GetApplication.
 
-    The AAM service is invoked by boto3 client name `accountaccess` (the service
-    id from the account-access service model, API version 2018-05-10). Tests can
+    The AAM service is invoked by boto3 client name `account-access`. Tests can
     inject a stubbed client via the `aam_client` constructor parameter.
     """
 
@@ -61,13 +60,7 @@ class EntitlementCreator:
                 "region_name": getattr(cfg, "aam_region", None) or cfg.region,
                 "config": boto_config(cfg.workers),
             }
-            # Default to the production endpoint; allow override via config.
-            aam_endpoint = getattr(cfg, "aam_endpoint_url", None)
-            if not aam_endpoint:
-                aam_region = client_kwargs["region_name"]
-                aam_endpoint = f"https://account-access.{aam_region}.api.aws"
-            client_kwargs["endpoint_url"] = aam_endpoint
-            aam_client = hub.session.client("accountaccess", **client_kwargs)
+            aam_client = hub.session.client("account-access", **client_kwargs)
         self.aam = aam_client
 
     # ── Application (Req 10 — operator-supplied prerequisite) ─────────────────

@@ -495,13 +495,11 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
                 hub_session = build_session(None)
 
         aam_region = params.get("aam_region") or config.IDC_REGION or "us-west-2"
-        aam_endpoint_url = f"https://account-access.{aam_region}.api.aws"
 
         try:
             aam_client = hub_session.client(
-                "accountaccess",
+                "account-access",
                 region_name=aam_region,
-                endpoint_url=aam_endpoint_url,
             )
         except Exception as exc:
             for m in entitlement_mappings:

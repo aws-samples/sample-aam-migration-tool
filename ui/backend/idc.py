@@ -961,11 +961,10 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
             # Use the hub session for AAM (entitlements live in the management account)
             try:
                 aam_region = params.get("aam_region") or params.get("region") or "us-east-1"
-                aam_endpoint_url = params.get("aam_endpoint_url") or f"https://account-access.{aam_region}.api.aws"
                 # IMPORTANT: AAM entitlements live in the hub/management account,
                 # not the target accounts. Use default creds (same as IdC discovery).
                 hub_session_for_aam = build_session(None)
-                aam_client = hub_session_for_aam.client("accountaccess", region_name=aam_region, endpoint_url=aam_endpoint_url)
+                aam_client = hub_session_for_aam.client("account-access", region_name=aam_region)
             except Exception as exc:
                 # If the AAM client can't be created (missing custom SDK), report all as failed
                 for a in eligible_assignments:

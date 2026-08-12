@@ -22,8 +22,6 @@ from botocore.exceptions import ClientError, BotoCoreError
 
 ProgressCb = Callable[[dict], None]
 
-AAM_ENDPOINT_TEMPLATE = "https://account-access.{region}.api.aws"
-
 
 def build_aam_trust_policy(aam_source_account: str = "", aam_application_arn: str = "") -> dict:
     """
@@ -495,11 +493,10 @@ def create_entitlements(
     Create AAM entitlements for assignments.
 
     role_arn_lookup: {permission_set_arn#account_id: role_arn}
-    Uses preview endpoint, retries on ValidationException.
+    Uses the official account-access SDK client, retries on ValidationException.
     """
-    aam_endpoint = AAM_ENDPOINT_TEMPLATE.format(region=region)
     try:
-        aam_client = hub_session.client("accountaccess", region_name=region, endpoint_url=aam_endpoint)
+        aam_client = hub_session.client("account-access", region_name=region)
     except Exception as exc:
         return [{"status": "error", "error": f"AAM client unavailable: {exc}"} for _ in assignments]
 

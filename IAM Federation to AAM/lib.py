@@ -56,8 +56,6 @@ def build_trust_statement(aam_source_account: str = "", aam_application_arn: str
 # Both the preview and GA service principals — used for idempotency detection
 AAM_SERVICE_PRINCIPALS = {"account-access.amazonaws.com", "account-access-preview.amazonaws.com"}
 
-AAM_ENDPOINT_TEMPLATE = "https://account-access.{region}.api.aws"
-
 ProgressCb = Callable[[dict], None]
 
 
@@ -438,9 +436,8 @@ def create_entitlements(
     arn_parts = aam_application_arn.split(":")
     if len(arn_parts) >= 4 and arn_parts[3]:
         region = arn_parts[3]
-    aam_endpoint = AAM_ENDPOINT_TEMPLATE.format(region=region)
     try:
-        aam_client = hub_session.client("accountaccess", region_name=region, endpoint_url=aam_endpoint)
+        aam_client = hub_session.client("account-access", region_name=region)
     except Exception as exc:
         return [{"group": m.get("group", ""), "status": "error", "error": f"AAM client unavailable: {exc}"} for m in mappings]
 
