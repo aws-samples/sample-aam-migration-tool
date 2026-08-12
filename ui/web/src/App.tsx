@@ -45,7 +45,7 @@ export default function App() {
   return (
     <>
       <TopNavigation
-        identity={{ href: "#", title: "Truffle — AAM Migration Console" }}
+        identity={{ href: "#", title: "AAM Migration Tool Console" }}
         utilities={[{ type: "button", text: "Local mode", iconName: "status-info" }]}
       />
       <AppLayout

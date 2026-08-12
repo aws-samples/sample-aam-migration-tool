@@ -205,13 +205,9 @@ def setup_codebuild(session, region, account_id, role_arn):
             "Statement": [{
                 "Sid": "AllowIdentityCenterRole",
                 "Effect": "Allow",
-                "Principal": {"AWS": "*"},
+                "Principal": {"AWS": role_arn},
                 "Action": "codebuild:BatchGetReportGroups",
                 "Resource": rg_arn,
-                "Condition": {
-                    "StringEquals": {"aws:PrincipalOrgID": ORG_ID},
-                    "ArnEquals": {"aws:PrincipalArn": role_arn},
-                },
             }]
         })
         cb.put_resource_policy(
@@ -264,10 +260,18 @@ def setup_kinesis(session, region, account_id, role_arn):
     try:
         desc = kinesis.describe_stream_summary(StreamName=PREFIX)
         stream_arn = desc["StreamDescriptionSummary"]["StreamARN"]
-        kinesis.put_resource_policy(
-            ResourceARN=stream_arn,
-            Policy=policy_doc_direct(role_arn, "kinesis:DescribeStream", stream_arn),
-        )
+        # Kinesis resource policies need account root as principal
+        kinesis_policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "AllowIdentityCenterRole",
+                "Effect": "Allow",
+                "Principal": {"AWS": f"arn:aws:iam::{account_id}:root"},
+                "Action": "kinesis:DescribeStream",
+                "Resource": stream_arn,
+            }]
+        })
+        kinesis.put_resource_policy(ResourceARN=stream_arn, Policy=kinesis_policy)
         print("  Attached stream policy")
     except ClientError as e:
         print(f"  Skipped policy: {e}")
@@ -421,15 +425,36 @@ def setup_ssm(session, region, account_id, role_arn):
 
 
 def setup_entity_resolution(session, region, account_id, role_arn):
-    """Attach a resource policy to the pre-existing Entity Resolution ID namespace."""
+    """Attach a resource policy to an Entity Resolution ID namespace."""
     print("=== Entity Resolution ===")
     er = session.client("entityresolution", region_name=region)
-    ns_arn = "arn:aws:entityresolution:us-west-2:183068582925:idnamespace/test"
+    ns_name = "policy-scan-test"
+    ns_arn = f"arn:aws:entityresolution:{region}:{account_id}:idnamespace/{ns_name}"
+    # Create namespace if it doesn't exist
     try:
-        er.put_policy(
-            arn=ns_arn,
-            policy=policy_doc(role_arn, "entityresolution:GetIdNamespace", ns_arn),
+        er.create_id_namespace(
+            idNamespaceName=ns_name,
+            type="SOURCE",
         )
+        print(f"  Created ID namespace: {ns_name}")
+    except ClientError as e:
+        if "ConflictException" in str(e) or "already exists" in str(e).lower():
+            print(f"  ID namespace already exists")
+        else:
+            print(f"  Could not create ID namespace: {e}")
+            return
+    try:
+        er_policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "AllowCrossAccountAccess",
+                "Effect": "Allow",
+                "Principal": {"AWS": f"arn:aws:iam::{account_id}:root"},
+                "Action": ["entityresolution:GetIdNamespace"],
+                "Resource": ns_arn,
+            }]
+        })
+        er.put_policy(arn=ns_arn, policy=er_policy)
         print("  Attached ID namespace policy")
     except ClientError as e:
         print(f"  Skipped policy: {e}")
@@ -525,13 +550,9 @@ def setup_private_ca(session, region, account_id, role_arn):
             "Statement": [{
                 "Sid": "AllowIdentityCenterRole",
                 "Effect": "Allow",
-                "Principal": {"AWS": "*"},
+                "Principal": {"AWS": role_arn},
                 "Action": "acm-pca:DescribeCertificateAuthority",
                 "Resource": ca_arn,
-                "Condition": {
-                    "StringEquals": {"aws:PrincipalOrgID": ORG_ID},
-                    "ArnEquals": {"aws:PrincipalArn": role_arn},
-                },
             }]
         })
         pca.put_policy(
@@ -598,12 +619,24 @@ def setup_msk(session, region, account_id, role_arn):
         except ClientError as e:
             print(f"  Cluster creation error: {e}")
             return
-    # Attach cluster policy
+    # Attach cluster policy (for multi-VPC private connectivity)
     try:
-        kafka.put_cluster_policy(
-            ClusterArn=cluster_arn,
-            Policy=policy_doc_direct(role_arn, "kafka-cluster:Connect", cluster_arn),
-        )
+        msk_policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "AllowCrossAccountAccess",
+                "Effect": "Allow",
+                "Principal": {"AWS": f"arn:aws:iam::{account_id}:root"},
+                "Action": [
+                    "kafka:CreateVpcConnection",
+                    "kafka:GetBootstrapBrokers",
+                    "kafka:DescribeCluster",
+                    "kafka:DescribeClusterV2",
+                ],
+                "Resource": cluster_arn,
+            }]
+        })
+        kafka.put_cluster_policy(ClusterArn=cluster_arn, Policy=msk_policy)
         print("  Attached cluster policy")
     except ClientError as e:
         print(f"  Skipped policy (cluster may still be creating): {e}")
@@ -626,7 +659,7 @@ def setup_signer(session, region, account_id, role_arn):
         signer.add_profile_permission(
             profileName=profile_name,
             action="signer:StartSigningJob",
-            principal=role_arn,
+            principal=account_id,
             statementId="AllowIdentityCenterRole",
         )
         print("  Added profile permission")
@@ -715,17 +748,18 @@ def setup_network_firewall(session, region, account_id, role_arn):
         except ClientError as e:
             print(f"  Rule group creation error: {e}")
             return
-    # Attach resource policy (for sharing)
+    # Attach resource policy (for cross-account sharing via RAM)
     try:
         nfw_policy = json.dumps({
             "Version": "2012-10-17",
             "Statement": [{
-                "Sid": "AllowIdentityCenterRole",
+                "Sid": "AllowCrossAccountAccess",
                 "Effect": "Allow",
-                "Principal": {"AWS": role_arn},
+                "Principal": {"AWS": f"arn:aws:iam::{account_id}:root"},
                 "Action": [
-                    "network-firewall:ListRuleGroups",
                     "network-firewall:CreateFirewallPolicy",
+                    "network-firewall:UpdateFirewallPolicy",
+                    "network-firewall:ListRuleGroups",
                 ],
                 "Resource": rg_arn,
             }]
@@ -737,6 +771,331 @@ def setup_network_firewall(session, region, account_id, role_arn):
         print("  Attached resource policy")
     except ClientError as e:
         print(f"  Skipped policy: {e}")
+
+
+# ─── S3 Express (Directory Bucket) ───────────────────────────────────────────
+
+def setup_s3_express(session, region, account_id, role_arn):
+    """Create an S3 Express directory bucket with a bucket policy."""
+    print("=== S3 Express (Directory Bucket) ===")
+    s3 = session.client("s3", region_name=region)
+    # Directory bucket names: <base>--<az-id>--x-s3
+    ec2 = session.client("ec2", region_name=region)
+    azs = ec2.describe_availability_zones(Filters=[{"Name": "zone-type", "Values": ["availability-zone"]}])
+    if not azs["AvailabilityZones"]:
+        print("  No AZs available, skipping")
+        return
+    az_id = azs["AvailabilityZones"][0]["ZoneId"]  # e.g. "usw2-az1"
+    bucket_name = f"policy-scan-test--{az_id}--x-s3"
+    try:
+        s3.create_bucket(
+            Bucket=bucket_name,
+            CreateBucketConfiguration={
+                "Location": {"Type": "AvailabilityZone", "Name": az_id},
+                "Bucket": {"Type": "Directory", "DataRedundancy": "SingleAvailabilityZone"},
+            },
+        )
+        print(f"  Created directory bucket: {bucket_name}")
+    except ClientError as e:
+        if "BucketAlreadyOwnedByYou" in str(e) or "BucketAlreadyExists" in str(e):
+            print(f"  Directory bucket already exists: {bucket_name}")
+        else:
+            print(f"  Error creating directory bucket: {e}")
+            return
+
+    # Attach policy
+    policy = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AllowIdentityCenterRole",
+            "Effect": "Allow",
+            "Principal": {"AWS": f"arn:aws:iam::{account_id}:root"},
+            "Action": "s3express:CreateSession",
+            "Resource": f"arn:aws:s3express:{region}:{account_id}:bucket/{bucket_name}",
+        }],
+    })
+    try:
+        s3.put_bucket_policy(Bucket=bucket_name, Policy=policy)
+        print(f"  Attached policy to {bucket_name}")
+    except ClientError as e:
+        print(f"  Error attaching policy: {e}")
+
+
+# ─── S3 Tables ────────────────────────────────────────────────────────────────
+
+def setup_s3_tables(session, region, account_id, role_arn):
+    """Create an S3 Tables table bucket with a resource policy."""
+    print("=== S3 Tables ===")
+    try:
+        s3tables = session.client("s3tables", region_name=region)
+    except Exception as e:
+        print(f"  S3 Tables client not available: {e}")
+        return
+
+    bucket_name = "policy-scan-test-tables"
+    bucket_arn = None
+    try:
+        resp = s3tables.create_table_bucket(name=bucket_name)
+        bucket_arn = resp["arn"]
+        print(f"  Created table bucket: {bucket_arn}")
+    except ClientError as e:
+        if "ConflictException" in str(e) or "already exists" in str(e).lower():
+            # List to find existing ARN
+            try:
+                buckets = s3tables.list_table_buckets()
+                for b in buckets.get("tableBuckets", []):
+                    if b["name"] == bucket_name:
+                        bucket_arn = b["arn"]
+                        break
+            except Exception:
+                pass
+            print(f"  Table bucket already exists: {bucket_arn or bucket_name}")
+        else:
+            print(f"  Error creating table bucket: {e}")
+            return
+
+    if not bucket_arn:
+        return
+
+    policy = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AllowIdentityCenterRole",
+            "Effect": "Allow",
+            "Principal": {"AWS": "*"},
+            "Action": "s3tables:*",
+            "Resource": bucket_arn,
+            "Condition": {"ArnEquals": {"aws:PrincipalArn": role_arn}},
+        }],
+    })
+    try:
+        s3tables.put_table_bucket_policy(tableBucketARN=bucket_arn, resourcePolicy=policy)
+        print(f"  Attached policy to table bucket")
+    except ClientError as e:
+        print(f"  Error attaching policy: {e}")
+
+
+# ─── Redshift Serverless ──────────────────────────────────────────────────────
+
+def setup_redshift_serverless(session, region, account_id, role_arn):
+    """Create a Redshift Serverless namespace + snapshot with a resource policy.
+    NOTE: This creates a namespace and workgroup (which incurs cost while running).
+    The workgroup is created with minimal RPU. A snapshot is taken and the policy
+    is attached to the snapshot."""
+    print("=== Redshift Serverless ===")
+    rs = session.client("redshift-serverless", region_name=region)
+
+    ns_name = "policy-scan-test-ns"
+    wg_name = "policy-scan-test-wg"
+    snapshot_name = "policy-scan-test-snap"
+
+    # Create namespace
+    try:
+        rs.create_namespace(namespaceName=ns_name)
+        print(f"  Created namespace: {ns_name}")
+    except ClientError as e:
+        if "ConflictException" in str(e) or "already exists" in str(e).lower():
+            print(f"  Namespace already exists: {ns_name}")
+        else:
+            print(f"  Error creating namespace: {e}")
+            return
+
+    # Create workgroup (minimal config)
+    try:
+        rs.create_workgroup(
+            workgroupName=wg_name,
+            namespaceName=ns_name,
+            baseCapacity=8,  # minimum RPU
+        )
+        print(f"  Created workgroup: {wg_name} (8 RPU — delete promptly to avoid cost)")
+    except ClientError as e:
+        if "ConflictException" in str(e) or "already exists" in str(e).lower():
+            print(f"  Workgroup already exists: {wg_name}")
+        else:
+            print(f"  Error creating workgroup (may need VPC/subnet): {e}")
+            # Try to attach policy to namespace directly if workgroup fails
+            try:
+                ns_resp = rs.get_namespace(namespaceName=ns_name)
+                ns_arn = ns_resp["namespace"]["namespaceArn"]
+                policy = json.dumps({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Sid": "AllowCrossAccountAccess",
+                        "Effect": "Allow",
+                        "Principal": {"AWS": f"arn:aws:iam::{account_id}:root"},
+                        "Action": "redshift-serverless:RestoreFromSnapshot",
+                        "Resource": ns_arn,
+                    }],
+                })
+                rs.put_resource_policy(resourceArn=ns_arn, policy=policy)
+                print(f"  Attached resource policy to namespace ARN")
+            except ClientError as e2:
+                print(f"  Could not attach policy: {e2}")
+            return
+
+    # Create a snapshot and attach policy
+    try:
+        import time as _time
+        ns_resp = rs.get_namespace(namespaceName=ns_name)
+        ns_arn = ns_resp["namespace"]["namespaceArn"]
+        # Wait for workgroup to become available
+        print("  Waiting for workgroup to become available...")
+        for _ in range(20):
+            try:
+                wg_resp = rs.get_workgroup(workgroupName=wg_name)
+                if wg_resp["workgroup"]["status"] == "AVAILABLE":
+                    break
+            except Exception:
+                pass
+            _time.sleep(15)
+
+        snap_resp = rs.create_snapshot(namespaceName=ns_name, snapshotName=snapshot_name)
+        snap_arn = snap_resp["snapshot"]["snapshotArn"]
+        print(f"  Created snapshot: {snap_arn}")
+
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "AllowCrossAccountAccess",
+                "Effect": "Allow",
+                "Principal": {"AWS": f"arn:aws:iam::{account_id}:root"},
+                "Action": "redshift-serverless:RestoreFromSnapshot",
+                "Resource": snap_arn,
+            }],
+        })
+        rs.put_resource_policy(resourceArn=snap_arn, policy=policy)
+        print(f"  Attached resource policy to snapshot")
+    except ClientError as e:
+        print(f"  Error with snapshot/policy: {e}")
+
+
+# ─── Serverless Application Repository ────────────────────────────────────────
+
+def setup_serverless_repo(session, region, account_id, role_arn):
+    """Create a Serverless Application Repository app with a policy."""
+    print("=== Serverless Application Repository ===")
+    sar = session.client("serverlessrepo", region_name=region)
+
+    app_name = "policy-scan-test-app"
+    app_id = None
+
+    # Simple SAM template — use InlineCode to avoid S3 dependency
+    template_body = """AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Test app for policy scanning
+Resources:
+  TestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.12
+      InlineCode: |
+        def handler(event, context):
+            return {"statusCode": 200}
+"""
+
+    try:
+        resp = sar.create_application(
+            Author="policy-scan-test",
+            Description="Test application for policy scanning",
+            Name=app_name,
+            SpdxLicenseId="MIT",
+            SemanticVersion="1.0.0",
+            TemplateBody=template_body,
+        )
+        app_id = resp["ApplicationId"]
+        print(f"  Created application: {app_id}")
+    except ClientError as e:
+        if "ConflictException" in str(e) or "already exists" in str(e).lower():
+            # Find existing
+            try:
+                apps = sar.list_applications()
+                for app in apps.get("Applications", []):
+                    if app.get("Name") == app_name:
+                        app_id = app["ApplicationId"]
+                        break
+            except Exception:
+                pass
+            print(f"  Application already exists: {app_id or app_name}")
+        else:
+            print(f"  Error creating application: {e}")
+            return
+
+    if not app_id:
+        return
+
+    # Attach application policy referencing the role
+    try:
+        sar.put_application_policy(
+            ApplicationId=app_id,
+            Statements=[{
+                "Actions": ["serverlessrepo:Deploy"],
+                "Principals": [account_id],
+                "StatementId": "AllowIdentityCenterRole",
+            }],
+        )
+        print(f"  Attached application policy")
+    except ClientError as e:
+        print(f"  Error attaching policy: {e}")
+
+
+# ─── Rekognition ──────────────────────────────────────────────────────────────
+
+def setup_rekognition(session, region, account_id, role_arn):
+    """Create a Rekognition Custom Labels project with a project policy.
+    NOTE: Rekognition Custom Labels is deprecated but the project policy API
+    still exists for cross-account model sharing."""
+    print("=== Rekognition ===")
+    rek = session.client("rekognition", region_name=region)
+
+    project_name = "policy-scan-test"
+    project_arn = None
+    try:
+        resp = rek.create_project(ProjectName=project_name)
+        project_arn = resp["ProjectArn"]
+        print(f"  Created project: {project_arn}")
+    except ClientError as e:
+        if "ResourceInUseException" in str(e) or "already exists" in str(e).lower():
+            # Find existing
+            try:
+                projects = rek.describe_projects()
+                for p in projects.get("ProjectDescriptions", []):
+                    if p["ProjectArn"].endswith(f"project/{project_name}/"):
+                        project_arn = p["ProjectArn"]
+                        break
+                    if project_name in p["ProjectArn"]:
+                        project_arn = p["ProjectArn"]
+                        break
+            except Exception:
+                pass
+            print(f"  Project already exists: {project_arn or project_name}")
+        else:
+            print(f"  Error creating project: {e}")
+            return
+
+    if not project_arn:
+        return
+
+    policy = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AllowIdentityCenterRole",
+            "Effect": "Allow",
+            "Principal": {"AWS": "*"},
+            "Action": "rekognition:CopyProjectVersion",
+            "Resource": "*",
+            "Condition": {"ArnEquals": {"aws:PrincipalArn": role_arn}},
+        }],
+    })
+    try:
+        rek.put_project_policy(
+            ProjectArn=project_arn,
+            PolicyName="policy-scan-test",
+            PolicyDocument=policy,
+        )
+        print(f"  Attached project policy")
+    except ClientError as e:
+        print(f"  Error attaching policy: {e}")
 
 
 # ─── Cleanup ─────────────────────────────────────────────────────────────────
@@ -930,6 +1289,88 @@ def cleanup(session, region, account_id, skip_cfn=False):
     except ClientError as e:
         print(f"  Network Firewall cleanup: {e}")
 
+    # S3 Express (Directory Bucket)
+    try:
+        s3 = session.client("s3", region_name=region)
+        ec2 = session.client("ec2", region_name=region)
+        azs = ec2.describe_availability_zones(Filters=[{"Name": "zone-type", "Values": ["availability-zone"]}])
+        az_id = azs["AvailabilityZones"][0]["ZoneId"] if azs["AvailabilityZones"] else "usw2-az1"
+        bucket_name = f"policy-scan-test--{az_id}--x-s3"
+        s3.delete_bucket_policy(Bucket=bucket_name)
+        s3.delete_bucket(Bucket=bucket_name)
+        print(f"  Deleted directory bucket: {bucket_name}")
+    except ClientError as e:
+        print(f"  S3 Express cleanup: {e}")
+
+    # S3 Tables
+    try:
+        s3tables = session.client("s3tables", region_name=region)
+        buckets = s3tables.list_table_buckets()
+        for b in buckets.get("tableBuckets", []):
+            if b["name"] == "policy-scan-test-tables":
+                s3tables.delete_table_bucket_policy(tableBucketARN=b["arn"])
+                s3tables.delete_table_bucket(tableBucketARN=b["arn"])
+                print(f"  Deleted table bucket: {b['arn']}")
+    except ClientError as e:
+        print(f"  S3 Tables cleanup: {e}")
+
+    # Redshift Serverless
+    try:
+        rs = session.client("redshift-serverless", region_name=region)
+        # Delete snapshot first
+        try:
+            rs.delete_snapshot(snapshotName="policy-scan-test-snap")
+            print("  Deleted Redshift Serverless snapshot")
+        except ClientError:
+            pass
+        # Delete workgroup
+        try:
+            rs.delete_workgroup(workgroupName="policy-scan-test-wg")
+            print("  Deleted Redshift Serverless workgroup (may take a moment)")
+        except ClientError:
+            pass
+        # Delete namespace
+        try:
+            rs.delete_namespace(namespaceName="policy-scan-test-ns")
+            print("  Deleted Redshift Serverless namespace")
+        except ClientError:
+            pass
+    except ClientError as e:
+        print(f"  Redshift Serverless cleanup: {e}")
+
+    # Serverless Application Repository
+    try:
+        sar = session.client("serverlessrepo", region_name=region)
+        apps = sar.list_applications()
+        for app in apps.get("Applications", []):
+            if app.get("Name") == "policy-scan-test-app":
+                sar.delete_application(ApplicationId=app["ApplicationId"])
+                print(f"  Deleted SAR application: {app['ApplicationId']}")
+    except ClientError as e:
+        print(f"  Serverless App Repo cleanup: {e}")
+
+    # Rekognition
+    try:
+        rek = session.client("rekognition", region_name=region)
+        projects = rek.describe_projects()
+        for p in projects.get("ProjectDescriptions", []):
+            if "policy-scan-test" in p["ProjectArn"]:
+                # Delete policy first
+                try:
+                    policies = rek.list_project_policies(ProjectArn=p["ProjectArn"])
+                    for pol in policies.get("ProjectPolicies", []):
+                        rek.delete_project_policy(
+                            ProjectArn=p["ProjectArn"],
+                            PolicyName=pol["PolicyName"],
+                            PolicyRevisionId=pol["PolicyRevisionId"],
+                        )
+                except Exception:
+                    pass
+                rek.delete_project(ProjectArn=p["ProjectArn"])
+                print(f"  Deleted Rekognition project: {p['ProjectArn']}")
+    except ClientError as e:
+        print(f"  Rekognition cleanup: {e}")
+
     # CloudFormation stack (last — some SDK resources depend on CFN resources)
     if not skip_cfn:
         delete_cfn_stack(session, region)
@@ -988,6 +1429,11 @@ def main():
     setup_signer(session, region, account_id, role_arn)
     setup_vpc_lattice(session, region, account_id, role_arn)
     setup_network_firewall(session, region, account_id, role_arn)
+    setup_s3_express(session, region, account_id, role_arn)
+    setup_s3_tables(session, region, account_id, role_arn)
+    setup_redshift_serverless(session, region, account_id, role_arn)
+    setup_serverless_repo(session, region, account_id, role_arn)
+    setup_rekognition(session, region, account_id, role_arn)
 
     print("\n" + "=" * 70)
     print("All test resources deployed.")
