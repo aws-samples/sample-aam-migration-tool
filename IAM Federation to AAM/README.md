@@ -218,11 +218,28 @@ The `lib.py` module is the single source of truth for discovery, migration, and 
 
 ## CSV Output Format
 
+### Single-account mode
+
 | Column | Description |
 |--------|-------------|
 | Role Name | IAM role name |
 | Policy Name | Attached or inline policy name |
 | Policy Type | `AWS Managed`, `Customer Managed`, or `Inline` |
+| Permission Boundary | ARN of the permission boundary attached to the role (empty if none) |
+| Trust Policy Name | Summary of the current trust relationship |
+
+### Multi-account mode
+
+The consolidated CSV (`AAM_role_evaluation_multi.csv`) adds two extra leading columns:
+
+| Column | Description |
+|--------|-------------|
+| Account ID | 12-digit AWS account ID the role belongs to |
+| Role Name | IAM role name |
+| Role ARN | Full role ARN |
+| Policy Name | Attached or inline policy name |
+| Policy Type | `AWS Managed`, `Customer Managed`, or `Inline` |
+| Permission Boundary | ARN of the permission boundary attached to the role (empty if none) |
 | Trust Policy Name | Summary of the current trust relationship |
 
 ---

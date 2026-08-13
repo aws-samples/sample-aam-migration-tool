@@ -1,4 +1,4 @@
-# Truffle — AAM Migration Console
+# AAM Migration Console
 
 A locally-run web console for migrating to AWS Account Access Manager (AAM).
 Built with the [Cloudscape Design System](https://cloudscape.design/) for an
@@ -16,16 +16,6 @@ authentic AWS Console look and feel, running entirely on your machine.
 | AWS CLI | v2 | For credential resolution and AAM commands |
 | AWS credentials | configured | SSO, profiles, or environment variables |
 
-### Custom boto3 SDK (required)
-
-The tool uses a custom version of boto3/botocore that includes the AAM
-(`accountaccess`) service model. The `.whl` files are in the repo root and
-are installed automatically by `pip install -r requirements.txt`.
-
-Once the AAM service launches publicly, the standard boto3 will work and
-these wheels can be removed.
-
----
 
 ## Quick Start
 
@@ -44,23 +34,14 @@ the React UI, and serves at **http://127.0.0.1:5000**.
 ./run.sh --dev                 # Dev mode: Flask + Vite hot-reload
 ./run.sh --rebuild             # Force UI rebuild
 
-# Managed backend mode (requires deployed infrastructure)
-./run.sh --managed --endpoint https://<id>.execute-api.<region>.amazonaws.com/prod
-./run.sh --managed --endpoint URL --profile my-aws-profile
-./run.sh --managed --endpoint URL --region us-west-2
 ```
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--managed` | No | Use the managed AWS backend instead of local execution |
-| `--endpoint URL` | Yes (with `--managed`) | API Gateway endpoint from CDK deploy output |
 | `--region REGION` | No | AWS region for API signing (auto-detected from endpoint URL) |
 | `--profile PROFILE` | No | AWS profile for signing managed API requests |
 | `--dev` | No | Dev mode with Vite hot-reload on :5173 |
 | `--rebuild` | No | Force a fresh UI build |
-
-Environment variables also work: `TRUFFLE_MODE`, `TRUFFLE_API_ENDPOINT`,
-`TRUFFLE_API_REGION`, `TRUFFLE_API_PROFILE`.
 
 ---
 
@@ -73,7 +54,7 @@ to specific strings (e.g., an old SAML provider ARN you're migrating away from).
 
 **What you need to provide:**
 - **Search terms** — one or more strings to search for in resource policies
-- **Authentication** — choose between:
+- **Authentication** — choose between (single or multi-account scans):
   - *Local profiles* — select one or more AWS credential profiles
   - *Assume role* — provide account IDs + a role name to assume in each
 - **Regions** — which regions to scan (default: all enabled regions)
@@ -91,6 +72,11 @@ Discovers IAM roles with SAML trust policies and migrates them to AAM.
 **Step 2: Migration** — what you need:
 - **Mode** — `ADD` (keep existing trust, add AAM) or `REPLACE` (remove old SAML trust, add AAM)
 - **Role selection** — which discovered roles to migrate
+- **AAM Application ARN** — required for creating entitlements. Get it with:
+  ```bash
+  aws account-access list-applications --region <region>
+  ```
+  Copy the `applicationArn` from the output.
 
 ### 3. IdC → AAM
 
@@ -160,15 +146,6 @@ console or API.
 | IdC Discovery | `sso-admin:*`, `identitystore:Describe*`, `identitystore:List*` (from management/delegated admin account) |
 | IdC Apply (create roles) | `iam:CreateRole`, `iam:AttachRolePolicy`, `iam:PutRolePolicy`, `iam:TagRole` |
 | IdC Apply (entitlements) | `account-access:CreateEntitlement` |
-
-### Local Mode vs Managed Mode
-
-| | Local Mode | Managed Mode |
-|---|---|---|
-| How it works | Scans run directly on your machine using local AWS creds | Jobs submitted to a serverless backend in AWS |
-| When to use | Small-scale (few accounts), testing, development | Large-scale (100s of accounts), long-running scans |
-| Setup | Just `./run.sh` | Deploy the managed solution first (see `managed solution/README.md`) |
-| Credentials | Your local AWS profiles/SSO | Local creds sign the API request; backend assumes into target accounts |
 
 ---
 

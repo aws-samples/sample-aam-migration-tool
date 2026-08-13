@@ -105,9 +105,27 @@ API Gateway, Backup Vaults, CloudTrail, CloudWatch Logs, CodeArtifact, CodeBuild
       "policy": { "Version": "2012-10-17", "Statement": [...] },
       "account_id": "111111111111"
     }
-  ]
+  ],
+  "skipped_resources": [
+    {
+      "resource_arn": "arn:aws:kms:us-east-1:111111111111:key/abc-123",
+      "service": "KMS",
+      "error": "AccessDeniedException",
+      "account_id": "111111111111"
+    }
+  ],
+  "total_skipped": 1
 }
 ```
+
+| Field | Description |
+|-------|-------------|
+| `search_terms` | The search strings that were scanned for. |
+| `regions_scanned` | Regions included in the scan. |
+| `total_matches` | Number of resources with at least one matching term. |
+| `matches` | Array of matched resources with their full policy document. |
+| `skipped_resources` | Array of resources that could not be scanned (access denied, throttled, etc.). |
+| `total_skipped` | Count of skipped resources. |
 
 ## Performance notes
 

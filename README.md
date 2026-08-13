@@ -1,12 +1,12 @@
-# Truffle — AAM Migration Toolkit
+# AAM Migration Tool
 
-Migrate to **AWS Account Access Manager (AAM)** from IAM Identity Center (IdC) or SAML-based IAM Federation. Truffle automates discovery, policy analysis, role creation, and entitlement mapping through a browser-based console running on your local machine.
+Migrate to **AWS Account Access Manager (AAM)** from IAM Identity Center (IdC) or SAML-based IAM Federation. This tool automates discovery, policy analysis, role creation, and entitlement mapping through a browser-based console running on your local machine.
 
 ---
 
 ## Getting Started
 
-The recommended way to use Truffle is through the **web console**:
+The recommended way to use this tool is through the **web console**:
 
 ```bash
 cd ui
@@ -25,9 +25,9 @@ See [`ui/README.md`](ui/README.md) for full UI documentation including credentia
 
 ### 1. Policy Analysis
 
-Scans resource-based policies (S3, KMS, SQS, SNS, Lambda, IAM trust policies, SCPs/RCPs, and 20+ more services) across accounts for specific strings. Supports case-insensitive matching and IAM-style wildcards (`*`, `?`).
+Scans resource-based policies (S3, KMS, SQS, SNS, Lambda, IAM trust policies, SCPs/RCPs, and 20+ more services) across accounts for specific strings. Supports case-insensitive matching and IAM-style wildcards (`*`, `?`). The purpose of this tool is to identify where Identity Center Permission Sets are referenced in policies as those policies will need to be modified to refer to the new IAM Role ARN used by Account Access Manager. 
 
-Use this to identify policies that reference your IdP before migration.
+Use this to identify policies that reference your IdP before completing migration.
 
 - Read-only — never modifies policies
 - Parallelized across accounts and services
@@ -74,9 +74,8 @@ Each tool can also be run independently from the command line without the UI. Th
 | IAM Federation → AAM | `IAM Federation to AAM/` | [`IAM Federation to AAM/README.md`](IAM%20Federation%20to%20AAM/README.md) |
 | IdC → AAM | `Identity Center to AAM/` | [`Identity Center to AAM/README.md`](Identity%20Center%20to%20AAM/README.md) |
 
-The CLI tools and the UI share the same core logic via `lib.py` modules. Bug fixes and features apply to both.
 
-Both the IAM Federation and IdC CLIs support `--apply-only` mode to skip discovery and apply directly from a previously generated file (CSV or inventory JSON). Both also support `--profiles` for multi-account credential resolution via named AWS profiles.
+Both the IAM Federation and IdC tools (UI or CLI) support `--apply-only` mode to skip discovery and apply directly from a previously generated file (CSV or inventory JSON). Both also support `--profiles` for multi-account credential resolution via named AWS profiles.
 
 ---
 
@@ -229,9 +228,9 @@ account-access:GetApplication
 2. **Pre-create customer managed policies** — If your IdC permission sets reference CMPs, those policies must exist in each target account with the same name and path.
 3. **Test access after migration** — Validate that users/groups can assume the new roles.
 4. **Run parallel operations** — Keep IdC or SAML federation active alongside AAM until validated.
-5. **Decommission legacy access** — Once satisfied, disable the old access path.
+5. **Decommission legacy access** — Once satisfied, tested, and validated disable the old access path.
 6. **Update resource-based policies** — If policies reference old role ARNs, update them. Policy Analysis helps identify these.
-7. **Set up break-glass access** — Ensure emergency access procedures exist before cutover.
+
 
 ---
 
@@ -239,7 +238,7 @@ account-access:GetApplication
 
 - **Local-only execution** — runs entirely on your machine. No data is sent externally. Results cached in `ui/cache/`.
 - **No rollback automation** — apply mode logs what it changed but doesn't provide one-click undo.
-- **IdC API throttling** — org-wide scans may hit rate limits (20 TPS). The tool uses adaptive retry with exponential backoff.
+- **IdC API throttling** — scans may hit rate limits (e.g., 20 TPS for Identity Center). The tool uses adaptive retry with exponential backoff.
 - **Customer managed policy propagation** — CMPs referenced by permission sets must exist in target accounts before role creation.
 
 ---
@@ -247,7 +246,7 @@ account-access:GetApplication
 ## Repository Structure
 
 ```
-truffle/
+sample-aam-migration-tool/
 ├── ui/                                   # Browser-based console (primary interface)
 │   ├── run.sh                            # One-command setup + launch
 │   ├── app.py                            # Flask API + serves built UI
@@ -274,11 +273,3 @@ truffle/
 ```
 
 ---
-
-## Design Tenets
-
-- **Lightweight** — minimal dependencies, no Docker/containers required
-- **Fast** — parallel API calls where possible
-- **AWS console look and feel** — Cloudscape design system
-- **Local-first** — runs on your machine, uses your credentials, caches locally
-- **Safe by default** — apply mode requires explicit action

@@ -33,7 +33,7 @@ then generates cloudformation/terraform with the default roles (including the tr
 
 - there should be an option to run this in a single account or the entire org, the default should be a single account. We should have a disclaimer for the org run that they may get throttled
 
-It is one of three components in the larger Truffle migration toolkit.
+It is one of three components in the larger migration toolkit.
 
 ---
 
@@ -85,10 +85,6 @@ cd "Identity Center to AAM"
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install the custom AAM-aware SDK wheels FIRST (again to be removed when boto3 is released):
-pip install /path/to/botocore-1.43.55-py3-none-any.whl
-pip install /path/to/boto3-1.43.55-py3-none-any.whl
-
 # Then the rest of the dependencies:
 pip install -r requirements.txt
 ```
@@ -96,7 +92,7 @@ pip install -r requirements.txt
 Verify the AAM client is available:
 
 ```bash
-python -c "import boto3; boto3.client('accountaccess', region_name='us-east-1'); print('AAM client OK')"
+python -c "import boto3; boto3.client('account-access', region_name='us-east-1'); print('AAM client OK')"
 ```
 
 ---
@@ -333,6 +329,38 @@ python idc_to_aam.py --region us-east-1 \
 | `output/<run_id>/roles.yaml` | generate-iac | CloudFormation: `AWS::IAM::Role` + `AWS::AccountAccess::Entitlement`. |
 | `mapping_<run_id>.{xlsx,csv,json}` | end of run | One row per assignment: principal → permission set → account → role → entitlement → status. |
 
+### Mapping report columns
+
+The mapping report (XLSX, CSV, or JSON) contains one row per assignment:
+
+| Column | Description |
+|--------|-------------|
+| `principal_type` | `USER` or `GROUP` |
+| `principal_display_name` | Human-readable name of the IdC user or group |
+| `principal_id` | IdC principal UUID |
+| `permission_set_name` | Name of the permission set being migrated |
+| `permission_set_arn` | Full ARN of the permission set |
+| `target_account_id` | AWS account ID where the role was created |
+| `role_arn` | ARN of the created/existing IAM role |
+| `application_id` | AAM application ID (from the supplied ARN) |
+| `entitlement_id` | AAM entitlement ID (empty if skipped/failed) |
+| `status` | `CREATED`, `EXISTING`, `SKIPPED`, or `FAILED` |
+
+### Audit log CSV columns
+
+When `--audit-to-file` is enabled, the audit CSV contains:
+
+| Column | Description |
+|--------|-------------|
+| `timestamp` | ISO 8601 timestamp with timezone |
+| `run_id` | Unique run identifier |
+| `action` | The operation performed (e.g., `role_created`, `entitlement_created`) |
+| `target` | The resource being acted on (ARN or path) |
+| `status` | `SUCCESS` or `FAILURE` |
+| `caller_arn` | ARN of the IAM principal executing the action |
+| `error_detail` | Error message (empty on success) |
+| `extra` | JSON-encoded supplemental data |
+
 ---
 
 ## IAM permissions needed
@@ -375,21 +403,6 @@ and `CreateEntitlement` / `ListEntitlements`.
 
 ---
 
-## For contributors: running the tests
-
-> You do **not** need this to use the tool — it's only for developers changing
-> the code. The tests never touch AWS.
-
-```bash
-.venv/bin/python -m pytest -q
-```
-
-The suite is unit + property-based (Hypothesis). It runs entirely offline: AWS
-is mocked with `moto` and the preview AAM client is replaced with an injected
-stub, so no credentials and no real API calls are involved.
-
----
-
 ## Limitations / out of scope
 
 - **Terraform output** is not yet emitted (no AAM Terraform provider yet);
@@ -399,7 +412,7 @@ stub, so no credentials and no real API calls are involved.
 - **Multi-account IaC distribution** (CloudFormation StackSets) is future work;
   generated templates target a single account.
 - The tool does **not** modify resource-based policies, migrate IAM Federation,
-  or analyze SCPs/RCPs/VPC endpoint policies (other Truffle components cover those).
+  or analyze SCPs/RCPs/VPC endpoint policies (other components cover those).
 
 
 ---
