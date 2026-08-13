@@ -94,6 +94,7 @@ sts:AssumeRole
 ec2:DescribeRegions
 s3:ListAllMyBuckets
 s3:GetBucketPolicy
+s3:GetBucketLocation
 s3:ListDirectoryBuckets
 iam:ListRoles
 iam:GetRole
@@ -159,6 +160,8 @@ sqs:ListQueues
 sqs:GetQueueAttributes
 ecr:DescribeRepositories
 ecr:GetRepositoryPolicy
+ecr-public:DescribeRepositories
+ecr-public:GetRepositoryPolicy
 efs:DescribeFileSystems
 efs:DescribeFileSystemPolicy
 redshift-serverless:ListNamespaces
@@ -185,6 +188,8 @@ iam:UpdateAssumeRolePolicy
 account-access:CreateEntitlement
 account-access:ListEntitlements
 account-access:GetApplication
+identitystore:GetGroupId
+identitystore:GetUserId
 ```
 
 ### IdC → AAM
@@ -203,6 +208,8 @@ sso:ListAccountsForProvisionedPermissionSet
 sso:ListAccountAssignments
 identitystore:DescribeUser
 identitystore:DescribeGroup
+identitystore:GetGroupId
+identitystore:GetUserId
 
 # Apply mode — role creation (write)
 iam:CreateRole
@@ -210,6 +217,7 @@ iam:AttachRolePolicy
 iam:PutRolePolicy
 iam:PutRolePermissionsBoundary
 iam:TagRole
+iam:TagPolicy
 iam:CreatePolicy
 iam:GetRole
 iam:GetPolicy
