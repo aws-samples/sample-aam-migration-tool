@@ -88,10 +88,14 @@ class SuppressedLogger:
             job_id: The unique job identifier (displayed in the UI so the user
                     knows which log file to inspect).
         """
+        from datetime import datetime, timezone
+
         with self._lock:
             self._counts.clear()
             self._job_id = job_id
-            self._log_filename = f"{self._module_name}_{job_id}.log"
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            short_id = job_id[:4] if job_id else "0000"
+            self._log_filename = f"{self._module_name}_{ts}_{short_id}.log"
 
         # Replace the file handler to write to the new job-specific file.
         _ensure_log_dir()

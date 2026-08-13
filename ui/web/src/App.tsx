@@ -6,6 +6,7 @@ import PolicyAnalysis from "./pages/PolicyAnalysis";
 import IamFederation from "./pages/IamFederation";
 import Idc from "./pages/Idc";
 import CacheManager from "./pages/CacheManager";
+import { NotificationProvider, NotificationBar } from "./utils/notifications";
 
 type PageId = "policy-analysis" | "iam-federation" | "idc" | "cache";
 
@@ -43,13 +44,14 @@ export default function App() {
   const [active, setActive] = useState<PageId>("idc");
 
   return (
-    <>
+    <NotificationProvider>
       <TopNavigation
         identity={{ href: "#", title: "AAM Migration Tool Console" }}
         utilities={[{ type: "button", text: "Local mode", iconName: "status-info" }]}
       />
       <AppLayout
         toolsHide
+        notifications={<NotificationBar />}
         navigation={
           <SideNavigation
             activeHref={`#${active}`}
@@ -80,6 +82,6 @@ export default function App() {
           </>
         }
       />
-    </>
+    </NotificationProvider>
   );
 }

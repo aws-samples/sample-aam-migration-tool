@@ -22,6 +22,7 @@ import { ProfileMultiSelect } from "../components/ProfileSelect";
 import { exportToCsv, parseCsvLine } from "../utils/csv";
 import { formatAbsolute, formatAge } from "../utils/time";
 import { useTablePagination } from "../utils/useTablePagination";
+import { useNotifications } from "../utils/notifications";
 
 interface PermissionSet {
   arn: string;
@@ -57,8 +58,13 @@ const POLL_MS = 1000;
 const DISCOVER_JOB_KEY = "truffle.idcDiscoverJob";
 
 export default function Idc() {
+  const { addNotification } = useNotifications();
   const [auth, setAuth] = useState<AuthState>(INITIAL_AUTH_STATE);
-  const [error, setError] = useState<string | null>(null);
+  const [, _setError] = useState<string | null>(null);
+  const setError = (msg: string | null) => {
+    _setError(msg);
+    if (msg) addNotification("error", msg, "IdC Migration Error");
+  };
   const [region, setRegion] = useState("us-east-1");
   const [accountScope, setAccountScope] = useState<"single" | "multi" | "org">("single");
   const [targetAccountIds, setTargetAccountIds] = useState("");
@@ -409,7 +415,6 @@ export default function Idc() {
       }
     >
       <SpaceBetween size="l">
-        {error && <Alert type="error" header="Error" dismissible onDismiss={() => setError(null)}>{error}</Alert>}
 
         {/* Account Scope */}
         <Container
@@ -643,7 +648,7 @@ export default function Idc() {
                 actions={
                   <SpaceBetween direction="horizontal" size="xs">
                     <Button iconName="download" onClick={() => {
-                      exportToCsv("migration_plan.csv", roleMappings.map((m) => {
+                      exportToCsv("migration_plan.csv", filteredRoleMappings.map((m) => {
                         // Look up policies from inventory if available
                         const ps = inventory?.permission_sets.find((p) => p.arn === m.psArn);
                         return {
@@ -762,9 +767,17 @@ export default function Idc() {
                                   total_assignments: res.assignments.length,
                                 });
                               }
-                              if (res.errors.length) {
-                                const errorDetails = (res.errors as any[]).map((e: any) => `${e.principal}: ${e.resolution_error}`).join("\n");
-                                setError(`Resolution errors:\n${errorDetails}`);
+                              if (res.errors.length || res.ps_errors?.length) {
+                                const parts: string[] = [];
+                                if (res.ps_errors?.length) {
+                                  parts.push("Permission Set errors:");
+                                  (res.ps_errors as any[]).forEach((e: any) => parts.push(`  ${e.psArn}: ${e.error}`));
+                                }
+                                if (res.errors.length) {
+                                  parts.push("Principal resolution errors:");
+                                  (res.errors as any[]).forEach((e: any) => parts.push(`  ${e.principal}: ${e.resolution_error}`));
+                                }
+                                setError(parts.join("\n"));
                               }
                             }).catch((e) => {
                               // Fallback: use uploaded data as-is if resolve fails

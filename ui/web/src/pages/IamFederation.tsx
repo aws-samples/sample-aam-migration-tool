@@ -21,6 +21,7 @@ import { AuthMethodSelect, INITIAL_AUTH_STATE, parseAccountIds, type AuthState }
 import { exportToCsv, parseCsvLine } from "../utils/csv";
 import { formatAbsolute, formatAge } from "../utils/time";
 import { useTablePagination } from "../utils/useTablePagination";
+import { useNotifications } from "../utils/notifications";
 
 interface Provider {
   arn: string;
@@ -62,8 +63,13 @@ const DISCOVER_JOB_KEY = "truffle.iamDiscoverJob";
 type MigrateMode = "ADD" | "REPLACE";
 
 export default function IamFederation() {
+  const { addNotification } = useNotifications();
   const [auth, setAuth] = useState<AuthState>(INITIAL_AUTH_STATE);
-  const [error, setError] = useState<string | null>(null);
+  const [, _setError] = useState<string | null>(null);
+  const setError = (msg: string | null) => {
+    _setError(msg);
+    if (msg) addNotification("error", msg, "IAM Federation Error");
+  };
 
   // Step 1: Providers
   const [providers, setProviders] = useState<Provider[]>([]);
@@ -355,7 +361,6 @@ export default function IamFederation() {
       }
     >
       <SpaceBetween size="l">
-        {error && <Alert type="error" header="Error" dismissible onDismiss={() => setError(null)}>{error}</Alert>}
 
         {/* AAM Configuration */}
         <Container

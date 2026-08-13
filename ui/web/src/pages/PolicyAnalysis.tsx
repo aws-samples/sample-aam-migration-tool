@@ -22,6 +22,7 @@ import { type MultiOption } from "../components/ProfileSelect";
 import { exportToCsv } from "../utils/csv";
 import { formatAbsolute, formatAge } from "../utils/time";
 import { useTablePagination } from "../utils/useTablePagination";
+import { useNotifications } from "../utils/notifications";
 
 interface Match {
   resource_arn: string;
@@ -45,6 +46,7 @@ const POLL_MS = 1000;
 const JOB_KEY = "truffle.policyScanJob";
 
 export default function PolicyAnalysis() {
+  const { addNotification } = useNotifications();
   const [search, setSearch] = useState("");
   const [auth, setAuth] = useState<AuthState>(INITIAL_AUTH_STATE);
   const [services, setServices] = useState<MultiOption[]>([]);
@@ -53,7 +55,11 @@ export default function PolicyAnalysis() {
   const [mgmt, setMgmt] = useState(false);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<JobProgress | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [, _setError] = useState<string | null>(null);
+  const setError = (msg: string | null) => {
+    _setError(msg);
+    if (msg) addNotification("error", msg, "Policy Analysis Error");
+  };
   const [result, setResult] = useState<ScanData | null>(null);
   const [cachedAt, setCachedAt] = useState<string | undefined>();
   const [policyMatch, setPolicyMatch] = useState<Match | null>(null);
@@ -186,7 +192,6 @@ export default function PolicyAnalysis() {
       }
     >
       <SpaceBetween size="l">
-        {error && <Alert type="error" header="Scan failed" dismissible onDismiss={() => setError(null)}>{error}</Alert>}
 
         <Container header={<Header variant="h2">Credentials</Header>}>
           <AuthMethodSelect state={auth} onChange={setAuth} disabled={running} profileMode="multi" allowOrg={false} />

@@ -121,7 +121,7 @@ export const api = {
   idcDiscoverStatus: (jobId: string) =>
     request<JobStatus>(`/api/idc/discover/status?job_id=${encodeURIComponent(jobId)}`),
   idcResolvePlan: (payload: unknown) =>
-    request<{ permission_sets: unknown[]; assignments: unknown[]; resolved_mappings: { key: string; psArn: string; psName: string; roleName: string; principal: string; principal_id: string; accountId: string; principal_type: string; resolution_error: string | null }[]; errors: unknown[] }>(
+    request<{ permission_sets: unknown[]; assignments: unknown[]; resolved_mappings: { key: string; psArn: string; psName: string; roleName: string; principal: string; principal_id: string; accountId: string; principal_type: string; resolution_error: string | null }[]; errors: unknown[]; ps_errors?: { psArn: string; psName: string; error: string }[] }>(
       "/api/idc/resolve-plan",
       { method: "POST", body: JSON.stringify(payload) }
     ),

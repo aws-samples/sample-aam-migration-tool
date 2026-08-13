@@ -38,6 +38,30 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.post("/api/log-error")
+def log_error():
+    """Log a UI-surfaced error to the cached log file (per-day)."""
+    data = request.get_json(silent=True) or {}
+    message = data.get("message", "")
+    source = data.get("source", "ui")
+    if message:
+        import logging
+        from datetime import date
+        log_dir = os.path.join(config.CACHE_DIR, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        today = date.today().isoformat()
+        log_file = os.path.join(log_dir, f"ui_errors_{today}.log")
+        _ui_logger = logging.getLogger(f"truffle.ui_errors.{today}")
+        if not _ui_logger.handlers:
+            handler = logging.FileHandler(log_file)
+            handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            _ui_logger.addHandler(handler)
+            _ui_logger.setLevel(logging.DEBUG)
+            _ui_logger.propagate = False
+        _ui_logger.error(f"[{source}] {message}")
+    return jsonify({"logged": True})
+
+
 @app.get("/api/config")
 def get_config():
     """Return runtime configuration the UI needs (region, mode, etc.)."""

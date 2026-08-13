@@ -1150,6 +1150,7 @@ def resolve_plan(params: dict) -> dict:
     # setting MaxSessionDuration on the created role).
     _idc_lib = _load_idc_lib()
     permission_sets = []
+    ps_errors = []
     for ps_arn in ps_arns_to_describe:
         # Find the name from the role_mappings input
         ps_name = ""
@@ -1157,7 +1158,12 @@ def resolve_plan(params: dict) -> dict:
             if rm.get("psArn") == ps_arn:
                 ps_name = rm.get("psName", "")
                 break
-        ps_data = _idc_lib.fetch_permission_set_policies(sso_admin, instance_arn, ps_arn, ps_name)
+        try:
+            ps_data = _idc_lib.fetch_permission_set_policies(sso_admin, instance_arn, ps_arn, ps_name)
+        except Exception as exc:
+            _slog.record(exc, context="resolve_plan_fetch_policies", resource=ps_arn)
+            ps_errors.append({"psArn": ps_arn, "psName": ps_name, "error": f"Policy fetch failed: {exc}"})
+            continue
         # Enrich with description + session_duration from DescribePermissionSet
         try:
             desc_resp = sso_admin.describe_permission_set(
@@ -1168,8 +1174,9 @@ def resolve_plan(params: dict) -> dict:
             ps_data["session_duration"] = ps_meta.get("SessionDuration", "PT1H")
             if not ps_data["name"] or ps_data["name"] == ps_arn.rsplit("/", 1)[-1]:
                 ps_data["name"] = ps_meta.get("Name", ps_data["name"])
-        except Exception:
-            pass
+        except Exception as exc:
+            _slog.record(exc, context="resolve_plan_describe_ps", resource=ps_arn)
+            ps_errors.append({"psArn": ps_arn, "psName": ps_name, "error": f"DescribePermissionSet failed: {exc}"})
         permission_sets.append(ps_data)
 
     # Build a name→ARN lookup
@@ -1253,4 +1260,5 @@ def resolve_plan(params: dict) -> dict:
         "assignments": assignments,
         "resolved_mappings": resolved_mappings,
         "errors": [rm for rm in resolved_mappings if rm.get("resolution_error")],
+        "ps_errors": ps_errors,
     }
