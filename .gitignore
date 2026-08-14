@@ -1,0 +1,76 @@
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+*.whl
+
+# ─── AAM service model (pre-release, not for distribution) ───────────────────
+account-access-service-model-prod.json
+
+# ─── Node / UI build ─────────────────────────────────────────────────────────
+node_modules/
+dist/
+*.tsbuildinfo
+
+# ─── CDK ─────────────────────────────────────────────────────────────────────
+cdk.out/
+
+# ─── Local cache / runtime output ────────────────────────────────────────────
+# The console writes scan results, discovery dumps, and checkpoints here.
+ui/cache/*
+!ui/cache/.gitignore
+
+# ─── Managed solution (local test environment, not ready for repo) ────────────
+managed solution/
+
+# ─── OS / editor ─────────────────────────────────────────────────────────────
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# ─── Tests (internal, not for open source) ────────────────────────────────────
+Identity Center to AAM/tests/
+
+# ─── IdC-to-AAM tool: extra Python caches ────────────────────────────────────
+env/
+*$py.class
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+
+# ─── IdC-to-AAM tool: test / coverage artifacts ──────────────────────────────
+.coverage
+coverage.xml
+htmlcov/
+build/
+
+# ─── Utilities: test resources & scan output ──────────────────────────────────
+# CloudFormation templates with real account IDs / ARNs used for testing
+Utilites/resource_policy_scan/test_resources.yaml
+# Scan output containing customer-specific findings
+Utilites/resource_policy_scan/scan_results.json
+
+# ─── IdC-to-AAM tool: generated outputs ──────────────────────────────────────
+inventory_*.json
+migration_plan_*.xlsx
+mapping_*.xlsx
+mapping_*.csv
+mapping_*.json
+audit_*.csv
+# Generated IaC (CloudFormation templates with real ARNs / entitlements)
+Identity Center to AAM/output/
+output/
+
+# ─── IdC-to-AAM tool: all generated Excel outputs + Office lock files ─────────
+# Every .xlsx the tool touches is generated (migration plans, mapping reports)
+# and contains customer-specific data — never commit them.
+*.xlsx
+~$*
+
+# ─── Test utilities (not for distribution) ────────────────────────────────────
+Utilites/resource_policy_scan/deploy_test_policies.py
