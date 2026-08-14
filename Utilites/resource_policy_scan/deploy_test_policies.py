@@ -15,6 +15,7 @@ import json
 import os
 import random
 import string
+import sys
 import time
 
 import boto3
@@ -1100,279 +1101,302 @@ def setup_rekognition(session, region, account_id, role_arn):
 
 # ─── Cleanup ─────────────────────────────────────────────────────────────────
 
-def cleanup(session, region, account_id, skip_cfn=False):
+def cleanup(session, region, account_id, skip_cfn=False, only_service=None):
     """Delete all test resources created by this script."""
     print("\n=== Cleaning up non-CFN resources ===\n")
 
-    # API Gateway
-    try:
-        apigw = session.client("apigateway", region_name=region)
-        for api in apigw.get_rest_apis().get("items", []):
-            if api["name"] == PREFIX:
-                apigw.delete_rest_api(restApiId=api["id"])
-                print(f"  Deleted REST API: {api['id']}")
-    except ClientError as e:
-        print(f"  API Gateway cleanup: {e}")
+    def _cleanup_api_gateway():
+        try:
+            apigw = session.client("apigateway", region_name=region)
+            for api in apigw.get_rest_apis().get("items", []):
+                if api["name"] == PREFIX:
+                    apigw.delete_rest_api(restApiId=api["id"])
+                    print(f"  Deleted REST API: {api['id']}")
+        except ClientError as e:
+            print(f"  API Gateway cleanup: {e}")
 
-    # CodeArtifact
-    try:
-        ca = session.client("codeartifact", region_name=region)
-        ca.delete_domain(domain=PREFIX)
-        print(f"  Deleted CodeArtifact domain: {PREFIX}")
-    except ClientError as e:
-        print(f"  CodeArtifact cleanup: {e}")
+    def _cleanup_codeartifact():
+        try:
+            ca = session.client("codeartifact", region_name=region)
+            ca.delete_domain(domain=PREFIX)
+            print(f"  Deleted CodeArtifact domain: {PREFIX}")
+        except ClientError as e:
+            print(f"  CodeArtifact cleanup: {e}")
 
-    # CodeBuild
-    try:
-        cb = session.client("codebuild", region_name=region)
-        cb.delete_report_group(arn=f"arn:aws:codebuild:{region}:{account_id}:report-group/{PREFIX}", deleteReports=True)
-        print(f"  Deleted CodeBuild report group: {PREFIX}")
-    except ClientError as e:
-        print(f"  CodeBuild cleanup: {e}")
+    def _cleanup_codebuild():
+        try:
+            cb = session.client("codebuild", region_name=region)
+            cb.delete_report_group(arn=f"arn:aws:codebuild:{region}:{account_id}:report-group/{PREFIX}", deleteReports=True)
+            print(f"  Deleted CodeBuild report group: {PREFIX}")
+        except ClientError as e:
+            print(f"  CodeBuild cleanup: {e}")
 
-    # DynamoDB
-    try:
-        ddb = session.client("dynamodb", region_name=region)
-        ddb.delete_table(TableName=PREFIX)
-        print(f"  Deleted DynamoDB table: {PREFIX}")
-    except ClientError as e:
-        print(f"  DynamoDB cleanup: {e}")
+    def _cleanup_dynamodb():
+        try:
+            ddb = session.client("dynamodb", region_name=region)
+            ddb.delete_table(TableName=PREFIX)
+            print(f"  Deleted DynamoDB table: {PREFIX}")
+        except ClientError as e:
+            print(f"  DynamoDB cleanup: {e}")
 
-    # Kinesis
-    try:
-        kinesis = session.client("kinesis", region_name=region)
-        kinesis.delete_stream(StreamName=PREFIX, EnforceConsumerDeletion=True)
-        print(f"  Deleted Kinesis stream: {PREFIX}")
-    except ClientError as e:
-        print(f"  Kinesis cleanup: {e}")
+    def _cleanup_kinesis():
+        try:
+            kinesis = session.client("kinesis", region_name=region)
+            kinesis.delete_stream(StreamName=PREFIX, EnforceConsumerDeletion=True)
+            print(f"  Deleted Kinesis stream: {PREFIX}")
+        except ClientError as e:
+            print(f"  Kinesis cleanup: {e}")
 
-    # EventBridge Schemas
-    try:
-        schemas = session.client("schemas", region_name=region)
-        schemas.delete_registry(RegistryName=PREFIX)
-        print(f"  Deleted Schemas registry: {PREFIX}")
-    except ClientError as e:
-        print(f"  Schemas cleanup: {e}")
+    def _cleanup_eventbridge_schemas():
+        try:
+            schemas = session.client("schemas", region_name=region)
+            schemas.delete_registry(RegistryName=PREFIX)
+            print(f"  Deleted Schemas registry: {PREFIX}")
+        except ClientError as e:
+            print(f"  Schemas cleanup: {e}")
 
-    # Glue
-    try:
-        glue = session.client("glue", region_name=region)
-        glue.delete_resource_policy()
-        print("  Deleted Glue catalog resource policy")
-    except ClientError as e:
-        print(f"  Glue cleanup: {e}")
+    def _cleanup_glue():
+        try:
+            glue = session.client("glue", region_name=region)
+            glue.delete_resource_policy()
+            print("  Deleted Glue catalog resource policy")
+        except ClientError as e:
+            print(f"  Glue cleanup: {e}")
 
-    # MediaStore — discontinued, nothing to clean up
+    def _cleanup_ses():
+        try:
+            sesv2 = session.client("sesv2", region_name=region)
+            sesv2.delete_email_identity(EmailIdentity=f"{PREFIX}@example.com")
+            print(f"  Deleted SES identity: {PREFIX}@example.com")
+        except ClientError as e:
+            print(f"  SES cleanup: {e}")
 
-    # Glacier — discontinued, nothing to clean up
+    def _cleanup_vpc_endpoint():
+        try:
+            ec2 = session.client("ec2", region_name=region)
+            all_eps = ec2.describe_vpc_endpoints(
+                Filters=[{"Name": "service-name", "Values": [f"com.amazonaws.{region}.s3"]}]
+            )
+            for ep in all_eps.get("VpcEndpoints", []):
+                pol = json.dumps(ep.get("PolicyDocument", {}))
+                if ROLE_SUFFIX in pol:
+                    ec2.delete_vpc_endpoints(VpcEndpointIds=[ep["VpcEndpointId"]])
+                    print(f"  Deleted VPC endpoint: {ep['VpcEndpointId']}")
+        except ClientError as e:
+            print(f"  VPC Endpoint cleanup: {e}")
 
-    # SES
-    try:
-        sesv2 = session.client("sesv2", region_name=region)
-        sesv2.delete_email_identity(EmailIdentity=f"{PREFIX}@example.com")
-        print(f"  Deleted SES identity: {PREFIX}@example.com")
-    except ClientError as e:
-        print(f"  SES cleanup: {e}")
-
-    # VPC Endpoints (find by S3 gateway type with our policy)
-    try:
-        ec2 = session.client("ec2", region_name=region)
-        all_eps = ec2.describe_vpc_endpoints(
-            Filters=[{"Name": "service-name", "Values": [f"com.amazonaws.{region}.s3"]}]
-        )
-        for ep in all_eps.get("VpcEndpoints", []):
-            pol = json.dumps(ep.get("PolicyDocument", {}))
-            if ROLE_SUFFIX in pol:
-                ec2.delete_vpc_endpoints(VpcEndpointIds=[ep["VpcEndpointId"]])
-                print(f"  Deleted VPC endpoint: {ep['VpcEndpointId']}")
-    except ClientError as e:
-        print(f"  VPC Endpoint cleanup: {e}")
-
-    # CloudTrail
-    try:
-        ct = session.client("cloudtrail", region_name=region)
-        stores = ct.list_event_data_stores()
-        for s in stores.get("EventDataStores", []):
-            if PREFIX in s.get("Name", "") and s.get("Status") == "ENABLED":
-                ct.update_event_data_store(
-                    EventDataStore=s["EventDataStoreArn"],
-                    TerminationProtectionEnabled=False,
-                )
-                ct.delete_event_data_store(EventDataStore=s["EventDataStoreArn"])
-                print(f"  Deleted CloudTrail EDS: {s['EventDataStoreArn']}")
-    except ClientError as e:
-        print(f"  CloudTrail cleanup: {e}")
-
-    # SSM — skipped, no resources to clean up
-
-    # Entity Resolution — using pre-existing ID namespace, don't delete it
-
-    # Lex V2
-    try:
-        lex = session.client("lexv2-models", region_name=region)
-        bots = lex.list_bots(filters=[{"name": "BotName", "values": [PREFIX], "operator": "EQ"}])
-        for b in bots.get("botSummaries", []):
-            lex.delete_bot(botId=b["botId"], skipResourceInUseCheck=True)
-            print(f"  Deleted Lex bot: {b['botId']}")
-    except ClientError as e:
-        print(f"  Lex cleanup: {e}")
-
-    # Private CA
-    try:
-        pca = session.client("acm-pca", region_name=region)
-        cas = pca.list_certificate_authorities()
-        for ca in cas.get("CertificateAuthorities", []):
-            subj = ca.get("CertificateAuthorityConfiguration", {}).get("Subject", {})
-            status = ca.get("Status", "")
-            if PREFIX in subj.get("CommonName", ""):
-                if status in ("ACTIVE", "DISABLED"):
-                    pca.delete_certificate_authority(
-                        CertificateAuthorityArn=ca["Arn"],
-                        PermanentDeletionTimeInDays=7,
+    def _cleanup_cloudtrail():
+        try:
+            ct = session.client("cloudtrail", region_name=region)
+            stores = ct.list_event_data_stores()
+            for s in stores.get("EventDataStores", []):
+                if PREFIX in s.get("Name", "") and s.get("Status") == "ENABLED":
+                    ct.update_event_data_store(
+                        EventDataStore=s["EventDataStoreArn"],
+                        TerminationProtectionEnabled=False,
                     )
-                    print(f"  Deleted Private CA: {ca['Arn']}")
-                else:
-                    print(f"  Skipped Private CA (status={status}): {ca['Arn']}")
-    except ClientError as e:
-        print(f"  Private CA cleanup: {e}")
+                    ct.delete_event_data_store(EventDataStore=s["EventDataStoreArn"])
+                    print(f"  Deleted CloudTrail EDS: {s['EventDataStoreArn']}")
+        except ClientError as e:
+            print(f"  CloudTrail cleanup: {e}")
 
-    # SSM Incidents
-    try:
-        inc = session.client("ssm-incidents", region_name=region)
-        plans = inc.list_response_plans()
-        for p in plans.get("responsePlanSummaries", []):
-            if PREFIX in p["arn"]:
-                inc.delete_response_plan(arn=p["arn"])
-                print(f"  Deleted response plan: {p['arn']}")
-    except ClientError as e:
-        print(f"  SSM Incidents cleanup: {e}")
-
-    # MSK
-    try:
-        kafka = session.client("kafka", region_name=region)
-        clusters = kafka.list_clusters_v2()
-        for c in clusters.get("ClusterInfoList", []):
-            if c.get("ClusterName", "") == PREFIX:
-                kafka.delete_cluster(ClusterArn=c["ClusterArn"])
-                print(f"  Deleted MSK cluster: {c['ClusterArn']}")
-    except ClientError as e:
-        print(f"  MSK cleanup: {e}")
-
-    # Signer
-    try:
-        signer = session.client("signer", region_name=region)
-        profile_name = PREFIX.replace("-", "")
-        signer.cancel_signing_profile(profileName=profile_name)
-        print(f"  Canceled signing profile: {profile_name}")
-    except ClientError as e:
-        print(f"  Signer cleanup: {e}")
-
-    # VPC Lattice
-    try:
-        lattice = session.client("vpc-lattice", region_name=region)
-        services = lattice.list_services()
-        for s in services.get("items", []):
-            if s.get("name", "") == PREFIX:
-                lattice.delete_service(serviceIdentifier=s["id"])
-                print(f"  Deleted VPC Lattice service: {s['id']}")
-    except ClientError as e:
-        print(f"  VPC Lattice cleanup: {e}")
-
-    # Network Firewall
-    try:
-        nfw = session.client("network-firewall", region_name=region)
-        rgs = nfw.list_rule_groups()
-        for rg in rgs.get("RuleGroups", []):
-            if PREFIX in rg.get("Name", ""):
-                nfw.delete_rule_group(RuleGroupArn=rg["Arn"])
-                print(f"  Deleted Network Firewall rule group: {rg['Arn']}")
-    except ClientError as e:
-        print(f"  Network Firewall cleanup: {e}")
-
-    # S3 Express (Directory Bucket)
-    try:
-        s3 = session.client("s3", region_name=region)
-        ec2 = session.client("ec2", region_name=region)
-        azs = ec2.describe_availability_zones(Filters=[{"Name": "zone-type", "Values": ["availability-zone"]}])
-        az_id = azs["AvailabilityZones"][0]["ZoneId"] if azs["AvailabilityZones"] else "usw2-az1"
-        bucket_name = f"policy-scan-test--{az_id}--x-s3"
-        s3.delete_bucket_policy(Bucket=bucket_name)
-        s3.delete_bucket(Bucket=bucket_name)
-        print(f"  Deleted directory bucket: {bucket_name}")
-    except ClientError as e:
-        print(f"  S3 Express cleanup: {e}")
-
-    # S3 Tables
-    try:
-        s3tables = session.client("s3tables", region_name=region)
-        buckets = s3tables.list_table_buckets()
-        for b in buckets.get("tableBuckets", []):
-            if b["name"] == "policy-scan-test-tables":
-                s3tables.delete_table_bucket_policy(tableBucketARN=b["arn"])
-                s3tables.delete_table_bucket(tableBucketARN=b["arn"])
-                print(f"  Deleted table bucket: {b['arn']}")
-    except ClientError as e:
-        print(f"  S3 Tables cleanup: {e}")
-
-    # Redshift Serverless
-    try:
-        rs = session.client("redshift-serverless", region_name=region)
-        # Delete snapshot first
+    def _cleanup_lex():
         try:
-            rs.delete_snapshot(snapshotName="policy-scan-test-snap")
-            print("  Deleted Redshift Serverless snapshot")
-        except ClientError:
-            pass
-        # Delete workgroup
-        try:
-            rs.delete_workgroup(workgroupName="policy-scan-test-wg")
-            print("  Deleted Redshift Serverless workgroup (may take a moment)")
-        except ClientError:
-            pass
-        # Delete namespace
-        try:
-            rs.delete_namespace(namespaceName="policy-scan-test-ns")
-            print("  Deleted Redshift Serverless namespace")
-        except ClientError:
-            pass
-    except ClientError as e:
-        print(f"  Redshift Serverless cleanup: {e}")
+            lex = session.client("lexv2-models", region_name=region)
+            bots = lex.list_bots(filters=[{"name": "BotName", "values": [PREFIX], "operator": "EQ"}])
+            for b in bots.get("botSummaries", []):
+                lex.delete_bot(botId=b["botId"], skipResourceInUseCheck=True)
+                print(f"  Deleted Lex bot: {b['botId']}")
+        except ClientError as e:
+            print(f"  Lex cleanup: {e}")
 
-    # Serverless Application Repository
-    try:
-        sar = session.client("serverlessrepo", region_name=region)
-        apps = sar.list_applications()
-        for app in apps.get("Applications", []):
-            if app.get("Name") == "policy-scan-test-app":
-                sar.delete_application(ApplicationId=app["ApplicationId"])
-                print(f"  Deleted SAR application: {app['ApplicationId']}")
-    except ClientError as e:
-        print(f"  Serverless App Repo cleanup: {e}")
-
-    # Rekognition
-    try:
-        rek = session.client("rekognition", region_name=region)
-        projects = rek.describe_projects()
-        for p in projects.get("ProjectDescriptions", []):
-            if "policy-scan-test" in p["ProjectArn"]:
-                # Delete policy first
-                try:
-                    policies = rek.list_project_policies(ProjectArn=p["ProjectArn"])
-                    for pol in policies.get("ProjectPolicies", []):
-                        rek.delete_project_policy(
-                            ProjectArn=p["ProjectArn"],
-                            PolicyName=pol["PolicyName"],
-                            PolicyRevisionId=pol["PolicyRevisionId"],
+    def _cleanup_private_ca():
+        try:
+            pca = session.client("acm-pca", region_name=region)
+            cas = pca.list_certificate_authorities()
+            for ca in cas.get("CertificateAuthorities", []):
+                subj = ca.get("CertificateAuthorityConfiguration", {}).get("Subject", {})
+                status = ca.get("Status", "")
+                if PREFIX in subj.get("CommonName", ""):
+                    if status in ("ACTIVE", "DISABLED"):
+                        pca.delete_certificate_authority(
+                            CertificateAuthorityArn=ca["Arn"],
+                            PermanentDeletionTimeInDays=7,
                         )
-                except Exception:
-                    pass
-                rek.delete_project(ProjectArn=p["ProjectArn"])
-                print(f"  Deleted Rekognition project: {p['ProjectArn']}")
-    except ClientError as e:
-        print(f"  Rekognition cleanup: {e}")
+                        print(f"  Deleted Private CA: {ca['Arn']}")
+                    else:
+                        print(f"  Skipped Private CA (status={status}): {ca['Arn']}")
+        except ClientError as e:
+            print(f"  Private CA cleanup: {e}")
+
+    def _cleanup_ssm_incidents():
+        try:
+            inc = session.client("ssm-incidents", region_name=region)
+            plans = inc.list_response_plans()
+            for p in plans.get("responsePlanSummaries", []):
+                if PREFIX in p["arn"]:
+                    inc.delete_response_plan(arn=p["arn"])
+                    print(f"  Deleted response plan: {p['arn']}")
+        except ClientError as e:
+            print(f"  SSM Incidents cleanup: {e}")
+
+    def _cleanup_msk():
+        try:
+            kafka = session.client("kafka", region_name=region)
+            clusters = kafka.list_clusters_v2()
+            for c in clusters.get("ClusterInfoList", []):
+                if c.get("ClusterName", "") == PREFIX:
+                    kafka.delete_cluster(ClusterArn=c["ClusterArn"])
+                    print(f"  Deleted MSK cluster: {c['ClusterArn']}")
+        except ClientError as e:
+            print(f"  MSK cleanup: {e}")
+
+    def _cleanup_signer():
+        try:
+            signer = session.client("signer", region_name=region)
+            profile_name = PREFIX.replace("-", "")
+            signer.cancel_signing_profile(profileName=profile_name)
+            print(f"  Canceled signing profile: {profile_name}")
+        except ClientError as e:
+            print(f"  Signer cleanup: {e}")
+
+    def _cleanup_vpc_lattice():
+        try:
+            lattice = session.client("vpc-lattice", region_name=region)
+            services = lattice.list_services()
+            for s in services.get("items", []):
+                if s.get("name", "") == PREFIX:
+                    lattice.delete_service(serviceIdentifier=s["id"])
+                    print(f"  Deleted VPC Lattice service: {s['id']}")
+        except ClientError as e:
+            print(f"  VPC Lattice cleanup: {e}")
+
+    def _cleanup_network_firewall():
+        try:
+            nfw = session.client("network-firewall", region_name=region)
+            rgs = nfw.list_rule_groups()
+            for rg in rgs.get("RuleGroups", []):
+                if PREFIX in rg.get("Name", ""):
+                    nfw.delete_rule_group(RuleGroupArn=rg["Arn"])
+                    print(f"  Deleted Network Firewall rule group: {rg['Arn']}")
+        except ClientError as e:
+            print(f"  Network Firewall cleanup: {e}")
+
+    def _cleanup_s3_express():
+        try:
+            s3 = session.client("s3", region_name=region)
+            ec2 = session.client("ec2", region_name=region)
+            azs = ec2.describe_availability_zones(Filters=[{"Name": "zone-type", "Values": ["availability-zone"]}])
+            az_id = azs["AvailabilityZones"][0]["ZoneId"] if azs["AvailabilityZones"] else "usw2-az1"
+            bucket_name = f"policy-scan-test--{az_id}--x-s3"
+            s3.delete_bucket_policy(Bucket=bucket_name)
+            s3.delete_bucket(Bucket=bucket_name)
+            print(f"  Deleted directory bucket: {bucket_name}")
+        except ClientError as e:
+            print(f"  S3 Express cleanup: {e}")
+
+    def _cleanup_s3_tables():
+        try:
+            s3tables = session.client("s3tables", region_name=region)
+            buckets = s3tables.list_table_buckets()
+            for b in buckets.get("tableBuckets", []):
+                if b["name"] == "policy-scan-test-tables":
+                    s3tables.delete_table_bucket_policy(tableBucketARN=b["arn"])
+                    s3tables.delete_table_bucket(tableBucketARN=b["arn"])
+                    print(f"  Deleted table bucket: {b['arn']}")
+        except ClientError as e:
+            print(f"  S3 Tables cleanup: {e}")
+
+    def _cleanup_redshift_serverless():
+        try:
+            rs = session.client("redshift-serverless", region_name=region)
+            try:
+                rs.delete_snapshot(snapshotName="policy-scan-test-snap")
+                print("  Deleted Redshift Serverless snapshot")
+            except ClientError:
+                pass
+            try:
+                rs.delete_workgroup(workgroupName="policy-scan-test-wg")
+                print("  Deleted Redshift Serverless workgroup (may take a moment)")
+            except ClientError:
+                pass
+            try:
+                rs.delete_namespace(namespaceName="policy-scan-test-ns")
+                print("  Deleted Redshift Serverless namespace")
+            except ClientError:
+                pass
+        except ClientError as e:
+            print(f"  Redshift Serverless cleanup: {e}")
+
+    def _cleanup_serverless_repo():
+        try:
+            sar = session.client("serverlessrepo", region_name=region)
+            apps = sar.list_applications()
+            for app in apps.get("Applications", []):
+                if app.get("Name") == "policy-scan-test-app":
+                    sar.delete_application(ApplicationId=app["ApplicationId"])
+                    print(f"  Deleted SAR application: {app['ApplicationId']}")
+        except ClientError as e:
+            print(f"  Serverless App Repo cleanup: {e}")
+
+    def _cleanup_rekognition():
+        try:
+            rek = session.client("rekognition", region_name=region)
+            projects = rek.describe_projects()
+            for p in projects.get("ProjectDescriptions", []):
+                if "policy-scan-test" in p["ProjectArn"]:
+                    try:
+                        policies = rek.list_project_policies(ProjectArn=p["ProjectArn"])
+                        for pol in policies.get("ProjectPolicies", []):
+                            rek.delete_project_policy(
+                                ProjectArn=p["ProjectArn"],
+                                PolicyName=pol["PolicyName"],
+                                PolicyRevisionId=pol["PolicyRevisionId"],
+                            )
+                    except Exception:
+                        pass
+                    rek.delete_project(ProjectArn=p["ProjectArn"])
+                    print(f"  Deleted Rekognition project: {p['ProjectArn']}")
+        except ClientError as e:
+            print(f"  Rekognition cleanup: {e}")
+
+    CLEANUP_MAP = {
+        "api-gateway": _cleanup_api_gateway,
+        "codeartifact": _cleanup_codeartifact,
+        "codebuild": _cleanup_codebuild,
+        "dynamodb": _cleanup_dynamodb,
+        "kinesis": _cleanup_kinesis,
+        "eventbridge-schemas": _cleanup_eventbridge_schemas,
+        "glue": _cleanup_glue,
+        "ses": _cleanup_ses,
+        "vpc-endpoint": _cleanup_vpc_endpoint,
+        "cloudtrail": _cleanup_cloudtrail,
+        "lex": _cleanup_lex,
+        "private-ca": _cleanup_private_ca,
+        "ssm-incidents": _cleanup_ssm_incidents,
+        "msk": _cleanup_msk,
+        "signer": _cleanup_signer,
+        "vpc-lattice": _cleanup_vpc_lattice,
+        "network-firewall": _cleanup_network_firewall,
+        "s3-express": _cleanup_s3_express,
+        "s3-tables": _cleanup_s3_tables,
+        "redshift-serverless": _cleanup_redshift_serverless,
+        "serverless-repo": _cleanup_serverless_repo,
+        "rekognition": _cleanup_rekognition,
+    }
+
+    if only_service:
+        svc = only_service.lower()
+        if svc in CLEANUP_MAP:
+            CLEANUP_MAP[svc]()
+        else:
+            print(f"  No cleanup handler for: {svc}")
+    else:
+        for fn in CLEANUP_MAP.values():
+            fn()
 
     # CloudFormation stack (last — some SDK resources depend on CFN resources)
-    if not skip_cfn:
+    if not skip_cfn and not only_service:
         delete_cfn_stack(session, region)
 
     print("\nCleanup complete.")
@@ -1385,11 +1409,49 @@ def main():
     parser.add_argument("--region", default="us-east-1", help="AWS region (default: us-east-1)")
     parser.add_argument("--cleanup", action="store_true", help="Delete all test resources instead of creating them")
     parser.add_argument("--skip-cfn", action="store_true", help="Skip CloudFormation stack deployment, only deploy SDK resources")
+    parser.add_argument("--service", help="Deploy/clean only a specific service (e.g. msk, lex, s3-tables). Use --list-services to see all options.")
+    parser.add_argument("--list-services", action="store_true", help="List available service names and exit")
     args = parser.parse_args()
 
     session = boto3.Session()
     account_id = get_account_id(session)
     region = args.region
+
+    # Service registry: name -> (setup_fn, cleanup_fn_name_or_None)
+    SERVICE_MAP = {
+        "api-gateway": setup_api_gateway,
+        "codeartifact": setup_codeartifact,
+        "codebuild": setup_codebuild,
+        "dynamodb": setup_dynamodb,
+        "kinesis": setup_kinesis,
+        "eventbridge-schemas": setup_eventbridge_schemas,
+        "glue": setup_glue,
+        "mediastore": setup_mediastore,
+        "glacier": setup_glacier,
+        "ses": setup_ses,
+        "vpc-endpoint": setup_vpc_endpoint,
+        "cloudtrail": setup_cloudtrail,
+        "ssm": setup_ssm,
+        "entity-resolution": setup_entity_resolution,
+        "lex": setup_lex,
+        "private-ca": setup_private_ca,
+        "ssm-incidents": setup_ssm_incidents,
+        "msk": setup_msk,
+        "signer": setup_signer,
+        "vpc-lattice": setup_vpc_lattice,
+        "network-firewall": setup_network_firewall,
+        "s3-express": setup_s3_express,
+        "s3-tables": setup_s3_tables,
+        "redshift-serverless": setup_redshift_serverless,
+        "serverless-repo": setup_serverless_repo,
+        "rekognition": setup_rekognition,
+    }
+
+    if args.list_services:
+        print("Available services:")
+        for name in sorted(SERVICE_MAP.keys()):
+            print(f"  {name}")
+        return
 
     print(f"Account: {account_id}")
     print(f"Region:  {region}")
@@ -1398,7 +1460,23 @@ def main():
     print("=" * 70)
 
     if args.cleanup:
-        cleanup(session, region, account_id, skip_cfn=args.skip_cfn)
+        if args.service:
+            # Targeted cleanup — run the full cleanup but only for the named service
+            print(f"\nCleaning up: {args.service}")
+            cleanup(session, region, account_id, skip_cfn=True, only_service=args.service)
+        else:
+            cleanup(session, region, account_id, skip_cfn=args.skip_cfn)
+        return
+
+    if args.service:
+        # Deploy a single service
+        svc = args.service.lower()
+        if svc not in SERVICE_MAP:
+            print(f"Unknown service: {svc}")
+            print(f"Use --list-services to see available options.")
+            sys.exit(1)
+        SERVICE_MAP[svc](session, region, account_id, role_arn)
+        print("\nDone.")
         return
 
     # Deploy CloudFormation stack first (unless skipped)
@@ -1408,32 +1486,8 @@ def main():
         print("Skipping CloudFormation stack deployment")
 
     # Then deploy non-CFN resources
-    setup_api_gateway(session, region, account_id, role_arn)
-    setup_codeartifact(session, region, account_id, role_arn)
-    setup_codebuild(session, region, account_id, role_arn)
-    setup_dynamodb(session, region, account_id, role_arn)
-    setup_kinesis(session, region, account_id, role_arn)
-    setup_eventbridge_schemas(session, region, account_id, role_arn)
-    setup_glue(session, region, account_id, role_arn)
-    setup_mediastore(session, region, account_id, role_arn)
-    setup_glacier(session, region, account_id, role_arn)
-    setup_ses(session, region, account_id, role_arn)
-    setup_vpc_endpoint(session, region, account_id, role_arn)
-    setup_cloudtrail(session, region, account_id, role_arn)
-    setup_ssm(session, region, account_id, role_arn)
-    setup_entity_resolution(session, region, account_id, role_arn)
-    setup_lex(session, region, account_id, role_arn)
-    setup_private_ca(session, region, account_id, role_arn)
-    setup_ssm_incidents(session, region, account_id, role_arn)
-    setup_msk(session, region, account_id, role_arn)
-    setup_signer(session, region, account_id, role_arn)
-    setup_vpc_lattice(session, region, account_id, role_arn)
-    setup_network_firewall(session, region, account_id, role_arn)
-    setup_s3_express(session, region, account_id, role_arn)
-    setup_s3_tables(session, region, account_id, role_arn)
-    setup_redshift_serverless(session, region, account_id, role_arn)
-    setup_serverless_repo(session, region, account_id, role_arn)
-    setup_rekognition(session, region, account_id, role_arn)
+    for name, setup_fn in SERVICE_MAP.items():
+        setup_fn(session, region, account_id, role_arn)
 
     print("\n" + "=" * 70)
     print("All test resources deployed.")
