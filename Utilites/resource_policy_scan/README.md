@@ -23,6 +23,16 @@ Results are written to a JSON file with the matched resource ARN, service, accou
 
 The minimum IAM permissions needed vary by service but generally include `Get*Policy`, `List*`, and `Describe*` actions. A managed policy like `ReadOnlyAccess` covers most cases.
 
+## Installation
+
+```bash
+cd "Utilites/resource_policy_scan"
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
 ## Usage
 
 ### Python version (recommended)

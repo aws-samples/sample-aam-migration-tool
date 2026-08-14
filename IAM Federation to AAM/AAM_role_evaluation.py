@@ -302,9 +302,15 @@ def backup_trust_policies(saml_roles: List[Dict[str, Any]], account_id: str) -> 
     return backup_file
 
 
-def rollback_trust_policies(backup_file: str) -> None:
+def rollback_trust_policies(backup_file: str, profiles: str = "", account_ids: str = "", role_name: str = "") -> None:
     """
     Restore trust policies from a backup JSON file created by backup_trust_policies().
+
+    Supports multi-account rollback: keys in the backup JSON are full role ARNs
+    (e.g. arn:aws:iam::111111111111:role/MyRole). The account ID is extracted from
+    each ARN and credentials are resolved via --profiles or --account-ids/--role-name.
+    Falls back to the default session for single-account backups or legacy files
+    with plain role-name keys.
     """
     if not os.path.isfile(backup_file):
         print(f"Backup file not found: {backup_file}")
@@ -314,6 +320,47 @@ def rollback_trust_policies(backup_file: str) -> None:
         backup_data = json.load(f)
 
     print(f"\nRolling back {len(backup_data)} role(s) from {backup_file}")
+
+    # Determine which accounts are referenced in the backup
+    accounts_needed: set = set()
+    for key in backup_data:
+        if key.startswith("arn:"):
+            parts = key.split(":")
+            if len(parts) >= 5 and parts[4]:
+                accounts_needed.add(parts[4])
+
+    # Build session map for multi-account rollback
+    session_map: Dict[str, Any] = {}
+    if accounts_needed:
+        if profiles:
+            for profile in [p.strip() for p in profiles.split(",") if p.strip()]:
+                try:
+                    s = boto3.Session(profile_name=profile)
+                    acct = s.client("sts").get_caller_identity()["Account"]
+                    session_map[acct] = s
+                except Exception as exc:
+                    print(f"  WARNING: Profile '{profile}' failed: {exc}")
+        elif account_ids and role_name:
+            for acct in [a.strip() for a in account_ids.split(",") if a.strip()]:
+                try:
+                    session_map[acct] = assume_role_session(acct, role_name)
+                except Exception as exc:
+                    print(f"  WARNING: Could not assume into {acct}: {exc}")
+
+    # Fallback: default session for current account
+    if not session_map:
+        default_session = boto3.Session()
+        default_acct = default_session.client("sts").get_caller_identity()["Account"]
+        session_map[default_acct] = default_session
+
+    # Show what will be rolled back
+    if len(accounts_needed) > 1:
+        print(f"  Accounts in backup: {', '.join(sorted(accounts_needed))}")
+        missing = accounts_needed - set(session_map.keys())
+        if missing:
+            print(f"  WARNING: No credentials for account(s): {', '.join(sorted(missing))}")
+            print(f"  Use --profiles or --account-ids/--role-name to provide access.")
+
     confirm = input("Type 'yes' to confirm rollback: ").strip().lower()
     if confirm != "yes":
         print("Rollback aborted.")
@@ -321,21 +368,43 @@ def rollback_trust_policies(backup_file: str) -> None:
 
     success = 0
     errors = 0
+    skipped = 0
     for key, trust_doc in backup_data.items():
-        # Support both ARN keys (new format) and plain role name keys (legacy backups)
-        role_name = key.split("/")[-1] if key.startswith("arn:") else key
+        # Extract account ID and role name from key
+        if key.startswith("arn:"):
+            parts = key.split(":")
+            acct = parts[4] if len(parts) >= 5 else ""
+            role_name_from_arn = key.split("/")[-1]
+        else:
+            # Legacy backup with plain role name keys
+            acct = ""
+            role_name_from_arn = key
+
+        # Resolve session for this account
+        session = session_map.get(acct)
+        if not session and acct:
+            # Try any available session as fallback
+            print(f"  ⏭ {role_name_from_arn} (account {acct}): no credentials, skipping")
+            skipped += 1
+            continue
+        elif not session:
+            session = next(iter(session_map.values()))
+
         try:
-            iam_client.update_assume_role_policy(
-                RoleName=role_name,
+            iam = session.client("iam")
+            iam.update_assume_role_policy(
+                RoleName=role_name_from_arn,
                 PolicyDocument=json.dumps(trust_doc),
             )
-            print(f"  ✓ {role_name}")
+            display = f"{role_name_from_arn} ({acct})" if acct else role_name_from_arn
+            print(f"  ✓ {display}")
             success += 1
         except Exception as e:
-            print(f"  ✗ {role_name}: {e}")
+            display = f"{role_name_from_arn} ({acct})" if acct else role_name_from_arn
+            print(f"  ✗ {display}: {e}")
             errors += 1
 
-    print(f"\nRollback complete: {success} succeeded, {errors} failed.")
+    print(f"\nRollback complete: {success} succeeded, {skipped} skipped, {errors} failed.")
 
 
 # The new trust policy statement to add to roles
@@ -351,7 +420,7 @@ NEW_TRUST_STATEMENT = {
     ],
 }
 
-AAM_SERVICE_PRINCIPALS = {"account-access.amazonaws.com", "account-access-preview.amazonaws.com"}
+AAM_SERVICE_PRINCIPALS = {"account-access.amazonaws.com"}
 
 
 def update_trust_policies(saml_roles: List[Dict[str, Any]], idp_arns: List[str], account_id: str,
@@ -696,7 +765,8 @@ def main():
     parser.add_argument("--role-name", help="Role name to assume in each target account (for multi with assume-role).")
     parser.add_argument("--profiles", help="Comma-separated AWS profile names (for multi with profiles). Each profile is resolved to its account via GetCallerIdentity.")
     parser.add_argument("--workers", type=int, default=5, help="Max parallel workers (default 5).")
-    parser.add_argument("--aam-application-arn", help="AAM application ARN for entitlement creation and trust policy conditions (confused-deputy protection).")
+    parser.add_argument("--aam-application-arn",
+                        help="AAM application ARN for entitlement creation and trust policy conditions (confused-deputy protection). Required for all modes except --rollback.")
     parser.add_argument("--aam-source-account", help="AWS account where AAM is configured. Auto-extracted from --aam-application-arn if not specified. Used as aws:SourceAccount in the trust policy condition.")
     parser.add_argument("--apply-only", action="store_true",
                         help="Skip discovery. Apply trust policy updates + entitlement creation directly from --entitlement-csv. Requires --aam-application-arn and --entitlement-csv.")
@@ -716,8 +786,18 @@ def main():
         print("=" * 60)
         print("  AAM Role Evaluation — Rollback Mode")
         print("=" * 60)
-        rollback_trust_policies(args.rollback)
+        rollback_trust_policies(
+            args.rollback,
+            profiles=args.profiles or "",
+            account_ids=args.account_ids or "",
+            role_name=args.role_name or "",
+        )
         return
+
+    # --aam-application-arn is required for all modes except rollback
+    if not args.aam_application_arn:
+        print("ERROR: --aam-application-arn is required.")
+        sys.exit(1)
 
     # Auto-extract source account from application ARN if not provided
     if args.aam_application_arn and not args.aam_source_account:
@@ -788,7 +868,7 @@ def main():
                 if s:
                     try:
                         resp = s.client("iam").get_role(RoleName=rn)
-                        backup_data[rn] = resp["Role"]["AssumeRolePolicyDocument"]
+                        backup_data[role_arn] = resp["Role"]["AssumeRolePolicyDocument"]
                     except Exception:
                         pass
             if backup_data:

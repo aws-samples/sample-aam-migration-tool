@@ -6,12 +6,37 @@ This is the standalone CLI. For the browser-based console (recommended for most 
 
 ---
 
-## Quick Start
+## Requirements
+
+- Python 3.11+
+- The custom **boto3 / botocore 1.43.69** wheels that expose the
+  `accountaccess` (AAM) client. AAM is not yet in public boto3, so these are
+  required for the entitlement phase (this will get removed once boto3 is updated).
+- AWS credentials for the account(s) containing your SAML-federated roles.
+
+---
+
+## Installation
 
 ```bash
 cd "IAM Federation to AAM"
-pip install boto3
+python3 -m venv .venv
+source .venv/bin/activate
 
+pip install -r requirements.txt
+```
+
+Verify the AAM client is available:
+
+```bash
+python -c "import boto3; boto3.client('account-access', region_name='us-east-1'); print('AAM client OK')"
+```
+
+---
+
+## Quick Start
+
+```bash
 # Single account — discover and generate CSV report
 python AAM_role_evaluation.py --workers 5
 
