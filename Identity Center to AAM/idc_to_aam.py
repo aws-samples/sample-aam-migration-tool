@@ -210,6 +210,22 @@ def main(argv: Sequence[str]) -> int:
                 print(f"Migration plan error: {exc}", file=sys.stderr)
                 return 2
 
+        # ── Scope the inventory to the supplied plan ──────────────────────────
+        # When the operator provides a plan, it is authoritative: only the
+        # permission sets, accounts, and principals it lists are migrated. This
+        # prevents a broad saved inventory (e.g. a full-org discovery) from
+        # creating roles/entitlements the operator did not review in the plan.
+        # (Auto-generated plans mirror the full inventory, so this is skipped.)
+        if cfg.plan_path:
+            before = len(inventory.assignments)
+            inventory = plan_module.filter_inventory(inventory, plan_rows)
+            after = len(inventory.assignments)
+            if after != before:
+                print(
+                    f"  Scoped to migration plan: {after} of {before} assignment(s) "
+                    f"match the plan and will be migrated."
+                )
+
         iac_generator = IaCGenerator(cfg, audit)
 
         # Build a profile→account_id mapping if profiles were provided

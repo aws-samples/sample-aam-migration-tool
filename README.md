@@ -46,6 +46,7 @@ Discovers SAML-federated IAM roles and migrates their trust policies to include 
 - Parallelized discovery and migration
 - Trust policy backup before any modification
 - Per-account CloudFormation generation
+- Default trust statement grants `sts:AssumeRole`, `sts:SetContext`, and `sts:TagSession`. Customize the merged statement with `--trust-policy`, or drop `sts:TagSession` with `--no-tag-session` (CLI) / the "Include sts:TagSession" checkbox (UI)
 
 ### 3. IdC → AAM
 
@@ -61,6 +62,7 @@ Inventories Identity Center permission sets and assignments, then recreates them
 - CMP attach failure surfacing
 - IAM propagation delay handling (ValidationException retry)
 - Trust policy backup before any modification
+- Trust policy supplied via `--trust-policy` (the shipped `trust.json` grants `sts:AssumeRole`, `sts:SetContext`, and `sts:TagSession`). Drop `sts:TagSession` via the "Include sts:TagSession" checkbox in the UI, or by editing `trust.json` for the CLI
 
 ---
 
@@ -275,8 +277,6 @@ sample-aam-migration-tool/
 │   └── resource_policy_scan/            # Resource policy scanner (used by CLI + UI directly)
 ├── managed solution/                    # Serverless deployment architecture docs
 │   └── ARCHITECTURE.md                  # Design doc (API GW, Lambda, Step Functions)
-├── botocore-*.whl                       # Custom AAM-aware SDK (preview)
-├── boto3-*.whl                          # Custom AAM-aware SDK (preview)
 └── README.md                            # This file
 ```
 

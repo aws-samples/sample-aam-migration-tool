@@ -31,19 +31,40 @@ NEW_TRUST_STATEMENT = {
     },
     "Action": [
         "sts:AssumeRole",
-        "sts:SetContext"
+        "sts:SetContext",
+        "sts:TagSession"
     ],
 }
 
 
-def build_trust_statement(aam_source_account: str = "", aam_application_arn: str = "") -> dict:
+def build_trust_statement(
+    aam_source_account: str = "",
+    aam_application_arn: str = "",
+    include_tag_session: bool = True,
+    base_statement: Optional[dict] = None,
+) -> dict:
     """
     Build the AAM trust policy statement with optional confused-deputy protection.
 
     When aam_source_account and aam_application_arn are provided, adds Condition
     keys (aws:SourceAccount, aws:SourceArn) to prevent confused-deputy attacks.
+
+    When include_tag_session is False, the sts:TagSession action is removed from
+    the statement's Action list (used by the UI checkbox).
+
+    A custom base_statement (a single trust statement dict) may be supplied to
+    override the built-in NEW_TRUST_STATEMENT; confused-deputy conditions and the
+    include_tag_session toggle are still applied on top of it.
     """
-    stmt = dict(NEW_TRUST_STATEMENT)
+    source = base_statement if base_statement is not None else NEW_TRUST_STATEMENT
+    # Deep-ish copy so we never mutate the source dict or its Action list.
+    stmt = dict(source)
+    actions = list(stmt.get("Action", []) if isinstance(stmt.get("Action"), list) else [stmt.get("Action")])
+
+    if not include_tag_session:
+        actions = [a for a in actions if a != "sts:TagSession"]
+    stmt["Action"] = actions
+
     if aam_source_account or aam_application_arn:
         condition: dict = {"StringEquals": {}}
         if aam_source_account:
@@ -53,8 +74,8 @@ def build_trust_statement(aam_source_account: str = "", aam_application_arn: str
         stmt["Condition"] = condition
     return stmt
 
-# Both the preview and GA service principals — used for idempotency detection
-AAM_SERVICE_PRINCIPALS = {"account-access.amazonaws.com", "account-access-preview.amazonaws.com"}
+# The AAM GA service principal — used for idempotency detection
+AAM_SERVICE_PRINCIPALS = {"account-access.amazonaws.com"}
 
 ProgressCb = Callable[[dict], None]
 
@@ -218,15 +239,26 @@ def migrate_trust_policy(
     idp_arn: str,
     aam_source_account: str = "",
     aam_application_arn: str = "",
+    include_tag_session: bool = True,
+    custom_trust_statement: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """
     Update a single role's trust policy. Returns a result dict.
 
     mode: "ADD" — append AAM statement alongside existing.
           "REPLACE" — remove IDP statements, add AAM statement.
+
+    custom_trust_statement: optional single trust statement dict to merge instead
+        of the built-in default (from --trust-policy).
+    include_tag_session: when False, strips sts:TagSession from the merged statement.
     """
     iam_client = session.client("iam")
-    trust_stmt = build_trust_statement(aam_source_account, aam_application_arn)
+    trust_stmt = build_trust_statement(
+        aam_source_account,
+        aam_application_arn,
+        include_tag_session=include_tag_session,
+        base_statement=custom_trust_statement,
+    )
 
     try:
         role_resp = iam_client.get_role(RoleName=role_name)
@@ -290,6 +322,8 @@ def migrate_roles_parallel(
     aam_application_arn: str = "",
     workers: int = 5,
     on_progress: Optional[ProgressCb] = None,
+    include_tag_session: bool = True,
+    custom_trust_statement: Optional[dict] = None,
 ) -> List[Dict[str, Any]]:
     """
     Migrate trust policies on multiple roles in parallel.
@@ -314,7 +348,11 @@ def migrate_roles_parallel(
         if not session:
             return {"role_arn": role_arn, "role_name": role_name, "status": "error", "error": "No session available"}
 
-        result = migrate_trust_policy(session, role_name, mode, idp_arn, aam_source_account, aam_application_arn)
+        result = migrate_trust_policy(
+            session, role_name, mode, idp_arn, aam_source_account, aam_application_arn,
+            include_tag_session=include_tag_session,
+            custom_trust_statement=custom_trust_statement,
+        )
         result["role_arn"] = role_arn
         result["account_id"] = account_id
         return result

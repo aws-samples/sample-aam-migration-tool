@@ -302,6 +302,75 @@ class MigrationPlanModule:
             raise PlanError(f"duplicate role names in migration plan: {detail}")
         return mapping
 
+    # ── Inventory scoping ────────────────────────────────────────────────────
+
+    def filter_inventory(
+        self, inventory: Inventory, plan_rows: Iterable[MigrationPlanRow]
+    ) -> Inventory:
+        """Return a copy of ``inventory`` whose assignments are restricted to what
+        the migration plan authorizes.
+
+        The plan is authoritative: an assignment is kept only if it matches a plan
+        row on all three axes — permission set, account, and principal:
+
+          1. ``permission_set_arn`` appears in the plan, AND
+          2. ``account_id`` is listed in that row's ``account_ids``, AND
+          3. ``{principal_type}:{principal_display_name}`` is listed in that row's
+             ``principals``.
+
+        An empty ``principals`` or ``account_ids`` column matches *nothing* for
+        that permission set (so a fully-cleared row scopes it out entirely).
+        Permission sets absent from the plan are dropped as well.
+        """
+        # Build per-permission-set allow-sets from the plan.
+        principals_by_ps: dict[str, set[str]] = {}
+        accounts_by_ps: dict[str, set[str]] = {}
+        for row in plan_rows:
+            principals_by_ps.setdefault(row.permission_set_arn, set()).update(row.principals)
+            accounts_by_ps.setdefault(row.permission_set_arn, set()).update(row.account_ids)
+
+        kept = []
+        dropped = 0
+        for a in inventory.assignments:
+            ps = a.permission_set_arn
+            if ps not in principals_by_ps:
+                dropped += 1
+                continue
+            allowed_principals = principals_by_ps[ps]
+            allowed_accounts = accounts_by_ps.get(ps, set())
+            principal_label = f"{a.principal_type}:{a.principal_display_name}"
+            if (
+                a.account_id in allowed_accounts
+                and principal_label in allowed_principals
+            ):
+                kept.append(a)
+            else:
+                dropped += 1
+
+        # Also restrict permission_sets to those referenced by the plan so
+        # downstream role creation doesn't act on out-of-scope permission sets.
+        kept_ps = tuple(
+            ps for ps in inventory.permission_sets if ps.arn in principals_by_ps
+        )
+
+        self.audit.log_success(
+            "migration_plan_inventory_filtered",
+            self.cfg.run_id,
+            assignments_kept=len(kept),
+            assignments_dropped=dropped,
+            permission_sets_kept=len(kept_ps),
+        )
+
+        return Inventory(
+            hub_account_id=inventory.hub_account_id,
+            idc_instance_arn=inventory.idc_instance_arn,
+            identity_store_id=inventory.identity_store_id,
+            permission_sets=kept_ps,
+            assignments=tuple(kept),
+            run_id=inventory.run_id,
+            captured_at=inventory.captured_at,
+        )
+
 
 def _optional_list(raw: tuple, idx: int | None) -> tuple[str, ...]:
     if idx is None or idx >= len(raw):

@@ -416,15 +416,60 @@ NEW_TRUST_STATEMENT = {
     },
     "Action": [
         "sts:AssumeRole",
-        "sts:SetContext"
+        "sts:SetContext",
+        "sts:TagSession"
     ],
 }
 
 AAM_SERVICE_PRINCIPALS = {"account-access.amazonaws.com"}
 
 
+def load_custom_trust_statement(path: str) -> Optional[dict]:
+    """
+    Load a custom trust statement from a JSON file.
+
+    The file must contain a single trust policy STATEMENT (not a full policy
+    document) — the statement that gets merged into each role's existing trust
+    policy. Returns the parsed dict, or exits with an error on invalid input.
+
+    A convenience: if the file contains a full policy document (has a
+    "Statement" key), the first statement is used.
+    """
+    if not path:
+        return None
+    if not os.path.isfile(path):
+        print(f"ERROR: Trust policy file not found: {path}")
+        sys.exit(1)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"ERROR: Could not parse trust policy file {path}: {exc}")
+        sys.exit(1)
+
+    # Accept either a bare statement or a full policy document.
+    if isinstance(doc, dict) and "Statement" in doc:
+        statements = doc["Statement"]
+        if isinstance(statements, list) and statements:
+            stmt = statements[0]
+        elif isinstance(statements, dict):
+            stmt = statements
+        else:
+            print(f"ERROR: Trust policy file {path} has an empty Statement.")
+            sys.exit(1)
+    else:
+        stmt = doc
+
+    if not isinstance(stmt, dict) or "Effect" not in stmt:
+        print(f"ERROR: Trust policy file {path} does not contain a valid trust statement.")
+        sys.exit(1)
+    return stmt
+
+
 def update_trust_policies(saml_roles: List[Dict[str, Any]], idp_arns: List[str], account_id: str,
-                          aam_source_account: str = "", aam_application_arn: str = "") -> None:
+                          aam_source_account: str = "", aam_application_arn: str = "",
+                          custom_trust_statement: Optional[dict] = None,
+                          include_tag_session: bool = True) -> None:
     """
     For each identified SAML role, prompt the user to either:
       1) ADD the new trust statement alongside the existing IDP statement
@@ -432,9 +477,17 @@ def update_trust_policies(saml_roles: List[Dict[str, Any]], idp_arns: List[str],
       3) SKIP — make no changes
 
     The choice applies to ALL roles (batch operation).
+
+    custom_trust_statement: optional single statement dict (from --trust-policy)
+        to merge instead of the built-in default.
+    include_tag_session: when False, strips sts:TagSession from the statement.
     """
     from lib import build_trust_statement
-    trust_stmt = build_trust_statement(aam_source_account, aam_application_arn)
+    trust_stmt = build_trust_statement(
+        aam_source_account, aam_application_arn,
+        include_tag_session=include_tag_session,
+        base_statement=custom_trust_statement,
+    )
 
     print("\n" + "=" * 60)
     print("  Trust Policy Update")
@@ -628,6 +681,8 @@ def _generate_iac_from_roles(
     aam_application_arn: str,
     aam_source_account: str,
     region: str,
+    custom_trust_statement: Optional[dict] = None,
+    include_tag_session: bool = True,
 ) -> None:
     """Generate per-account CloudFormation templates for roles + a separate entitlements template."""
     import yaml
@@ -638,7 +693,11 @@ def _generate_iac_from_roles(
     def sanitize(name: str) -> str:
         return re.sub(r"[^a-zA-Z0-9]", "", name)
 
-    trust_stmt = build_trust_statement(aam_source_account, aam_application_arn)
+    trust_stmt = build_trust_statement(
+        aam_source_account, aam_application_arn,
+        include_tag_session=include_tag_session,
+        base_statement=custom_trust_statement,
+    )
 
     print("\n" + "=" * 60)
     print("  Generate IaC — CloudFormation Templates")
@@ -778,8 +837,16 @@ def main():
     parser.add_argument("--role-evaluation-csv",
                         help="Path to a previously generated role evaluation CSV (from discovery). Used with --generate-iac to skip re-running discovery.")
     parser.add_argument("--region", default="us-east-1", help="AWS region for AAM calls.")
+    parser.add_argument("--trust-policy",
+                        help="Path to a JSON file containing a custom trust policy STATEMENT to merge into each role's trust policy (instead of the built-in default). Confused-deputy conditions are still injected.")
+    parser.add_argument("--no-tag-session", action="store_true",
+                        help="Remove the sts:TagSession action from the trust statement before applying.")
 
     args = parser.parse_args()
+
+    # Load a custom trust statement if provided (single statement, not a full doc).
+    custom_trust_statement = load_custom_trust_statement(args.trust_policy) if args.trust_policy else None
+    include_tag_session = not args.no_tag_session
 
     # Handle --rollback mode
     if args.rollback:
@@ -885,6 +952,8 @@ def main():
                 aam_source_account=getattr(args, "aam_source_account", "") or "",
                 aam_application_arn=args.aam_application_arn or "",
                 workers=args.workers,
+                include_tag_session=include_tag_session,
+                custom_trust_statement=custom_trust_statement,
             )
             success = len([r for r in results if r["status"] == "success"])
             skipped = len([r for r in results if r["status"] == "skipped"])
@@ -973,6 +1042,8 @@ def main():
             args.aam_application_arn or "",
             getattr(args, "aam_source_account", "") or "",
             args.region,
+            custom_trust_statement=custom_trust_statement,
+            include_tag_session=include_tag_session,
         )
         print("\nDone.")
         return
@@ -1038,7 +1109,9 @@ def main():
                 if not args.generate_iac:
                     update_trust_policies(saml_roles, idp_arns, account_id,
                                           getattr(args, "aam_source_account", "") or "",
-                                          args.aam_application_arn or "")
+                                          args.aam_application_arn or "",
+                                          custom_trust_statement=custom_trust_statement,
+                                          include_tag_session=include_tag_session)
                 # Tag each role with its account_id for the consolidated report
                 for r in saml_roles:
                     r.setdefault("account_id", account_id)
@@ -1096,6 +1169,8 @@ def main():
                 args.aam_application_arn or "",
                 getattr(args, "aam_source_account", "") or "",
                 args.region,
+                custom_trust_statement=custom_trust_statement,
+                include_tag_session=include_tag_session,
             )
         elif not args.generate_iac:
             # Entitlement creation (after all accounts processed)
@@ -1145,11 +1220,15 @@ def main():
             args.aam_application_arn or "",
             getattr(args, "aam_source_account", "") or "",
             args.region,
+            custom_trust_statement=custom_trust_statement,
+            include_tag_session=include_tag_session,
         )
     else:
         update_trust_policies(saml_roles, idp_arns, account_id,
                               getattr(args, "aam_source_account", "") or "",
-                              args.aam_application_arn or "")
+                              args.aam_application_arn or "",
+                              custom_trust_statement=custom_trust_statement,
+                              include_tag_session=include_tag_session)
 
         # Entitlement creation
         if args.aam_application_arn:
