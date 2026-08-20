@@ -9,7 +9,8 @@
       },
       "Action": [
         "sts:AssumeRole",
-        "sts:SetContext"
+        "sts:SetContext",
+        "sts:TagSession"
       ]
     }
   ]

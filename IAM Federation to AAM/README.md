@@ -61,6 +61,45 @@ python AAM_role_evaluation.py \
   --mode ADD \
   --region us-east-1
 
+# Multi-account: discover, update trust policies, and create entitlements (with profiles)
+# Discovery runs across all listed accounts; the trust policy prompt and entitlement
+# creation then apply per-account. Fill in the generated entitlement_mappings_multi.csv
+# (Group/Principal + Principal Type columns) before this run.
+python AAM_role_evaluation.py \
+  --account-scope multi \
+  --profiles prod-account,dev-account,staging-account \
+  --aam-application-arn "arn:aws:account-access:us-east-1:123456:application/app-id" \
+  --entitlement-csv entitlement_mappings_multi.csv \
+  --region us-east-1 \
+  --workers 5
+
+# Multi-account: same as above but assume a role into each target account
+python AAM_role_evaluation.py \
+  --account-scope multi \
+  --account-ids 111111111111,222222222222 \
+  --role-name OrganizationAccountAccessRole \
+  --aam-application-arn "arn:aws:account-access:us-east-1:123456:application/app-id" \
+  --entitlement-csv entitlement_mappings_multi.csv \
+  --region us-east-1 \
+  --workers 5
+
+# Multi-account apply-only: skip discovery, update trust + entitlements straight from the CSV.
+# Credentials for each account are resolved from --profiles (or --account-ids + --role-name).
+# The account ID in each CSV row routes the trust policy update to the right account.
+python AAM_role_evaluation.py \
+  --apply-only \
+  --profiles prod-account,dev-account,staging-account \
+  --entitlement-csv entitlement_mappings_multi.csv \
+  --aam-application-arn "arn:aws:account-access:us-east-1:123456:application/app-id" \
+  --mode ADD \
+  --region us-east-1
+
+# Custom trust statement + omit sts:TagSession
+python AAM_role_evaluation.py \
+  --aam-application-arn "arn:aws:account-access:us-east-1:123456:application/app-id" \
+  --trust-policy my_trust_statement.json \
+  --no-tag-session
+
 # With entitlement creation after discovery (columnar CSV)
 python AAM_role_evaluation.py \
   --aam-application-arn "arn:aws:account-access:us-east-1:123456:application/app-id" \
@@ -157,11 +196,32 @@ python AAM_role_evaluation.py --rollback <backup_file>
 | `--entitlement-csv` | — | Columnar CSV with Group/Principal, Principal Type, Account ID, Role Name, Role ARN columns. |
 | `--region` | `us-east-1` | AWS region for AAM API calls. |
 
+### Trust policy
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--trust-policy <file>` | — | Path to a JSON file containing a custom trust policy **statement** to merge into each role's trust policy, instead of the built-in default. Confused-deputy conditions (`aws:SourceAccount`, `aws:SourceArn`) are still injected on top. |
+| `--no-tag-session` | off | Remove the `sts:TagSession` action from the trust statement before applying. |
+
+By default, the tool merges this statement into each role's trust policy:
+
+```json
+{
+  "Sid": "AAMTrustPolicyStatement",
+  "Effect": "Allow",
+  "Principal": { "Service": "account-access.amazonaws.com" },
+  "Action": ["sts:AssumeRole", "sts:SetContext", "sts:TagSession"]
+}
+```
+
+- **`sts:TagSession` is included by default.** It allows AAM to pass session tags when assuming the role. Use `--no-tag-session` to omit it if you do not need or want roles to leverage session tags.
+- **`--trust-policy`** accepts either a bare statement object or a full policy document (in which case the first statement is used). The action list you supply is honored as-is, except that `--no-tag-session` will still strip `sts:TagSession` if present.
+
 ### Other
 
 | Flag | Description |
 |------|-------------|
-| `--rollback <file>` | Restore trust policies from a backup JSON file. |
+| `--rollback <file>` | Restore trust policies from a backup JSON file. For multi-account backups, combine with `--profiles` or `--account-ids` + `--role-name` to resolve credentials per account (the account ID is read from each role ARN in the backup). |
 
 ---
 
@@ -219,7 +279,7 @@ account-access:GetApplication
 
 - **Backup before modify** — trust policies are backed up to a timestamped JSON before any update (both interactive and `--apply-only` modes).
 - **Rollback available** — `--rollback <backup_file>` restores original trust policies.
-- **Idempotent** — roles already containing the AAM service principal (`account-access.amazonaws.com` or `account-access-preview.amazonaws.com`) are skipped.
+- **Idempotent** — roles already containing the AAM service principal (`account-access.amazonaws.com`) are skipped.
 - **Fail-and-continue** — a failure on one role doesn't abort others.
 - **GA endpoint** — AAM calls use the GA endpoint (`account-access.<region>.api.aws`).
 - **ValidationException retry** — entitlement creation retries up to 3 times with backoff for IAM propagation delay.
@@ -271,8 +331,42 @@ The consolidated CSV (`AAM_role_evaluation_multi.csv`) adds two extra leading co
 
 ## Rollback
 
+Before any trust policy modification, the tool writes a timestamped JSON backup
+keyed by each role's **full ARN** (which embeds the account ID). Rollback restores
+the exact trust policy documents that were in place before the update.
+
+### Single account
+
 ```bash
 python AAM_role_evaluation.py --rollback AAM_trust_backup_<account>_<timestamp>.json
 ```
 
-Restores the exact trust policy documents that were in place before the update.
+With no credential flags, the rollback uses your default session (current account).
+This also handles legacy backups that used plain role-name keys.
+
+### Multi-account
+
+Because backup keys are full role ARNs, the tool extracts the account ID from each
+role and routes its restore to the matching account. Provide credentials the same
+way you did for the migration — with `--profiles` or `--account-ids` + `--role-name`:
+
+```bash
+# Rollback across accounts using named profiles
+python AAM_role_evaluation.py \
+  --rollback AAM_trust_backup_apply_only_<timestamp>.json \
+  --profiles prod-account,dev-account,staging-account
+
+# Rollback across accounts by assuming a role into each target
+python AAM_role_evaluation.py \
+  --rollback AAM_trust_backup_apply_only_<timestamp>.json \
+  --account-ids 111111111111,222222222222 \
+  --role-name OrganizationAccountAccessRole
+```
+
+Notes:
+
+- The tool prints which accounts appear in the backup and **warns** if you did not
+  supply credentials for one of them — roles in an unresolved account are **skipped**,
+  not failed.
+- Rollback is **fail-and-continue**: a failure on one role doesn't abort the rest.
+  The summary reports succeeded / skipped / failed counts.

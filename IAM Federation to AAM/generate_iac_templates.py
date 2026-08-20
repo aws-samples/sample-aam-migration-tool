@@ -103,7 +103,7 @@ def generate_cloudformation(
         "Sid": "AAMTrustPolicyStatement",
         "Effect": "Allow",
         "Principal": {"Service": {"Ref": "TrustServicePrincipal"}},
-        "Action": ["sts:AssumeRole", "sts:SetContext"],
+        "Action": ["sts:AssumeRole", "sts:SetContext", "sts:TagSession"],
     }
     if aam_source_account or aam_application_arn:
         condition: Dict[str, Any] = {"StringEquals": {}}
@@ -246,7 +246,7 @@ def generate_terraform(
     lines.append('  statement {')
     lines.append('    sid     = "AAMTrustPolicyStatement"')
     lines.append('    effect  = "Allow"')
-    lines.append('    actions = ["sts:AssumeRole", "sts:SetContext"]')
+    lines.append('    actions = ["sts:AssumeRole", "sts:SetContext", "sts:TagSession"]')
     lines.append('')
     lines.append('    principals {')
     lines.append('      type        = "Service"')
