@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import Alert from "@cloudscape-design/components/alert";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
+import Checkbox from "@cloudscape-design/components/checkbox";
 import Container from "@cloudscape-design/components/container";
 import ContentLayout from "@cloudscape-design/components/content-layout";
 import FormField from "@cloudscape-design/components/form-field";
@@ -93,6 +94,7 @@ export default function IamFederation() {
   const [migrateResults, setMigrateResults] = useState<MigrateResult[]>([]);
   const [aamAppArn, setAamAppArn] = useState("");
   const [aamSourceAccount, setAamSourceAccount] = useState("");
+  const [includeTagSession, setIncludeTagSession] = useState(true);
   const [aamProfile, setAamProfile] = useState<{ label: string; value: string } | null>(null);
   const [availableProfiles, setAvailableProfiles] = useState<{ label: string; value: string }[]>([]);
   const [entitlementResults, setEntitlementResults] = useState<{ group: string; principal: string; account: string; role: string; role_arn: string; status: string; error?: string }[]>([]);
@@ -227,6 +229,7 @@ export default function IamFederation() {
           return f;
         })(),
       };
+      payload.include_tag_session = includeTagSession;
       // Include entitlement mappings and AAM ARN if provided
       if (aamAppArn.trim()) {
         payload.aam_application_arn = aamAppArn.trim();
@@ -266,6 +269,7 @@ export default function IamFederation() {
     try {
       const payload: Record<string, unknown> = {
         role_arns: [...new Set(entitlementMappings.filter((m) => m.roleArn).map((m) => m.roleArn))],
+        include_tag_session: includeTagSession,
       };
       if (aamAppArn.trim()) {
         payload.aam_application_arn = aamAppArn.trim();
@@ -395,6 +399,17 @@ export default function IamFederation() {
                 onChange={({ detail }) => setAamSourceAccount(detail.value)}
                 placeholder="123456789012"
               />
+            </FormField>
+            <FormField
+              label="Trust policy options"
+              description="Allows AAM to pass session tags when assuming the role. Uncheck only if you do not need or want the ability for roles to leverage session tags."
+            >
+              <Checkbox
+                checked={includeTagSession}
+                onChange={({ detail }) => setIncludeTagSession(detail.checked)}
+              >
+                Include sts:TagSession in trust policy
+              </Checkbox>
             </FormField>
           </SpaceBetween>
         </Container>

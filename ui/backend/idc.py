@@ -414,6 +414,7 @@ def generate_iac(params: dict) -> dict:
     role_name_template = params.get("role_name_template") or "AAM-{name}"
     aam_application_arn = params.get("aam_application_arn")
     aam_source_account = params.get("aam_source_account") or ""
+    include_tag_session = params.get("include_tag_session", True)
 
     # Filter to selected permission sets if specified
     selected_ps_arns = params.get("selected_permission_sets")
@@ -466,11 +467,14 @@ def generate_iac(params: dict) -> dict:
         account_ps = [ps for ps in permission_sets if ps["arn"] in ps_arns_for_account]
 
         # Trust statement with conditions
+        _actions = ["sts:AssumeRole", "sts:SetContext", "sts:TagSession"]
+        if not include_tag_session:
+            _actions = [a for a in _actions if a != "sts:TagSession"]
         trust_stmt: dict = {
             "Sid": "AAMTrustPolicyStatement",
             "Effect": "Allow",
             "Principal": {"Service": "account-access.amazonaws.com"},
-            "Action": ["sts:AssumeRole", "sts:SetContext"],
+            "Action": _actions,
         }
         if aam_source_account or aam_application_arn:
             cond: dict = {"StringEquals": {}}
@@ -752,11 +756,14 @@ def apply_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
     # Build the trust policy with confused-deputy conditions
     aam_source_account = params.get("aam_source_account") or ""
     aam_app_arn = params.get("aam_application_arn") or ""
+    _actions = ["sts:AssumeRole", "sts:SetContext", "sts:TagSession"]
+    if not params.get("include_tag_session", True):
+        _actions = [a for a in _actions if a != "sts:TagSession"]
     trust_stmt: dict = {
         "Sid": "AAMTrustPolicyStatement",
         "Effect": "Allow",
         "Principal": {"Service": "account-access.amazonaws.com"},
-        "Action": ["sts:AssumeRole", "sts:SetContext"],
+        "Action": _actions,
     }
     if aam_source_account or aam_app_arn:
         trust_stmt["Condition"] = {"StringEquals": {}}

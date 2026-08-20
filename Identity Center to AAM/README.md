@@ -188,7 +188,7 @@ Run `python idc_to_aam.py --help` for the live list.
 ### Role creation
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--trust-policy` | — | Path to the JSON trust policy used as each role's AssumeRolePolicyDocument. Required (it defines the roles in both modes). A ready-made AAM trust policy ships as `trust.json`. |
+| `--trust-policy` | — | Path to the JSON trust policy used as each role's AssumeRolePolicyDocument. Required (it defines the roles in both modes). A ready-made AAM trust policy ships as `trust.json`. The shipped default grants the `account-access.amazonaws.com` service principal `sts:AssumeRole`, `sts:SetContext`, and `sts:TagSession`. Edit the file to remove `sts:TagSession` if you do not want roles to leverage session tags. |
 | `--role-path` | `/aam/` | IAM path applied to every created/emitted role. |
 | `--tag KEY=VALUE` | — | Tag applied to every role. Repeatable. |
 | `--permission-boundary` | — | ARN of a permission boundary to attach to every role. |

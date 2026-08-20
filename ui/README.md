@@ -77,6 +77,7 @@ Discovers IAM roles with SAML trust policies and migrates them to AAM.
   aws account-access list-applications --region <region>
   ```
   Copy the `applicationArn` from the output.
+- **Include sts:TagSession in trust policy** (checkbox, in the AAM Configuration panel) — **checked by default.** Allows AAM to pass session tags when assuming the role. Uncheck it only if you do not need or want the ability for roles to leverage session tags. The choice applies to both live trust policy updates and generated IaC.
 
 ### 3. IdC → AAM
 
@@ -100,6 +101,7 @@ equivalent IAM roles with AAM trust policies and entitlements.
   Copy the `applicationArn` from the output.
 - **Role path** — IAM path for created roles (default: `/aam/`)
 - **Permission set selection** — which permission sets to create roles for
+- **Include sts:TagSession in trust policy** (checkbox, in the AAM Configuration panel) — **checked by default.** Allows AAM to pass session tags when assuming the role. Uncheck it only if you do not need or want the ability for roles to leverage session tags. The choice applies to both live role creation (apply) and generated IaC.
 
 ### CSV Upload Formats
 

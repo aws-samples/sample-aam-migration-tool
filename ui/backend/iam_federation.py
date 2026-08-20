@@ -263,11 +263,12 @@ NEW_TRUST_STATEMENT = {
     },
     "Action": [
         "sts:AssumeRole",
-        "sts:SetContext"
+        "sts:SetContext",
+        "sts:TagSession"
     ],
 }
 
-AAM_SERVICE_PRINCIPALS = {"account-access.amazonaws.com", "account-access-preview.amazonaws.com"}
+AAM_SERVICE_PRINCIPALS = {"account-access.amazonaws.com"}
 
 
 def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dict:
@@ -393,6 +394,11 @@ def migrate_roles(params: dict, on_progress: Optional[ProgressCb] = None) -> dic
 
             # Build trust statement with confused-deputy conditions
             trust_stmt = dict(NEW_TRUST_STATEMENT)
+            # Honor the include_tag_session toggle (default: True / TagSession kept)
+            if not params.get("include_tag_session", True):
+                trust_stmt["Action"] = [
+                    a for a in trust_stmt.get("Action", []) if a != "sts:TagSession"
+                ]
             aam_src_acct = params.get("aam_source_account", "")
             aam_app_arn = params.get("aam_application_arn", "")
             if aam_src_acct or aam_app_arn:
@@ -702,11 +708,14 @@ def generate_iac(params: dict) -> dict:
         roles_by_account[acct].append(r)
 
     # Trust policy statement
+    actions = ["sts:AssumeRole", "sts:SetContext", "sts:TagSession"]
+    if not params.get("include_tag_session", True):
+        actions = [a for a in actions if a != "sts:TagSession"]
     trust_stmt: dict = {
         "Sid": "AAMTrustPolicyStatement",
         "Effect": "Allow",
         "Principal": {"Service": "account-access.amazonaws.com"},
-        "Action": ["sts:AssumeRole", "sts:SetContext"],
+        "Action": actions,
     }
     if aam_source_account or aam_application_arn:
         cond: dict = {"StringEquals": {}}

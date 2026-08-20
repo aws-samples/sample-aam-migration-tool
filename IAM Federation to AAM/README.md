@@ -61,6 +61,12 @@ python AAM_role_evaluation.py \
   --mode ADD \
   --region us-east-1
 
+# Custom trust statement + omit sts:TagSession
+python AAM_role_evaluation.py \
+  --aam-application-arn "arn:aws:account-access:us-east-1:123456:application/app-id" \
+  --trust-policy my_trust_statement.json \
+  --no-tag-session
+
 # With entitlement creation after discovery (columnar CSV)
 python AAM_role_evaluation.py \
   --aam-application-arn "arn:aws:account-access:us-east-1:123456:application/app-id" \
@@ -157,6 +163,27 @@ python AAM_role_evaluation.py --rollback <backup_file>
 | `--entitlement-csv` | — | Columnar CSV with Group/Principal, Principal Type, Account ID, Role Name, Role ARN columns. |
 | `--region` | `us-east-1` | AWS region for AAM API calls. |
 
+### Trust policy
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--trust-policy <file>` | — | Path to a JSON file containing a custom trust policy **statement** to merge into each role's trust policy, instead of the built-in default. Confused-deputy conditions (`aws:SourceAccount`, `aws:SourceArn`) are still injected on top. |
+| `--no-tag-session` | off | Remove the `sts:TagSession` action from the trust statement before applying. |
+
+By default, the tool merges this statement into each role's trust policy:
+
+```json
+{
+  "Sid": "AAMTrustPolicyStatement",
+  "Effect": "Allow",
+  "Principal": { "Service": "account-access.amazonaws.com" },
+  "Action": ["sts:AssumeRole", "sts:SetContext", "sts:TagSession"]
+}
+```
+
+- **`sts:TagSession` is included by default.** It allows AAM to pass session tags when assuming the role. Use `--no-tag-session` to omit it if you do not need or want roles to leverage session tags.
+- **`--trust-policy`** accepts either a bare statement object or a full policy document (in which case the first statement is used). The action list you supply is honored as-is, except that `--no-tag-session` will still strip `sts:TagSession` if present.
+
 ### Other
 
 | Flag | Description |
@@ -219,7 +246,7 @@ account-access:GetApplication
 
 - **Backup before modify** — trust policies are backed up to a timestamped JSON before any update (both interactive and `--apply-only` modes).
 - **Rollback available** — `--rollback <backup_file>` restores original trust policies.
-- **Idempotent** — roles already containing the AAM service principal (`account-access.amazonaws.com` or `account-access-preview.amazonaws.com`) are skipped.
+- **Idempotent** — roles already containing the AAM service principal (`account-access.amazonaws.com`) are skipped.
 - **Fail-and-continue** — a failure on one role doesn't abort others.
 - **GA endpoint** — AAM calls use the GA endpoint (`account-access.<region>.api.aws`).
 - **ValidationException retry** — entitlement creation retries up to 3 times with backoff for IAM propagation delay.

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import Alert from "@cloudscape-design/components/alert";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
+import Checkbox from "@cloudscape-design/components/checkbox";
 import Container from "@cloudscape-design/components/container";
 import ContentLayout from "@cloudscape-design/components/content-layout";
 import FormField from "@cloudscape-design/components/form-field";
@@ -86,6 +87,7 @@ export default function Idc() {
   // AAM Configuration (used for trust policy conditions + entitlement creation)
   const [aamAppArn, setAamAppArn] = useState("");
   const [aamSourceAccount, setAamSourceAccount] = useState("");
+  const [includeTagSession, setIncludeTagSession] = useState(true);
 
   // Apply mode
   const [applying, setApplying] = useState(false);
@@ -290,6 +292,7 @@ export default function Idc() {
       if (roleMappings.length) {
         payload.role_mappings = roleMappings;
       }
+      payload.include_tag_session = includeTagSession;
       const res = await api.idcGenerateIac(payload);
       setIacResult(res);
     } catch (e) {
@@ -360,6 +363,7 @@ export default function Idc() {
       if (roleMappings.length) {
         payload.role_mappings = roleMappings;
       }
+      payload.include_tag_session = includeTagSession;
       const { job_id } = await api.idcApply(payload);
       stopApplyPolling();
       applyTick(job_id);
@@ -504,6 +508,17 @@ export default function Idc() {
                 onChange={({ detail }) => setAamSourceAccount(detail.value)}
                 placeholder="123456789012"
               />
+            </FormField>
+            <FormField
+              label="Trust policy options"
+              description="Allows AAM to pass session tags when assuming the role. Uncheck only if you do not need or want the ability for roles to leverage session tags."
+            >
+              <Checkbox
+                checked={includeTagSession}
+                onChange={({ detail }) => setIncludeTagSession(detail.checked)}
+              >
+                Include sts:TagSession in trust policy
+              </Checkbox>
             </FormField>
           </SpaceBetween>
         </Container>

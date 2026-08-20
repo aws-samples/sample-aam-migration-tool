@@ -34,7 +34,7 @@ def build_aam_trust_policy(aam_source_account: str = "", aam_application_arn: st
         "Sid": "AAMTrustPolicyStatement",
         "Effect": "Allow",
         "Principal": {"Service": "account-access.amazonaws.com"},
-        "Action": ["sts:AssumeRole", "sts:SetContext"],
+        "Action": ["sts:AssumeRole", "sts:SetContext", "sts:TagSession"],
     }
     if aam_source_account or aam_application_arn:
         condition: dict = {"StringEquals": {}}

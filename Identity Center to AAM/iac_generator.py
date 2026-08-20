@@ -20,8 +20,7 @@ Each entitlement (``AWS::AccountAccess::Entitlement``):
   - the IdC principal (UserId or GroupId) from the assignment
   - the role ARN wired to the corresponding role resource via Fn::GetAtt
 
-Terraform output is intentionally omitted: the Terraform provider for the AAM
-preview service is not yet available, so only CloudFormation is generated.
+
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ from models import Inventory, PermissionSetRecord, RoleCreationResult
 
 
 AAM_TRUST_SERVICE_PRINCIPAL = "account-access.amazonaws.com"
-AAM_TRUST_ACTIONS = ["sts:AssumeRole", "sts:SetContext"]
+AAM_TRUST_ACTIONS = ["sts:AssumeRole", "sts:SetContext", "sts:TagSession"]
 
 
 class IaCGenerator:
