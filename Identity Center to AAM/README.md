@@ -1,13 +1,23 @@
 # IdC-to-AAM Migration Tool
 
-A Python 3 command-line tool that migrates AWS **IAM Identity Center (IdC)**
-configuration to **Account Access Manager (AAM)**. It inventories your existing
+A Python 3 command-line tool that migrates AWS **[IAM Identity Center (IdC)](https://docs.aws.amazon.com/singlesignon/latest/userguide/what-is.html)**
+configuration to **[Account Access Manager (AAM)](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager.html)**. It inventories your existing
 permission sets and account assignments, produces an editable Excel migration
 plan, recreates each permission set as an IAM role (or emits the equivalent
-Infrastructure-as-Code), and creates the AAM entitlements that preserve who can
+Infrastructure-as-Code), and creates the [AAM entitlements](https://docs.aws.amazon.com/account-access/latest/APIReference/API_CreateEntitlement.html) that preserve who can
 access what — all with an audit trail and a final mapping report.
 
 This is the standalone CLI. For the browser-based console (recommended for most users), see the [main README](../README.md).
+
+### Reference documentation
+
+| Topic | AWS documentation |
+|-------|-------------------|
+| Account Access Manager (AAM) | [Overview](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager.html) · [Getting started](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager-getting-started.html) |
+| AAM application & entitlements (API) | [`CreateApplication`](https://docs.aws.amazon.com/account-access/latest/APIReference/API_CreateApplication.html) · [`CreateEntitlement`](https://docs.aws.amazon.com/account-access/latest/APIReference/API_CreateEntitlement.html) · [all operations](https://docs.aws.amazon.com/account-access/latest/APIReference/API_Operations.html) |
+| IAM Identity Center (IdC) | [What is IAM Identity Center?](https://docs.aws.amazon.com/singlesignon/latest/userguide/what-is.html) |
+| IAM role trust policies | [Custom trust policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-custom.html) |
+| Customer managed policies (CMPs) | [Managed vs inline policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_managed-vs-inline.html) |
 
 The tool runs in clear, sequential phases:
 
@@ -50,6 +60,7 @@ It is one of three components in the larger migration toolkit.
 - [Outputs](#outputs)
 - [IAM permissions needed](#iam-permissions-needed)
 - [Safety model](#safety-model)
+- [Rollback and recovery](#rollback-and-recovery)
 - [For contributors: running the tests](#for-contributors-running-the-tests)
 - [Limitations / out of scope](#limitations--out-of-scope)
 
@@ -403,14 +414,86 @@ and `CreateEntitlement` / `ListEntitlements`.
 
 ---
 
+## Rollback and recovery
+
+Unlike the [IAM Federation → AAM tool](../IAM%20Federation%20to%20AAM/README.md#rollback) — which *modifies* existing trust policies and can restore them from a backup — this tool **creates** new IAM roles and AAM entitlements. There is therefore **no automated `--rollback`**: undoing an `apply` run means deleting the resources it created. This section is the manual runbook.
+
+> If you ran in the default **`generate-iac`** mode, nothing was changed in AWS — there is nothing to roll back. Simply discard the generated template (or, if you already deployed it, delete that CloudFormation stack, which removes the `AWS::IAM::Role` and `AWS::AccountAccess::Entitlement` resources it created).
+
+### Step 1 — identify exactly what was created
+
+Every `apply` run produces two authoritative records:
+
+- **Mapping report** (`mapping_<run_id>.xlsx` / `.csv` / `.json`) — one row per assignment with a `status` column. Rows with `status = CREATED` are the resources this run made; `EXISTING` rows were reused (do **not** delete those) and `SKIPPED` / `FAILED` rows created nothing.
+- **Audit log** (`--audit-to-file` CSV, or stdout JSON) — one entry per operation (`role_created`, `entitlement_created`, …) with the target ARN and `caller_arn`.
+
+Filter both to `status = CREATED` / successful `*_created` actions to get the precise list of roles and entitlements to remove.
+
+### Step 2 — delete AAM entitlements first
+
+Remove entitlements before roles, so no principal is left pointing at a role that is about to disappear. Use the entitlement IDs from the mapping report's `entitlement_id` column:
+
+```bash
+# For each CREATED entitlement_id in the mapping report:
+aws account-access delete-entitlement \
+  --application-arn "arn:aws:account-access:<region>:<acct>:application/<id>" \
+  --entitlement-id "<entitlement_id>" \
+  --region <region>
+```
+
+See the [AAM API operations reference](https://docs.aws.amazon.com/account-access/latest/APIReference/API_Operations.html) (`DeleteEntitlement`) for the full API details.
+
+### Step 3 — delete the created IAM roles
+
+For each role with `status = CREATED` (from the mapping report's `role_arn`), detach/delete its policies, then the role:
+
+```bash
+ROLE=<role-name>   # from role_arn in the mapping report
+
+# Detach managed policies
+for arn in $(aws iam list-attached-role-policies --role-name "$ROLE" \
+    --query 'AttachedPolicies[].PolicyArn' --output text); do
+  aws iam detach-role-policy --role-name "$ROLE" --policy-arn "$arn"
+done
+
+# Delete inline policies
+for name in $(aws iam list-role-policies --role-name "$ROLE" \
+    --query 'PolicyNames[]' --output text); do
+  aws iam delete-role-policy --role-name "$ROLE" --policy-name "$name"
+done
+
+# Remove a permission boundary if one was attached (--permission-boundary)
+aws iam delete-role-permissions-boundary --role-name "$ROLE" 2>/dev/null || true
+
+# Finally delete the role
+aws iam delete-role --role-name "$ROLE"
+```
+
+In **multi-account** runs, roles live in each target account — assume the same role/profile you used for the migration (`--profiles` or `--account-ids` + `--role-name`) to reach each account, and delete there.
+
+### Step 4 — clean up converted CMPs (only if you used `--convert-inline-to-cmp`)
+
+That flag creates customer managed policies named per `--cmp-name-template` (default `AAM-{permission_set_name}-inline`). After the roles above are deleted, delete those CMPs:
+
+```bash
+aws iam delete-policy --policy-arn "arn:aws:iam::<acct>:policy/AAM-<permission-set>-inline"
+```
+
+Do **not** delete CMPs that pre-existed your migration (ones a permission set referenced by name) — those are not created by this tool.
+
+### Advanced / troubleshooting
+
+- **Partial failures.** Because the tool is *fail-and-continue*, a run may leave a mix of `CREATED` / `FAILED` rows. Roll back only the `CREATED` rows; re-running the migration is safe for the `FAILED` ones because role and entitlement creation are **idempotent** (existing resources are detected and reused, not duplicated).
+- **`entitlement_id` is empty but a role exists.** The role was created but the entitlement failed (often IAM propagation delay — the tool already retries `ValidationException` up to 3 times). Either re-run to complete the entitlement, or delete the orphaned role via Step 3.
+- **Prefer a clean boundary next time.** For easy teardown, run future migrations with a distinct `--role-path` (e.g. `/aam-migration-2024/`) and a `--tag` (e.g. `migration=aam`). You can then enumerate everything created by that run with `aws iam list-roles --path-prefix /aam-migration-2024/` before deleting.
+- **IaC-deployed runs.** If you deployed the `generate-iac` template, delete the CloudFormation stack instead of doing Steps 2–4 by hand — the stack owns the roles and entitlements and removes them together.
+
+---
+
 ## Limitations / out of scope
 
-- **Terraform output** is not yet emitted (no AAM Terraform provider yet);
-  CloudFormation only. Tracked in `TODO_AAM_IAC.md`.
 - **The AAM application** is an operator-managed prerequisite and is not emitted
   as IaC.
-- **Multi-account IaC distribution** (CloudFormation StackSets) is future work;
-  generated templates target a single account.
 - The tool does **not** modify resource-based policies, migrate IAM Federation,
   or analyze SCPs/RCPs/VPC endpoint policies (other components cover those).
 

@@ -1,6 +1,22 @@
 # AAM Migration Tool
 
-Migrate to **AWS Account Access Manager (AAM)** from IAM Identity Center (IdC) or SAML-based IAM Federation. This tool automates discovery, policy analysis, role creation, and entitlement mapping through a browser-based console running on your local machine.
+Migrate to **[AWS Account Access Manager (AAM)](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager.html)** from [IAM Identity Center (IdC)](https://docs.aws.amazon.com/singlesignon/latest/userguide/what-is.html) or [SAML-based IAM Federation](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_saml.html). This tool automates discovery, policy analysis, role creation, and entitlement mapping through a browser-based console running on your local machine.
+
+### Reference documentation
+
+These are the canonical AWS docs for the services and concepts this tool works with. They are linked again on first mention throughout this README.
+
+| Topic | AWS documentation |
+|-------|-------------------|
+| Account Access Manager (AAM) — overview | [What is account access manager?](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager.html) |
+| AAM — getting started (create/enable the application) | [Getting started with account access manager](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager-getting-started.html) |
+| AAM — create the application (API) | [`CreateApplication`](https://docs.aws.amazon.com/account-access/latest/APIReference/API_CreateApplication.html) · [CLI `create-application`](https://docs.aws.amazon.com/cli/latest/reference/account-access/create-application.html) |
+| AAM — entitlements (API) | [`CreateEntitlement`](https://docs.aws.amazon.com/account-access/latest/APIReference/API_CreateEntitlement.html) · [all operations](https://docs.aws.amazon.com/account-access/latest/APIReference/API_Operations.html) |
+| AAM — security & IAM permissions | [Security in account access manager](https://docs.aws.amazon.com/IAM/latest/UserGuide/aam-security.html) · [`account-access` actions & condition keys](https://docs.aws.amazon.com/service-authorization/latest/reference/list_account-access.html) |
+| IAM Identity Center (IdC) | [What is IAM Identity Center?](https://docs.aws.amazon.com/singlesignon/latest/userguide/what-is.html) |
+| SAML-based IAM federation | [SAML 2.0 federation](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_saml.html) |
+| IAM role trust policies | [Create a role using custom trust policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-custom.html) · [Update a role trust policy](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_update-role-trust-policy.html) |
+| Customer managed policies (CMPs) | [Managed policies and inline policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_managed-vs-inline.html) |
 
 ---
 
@@ -15,9 +31,83 @@ cd ui
 
 Open **http://127.0.0.1:5000** in your browser. The script handles everything: Python venv, dependencies, frontend build, and Flask server.
 
-**Requirements:** Python 3.11+, Node.js 18+, AWS credentials configured locally.
+**Requirements:** Python 3.11+, Node.js 18+, AWS credentials configured locally, and a configured AAM Application (see [documentation for creating an AAM application](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager-getting-started.html)).
 
 See [`ui/README.md`](ui/README.md) for full UI documentation including credential requirements, operating modes, and troubleshooting.
+
+---
+
+## Recommended workflow
+
+**Start in the web console** (above) — it's the primary interface, and the three tools below are its tabs. The chart maps the end-to-end path, including the steps that remain **on you** (shaded) and are not handled by this tool. See [What You Must Do](#what-you-must-do-not-handled-by-this-tool) and [Caveats](#caveats) for detail on those steps and on rollback.
+
+```mermaid
+flowchart TD
+    Start([Start here]) --> UI["Launch the web console:
+    cd ui and run ./run.sh
+    then open the console at 127.0.0.1 port 5000"]
+
+    %% ---- Customer-owned prerequisite ----
+    UI --> Prereq[/"MANUAL: Create the AAM application
+    in the Org management account
+    (tool never does this)"/]:::manual
+
+    %% ---- Decision: which source am I migrating from? ----
+    Prereq --> Decide{"Which console tab
+    matches your current
+    access method?"}
+
+    %% ================= IdC branch =================
+    Decide -->|IAM Identity Center| Scan["Policy Analysis tab
+    scan resource policies for references
+    to your IdC permission sets (read-only)"]
+    Scan --> IdCHavePlan{"Already have an edited
+    migration plan CSV?"}
+    IdCHavePlan -->|No| IdC["IdC to AAM tab
+    Discovery: inventory permission
+    sets + assignments, edit the plan"]
+    IdCHavePlan -->|"Yes — upload it"| IdCMode
+    IdC --> IdCMode{"IdC tab:
+    Generate CloudFormation
+    or Apply directly?"}
+    IdCMode -->|Generate CloudFormation| IdCIaC["per-account CloudFormation +
+    reports, no AWS changes"]
+    IdCMode -->|Apply directly| IdCApply["create IAM roles +
+    AAM entitlements (live)"]
+    IdCIaC --> Test
+    IdCApply --> Test
+
+    %% ============= IAM Federation branch =============
+    Decide -->|SAML IAM Federation| FedHavePlan{"Already have an edited
+    entitlement mapping CSV?"}
+    FedHavePlan -->|No| Fed["IAM Federation to AAM tab
+    Discover roles that trust
+    your SAML provider"]
+    FedHavePlan -->|"Yes — upload it"| FedMode
+    Fed --> FedMode{"Federation tab:
+    Generate IaC or
+    Migrate & Create Entitlements?"}
+    FedMode -->|Generate IaC| FedIaC["per-account CloudFormation +
+    reports, no AWS changes"]
+    FedMode -->|"Migrate & Create Entitlements"| FedApply["ADD (keep SAML) or REPLACE,
+    then create entitlements (live)"]
+    FedIaC --> Test
+    FedApply --> Test
+
+    %% ---- Customer-owned validation & cutover (shared) ----
+    Test[/"MANUAL: test that users/groups
+    can assume the new AAM roles"/]:::manual --> Ok{"Access validated?"}
+    Ok -->|No| Rollback[/"See Rollback and recovery
+    Federation: --rollback ; IdC: manual"/]:::manual
+    Ok -->|Yes| Decom[/"MANUAL: decommission legacy access
+    (disable old IdC permission sets /
+    remove SAML trust) after validation"/]:::manual
+    Decom --> Done([Migration complete])
+
+    classDef manual fill:#fff3cd,stroke:#d39e00,color:#663c00;
+```
+
+> Shaded nodes are **customer-owned** steps this tool does not perform. Rectangles are console actions; diamonds are decisions you make.
 
 ---
 
@@ -35,7 +125,7 @@ Use this to identify policies that reference your IdP before completing migratio
 
 ### 2. IAM Federation → AAM
 
-Discovers SAML-federated IAM roles and migrates their trust policies to include the AAM service principal. Creates AAM entitlements to preserve who-can-access-what.
+Discovers [SAML-federated](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_saml.html) IAM roles and migrates their [trust policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_update-role-trust-policy.html) to include the AAM service principal. Creates [AAM entitlements](https://docs.aws.amazon.com/account-access/latest/APIReference/API_CreateEntitlement.html) to preserve who-can-access-what.
 
 - ADD mode: keeps existing SAML trust alongside AAM (parallel operation)
 - REPLACE mode: removes SAML trust, adds AAM only (cutover)
@@ -50,7 +140,7 @@ Discovers SAML-federated IAM roles and migrates their trust policies to include 
 
 ### 3. IdC → AAM
 
-Inventories Identity Center permission sets and assignments, then recreates them as IAM roles with AAM trust policies and entitlements.
+Inventories [Identity Center](https://docs.aws.amazon.com/singlesignon/latest/userguide/what-is.html) permission sets and assignments, then recreates them as IAM roles with AAM [trust policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-custom.html) and [entitlements](https://docs.aws.amazon.com/account-access/latest/APIReference/API_CreateEntitlement.html).
 
 - Optimized per-account discovery (`ListPermissionSetsProvisionedToAccount`) for single/multi mode
 - Organization-wide scan for full inventory
@@ -234,8 +324,8 @@ account-access:GetApplication
 
 ## What You Must Do (Not Handled by This Tool)
 
-1. **Create the AAM application** — The tool creates entitlements against an application but never creates the application itself.
-2. **Pre-create customer managed policies** — If your IdC permission sets reference CMPs, those policies must exist in each target account with the same name and path.
+1. **[Create the AAM application](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager-getting-started.html)** — The tool creates entitlements against an application but never creates the application itself.
+2. **Pre-create [customer managed policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_managed-vs-inline.html)** — If your IdC permission sets reference CMPs, those policies must exist in each target account with the same name and path. (The tool can convert *inline* policies to CMPs with `--convert-inline-to-cmp`, but it does not create CMPs that a permission set references by name.)
 3. **Test access after migration** — Validate that users/groups can assume the new roles.
 4. **Run parallel operations** — Keep IdC or SAML federation active alongside AAM until validated.
 5. **Decommission legacy access** — Once satisfied, tested, and validated disable the old access path.
@@ -247,7 +337,7 @@ account-access:GetApplication
 ## Caveats
 
 - **Local-only execution** — runs entirely on your machine. No data is sent externally. Results cached in `ui/cache/`.
-- **No rollback automation** — apply mode logs what it changed but doesn't provide one-click undo.
+- **Rollback support varies by tool** — the **IAM Federation → AAM** tool provides automated rollback of trust-policy changes (`--rollback <backup_file>`, single- and multi-account), because it backs up each role's original trust policy before modifying it. The **IdC → AAM** tool has no automated undo for apply mode (it *creates* roles and entitlements rather than modifying existing ones); reverse it manually using the run's mapping report and audit log. See each tool's **Rollback and recovery** section: [IAM Federation](IAM%20Federation%20to%20AAM/README.md#rollback) · [IdC](Identity%20Center%20to%20AAM/README.md#rollback-and-recovery).
 - **IdC API throttling** — scans may hit rate limits (e.g., 20 TPS for Identity Center). The tool uses adaptive retry with exponential backoff.
 - **Customer managed policy propagation** — CMPs referenced by permission sets must exist in target accounts before role creation.
 

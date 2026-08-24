@@ -1,8 +1,18 @@
 # IAM Federation → AAM — CLI Tool
 
-Evaluate and migrate SAML-federated IAM roles to AWS Account Access Manager (AAM). This tool discovers roles that trust your SAML identity provider, updates their trust policies to enable AAM, and creates AAM entitlements to preserve who-can-access-what.
+Evaluate and migrate [SAML-federated](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_saml.html) IAM roles to AWS [Account Access Manager (AAM)](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager.html). This tool discovers roles that trust your SAML identity provider, updates their [trust policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_update-role-trust-policy.html) to enable AAM, and creates [AAM entitlements](https://docs.aws.amazon.com/account-access/latest/APIReference/API_CreateEntitlement.html) to preserve who-can-access-what.
 
 This is the standalone CLI. For the browser-based console (recommended for most users), see the [main README](../README.md).
+
+### Reference documentation
+
+| Topic | AWS documentation |
+|-------|-------------------|
+| Account Access Manager (AAM) | [Overview](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager.html) · [Getting started](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager-getting-started.html) |
+| AAM application & entitlements (API) | [`CreateApplication`](https://docs.aws.amazon.com/account-access/latest/APIReference/API_CreateApplication.html) · [`CreateEntitlement`](https://docs.aws.amazon.com/account-access/latest/APIReference/API_CreateEntitlement.html) · [all operations](https://docs.aws.amazon.com/account-access/latest/APIReference/API_Operations.html) |
+| SAML-based IAM federation | [SAML 2.0 federation](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_saml.html) |
+| IAM role trust policies | [Update a role trust policy](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_update-role-trust-policy.html) · [Custom trust policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-custom.html) |
+| AAM security & permissions | [Security in AAM](https://docs.aws.amazon.com/IAM/latest/UserGuide/aam-security.html) · [`account-access` actions & condition keys](https://docs.aws.amazon.com/service-authorization/latest/reference/list_account-access.html) |
 
 ---
 
@@ -370,3 +380,49 @@ Notes:
   not failed.
 - Rollback is **fail-and-continue**: a failure on one role doesn't abort the rest.
   The summary reports succeeded / skipped / failed counts.
+
+### What rollback does and does not cover
+
+`--rollback` restores **trust policies only**. It does **not** delete any AAM
+entitlements the run created — an entitlement is harmless once a role no longer
+trusts `account-access.amazonaws.com` (the principal can't assume the role), but
+to remove it entirely, delete it explicitly:
+
+```bash
+# List entitlements to find the ones created for the affected roles
+aws account-access list-entitlements \
+  --application-arn "arn:aws:account-access:<region>:<acct>:application/<id>" \
+  --region <region>
+
+# Delete a specific entitlement
+aws account-access delete-entitlement \
+  --application-arn "arn:aws:account-access:<region>:<acct>:application/<id>" \
+  --entitlement-id "<entitlement_id>" \
+  --region <region>
+```
+
+See the [AAM API operations reference](https://docs.aws.amazon.com/account-access/latest/APIReference/API_Operations.html) (`ListEntitlements`, `DeleteEntitlement`).
+
+### Advanced / troubleshooting
+
+- **REPLACE mode.** `REPLACE` removes the SAML trust statement and adds the AAM
+  one. Rolling back restores the original document — including the SAML trust —
+  from the pre-change backup, so a mistaken cutover is fully recoverable **as
+  long as you keep the backup file**. Treat these backups as the recovery point
+  and store them safely; without the file there is no automated way to
+  reconstruct the prior trust policy. See [Update a role trust policy](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_update-role-trust-policy.html).
+- **Verify after rollback.** Confirm the restored trust policy with
+  `aws iam get-role --role-name <role> --query 'Role.AssumeRolePolicyDocument'`,
+  and validate that a federated user can (or, for REPLACE, again can) assume the
+  role.
+- **"Role skipped" during rollback.** The backup contains a role whose account
+  you didn't supply credentials for. Re-run the rollback adding that account's
+  `--profiles` entry (or `--account-ids` + `--role-name`); skipped roles are not
+  modified, so it is safe to re-run.
+- **Re-applying is idempotent.** If you roll back and then re-migrate, roles that
+  already contain the AAM service principal are detected and skipped, so no
+  duplicate statements are added.
+- **No backup file?** If the backup was lost, there is no automated restore.
+  Manually remove the AAM trust statement (`Sid: AAMTrustPolicyStatement`) with
+  `aws iam update-assume-role-policy`, and for REPLACE-mode roles re-add your
+  original SAML trust statement by hand.

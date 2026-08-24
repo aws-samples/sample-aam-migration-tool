@@ -1,8 +1,18 @@
 # AAM Migration Console
 
-A locally-run web console for migrating to AWS Account Access Manager (AAM).
+A locally-run web console for migrating to AWS [Account Access Manager (AAM)](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager.html).
 Built with the [Cloudscape Design System](https://cloudscape.design/) for an
 authentic AWS Console look and feel, running entirely on your machine.
+
+### Reference documentation
+
+| Topic | AWS documentation |
+|-------|-------------------|
+| Account Access Manager (AAM) | [Overview](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager.html) · [Getting started (create/enable the application)](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager-getting-started.html) |
+| AAM application & entitlements (API) | [`CreateApplication`](https://docs.aws.amazon.com/account-access/latest/APIReference/API_CreateApplication.html) · [`CreateEntitlement`](https://docs.aws.amazon.com/account-access/latest/APIReference/API_CreateEntitlement.html) |
+| IAM Identity Center (IdC) | [What is IAM Identity Center?](https://docs.aws.amazon.com/singlesignon/latest/userguide/what-is.html) |
+| SAML-based IAM federation | [SAML 2.0 federation](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_saml.html) |
+| IAM role trust policies | [Custom trust policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-custom.html) |
 
 ---
 
@@ -63,7 +73,7 @@ to specific strings (e.g., an old SAML provider ARN you're migrating away from).
 
 ### 2. IAM Federation → AAM
 
-Discovers IAM roles with SAML trust policies and migrates them to AAM.
+Discovers IAM roles with [SAML trust policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_saml.html) and migrates them to AAM.
 
 **Step 1: Discovery** — what you need:
 - **Authentication** — same options as Policy Analysis
@@ -81,8 +91,8 @@ Discovers IAM roles with SAML trust policies and migrates them to AAM.
 
 ### 3. IdC → AAM
 
-Inventories Identity Center permission sets and assignments, then creates
-equivalent IAM roles with AAM trust policies and entitlements.
+Inventories [Identity Center](https://docs.aws.amazon.com/singlesignon/latest/userguide/what-is.html) permission sets and assignments, then creates
+equivalent IAM roles with AAM [trust policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-custom.html) and [entitlements](https://docs.aws.amazon.com/account-access/latest/APIReference/API_CreateEntitlement.html).
 
 **Step 1: Discovery** — what you need:
 - **Region** — the region where Identity Center is configured (check your IdC console)
