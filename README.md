@@ -365,8 +365,6 @@ sample-aam-migration-tool/
 │   └── lib.py                           # Shared library (used by CLI + UI)
 ├── Utilites/                            # Shared utilities
 │   └── resource_policy_scan/            # Resource policy scanner (used by CLI + UI directly)
-├── managed solution/                    # Serverless deployment architecture docs
-│   └── ARCHITECTURE.md                  # Design doc (API GW, Lambda, Step Functions)
 └── README.md                            # This file
 ```
 

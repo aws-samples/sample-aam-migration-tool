@@ -173,9 +173,8 @@ ui/
 │   ├── cache.py              # Local-file cache helpers
 │   ├── checkpoint.py         # Scan resume/checkpoint logic
 │   ├── aws_session.py        # Credential-profile / session helpers
-│   ├── jobs.py               # Job dispatcher (routes to local or managed)
+│   ├── jobs.py               # Job dispatcher
 │   ├── _jobs_local.py        # Local execution (threads, in-process scanning)
-│   ├── _jobs_managed.py      # Managed execution (SigV4 client to API Gateway)
 │   ├── policy_analysis.py    # Resource policy scanning logic
 │   ├── iam_federation.py     # IAM federation discovery + migration
 │   └── idc.py                # IdC discovery + apply
@@ -203,5 +202,4 @@ For assume-role mode, verify the target role exists and trusts your caller.
 
 ### UI stuck on "running" with no progress
 The job may have failed silently. Check the browser console for errors, or
-restart Flask. In managed mode, check the Step Functions execution history
-in the AWS Console.
+restart Flask.
