@@ -48,9 +48,7 @@ flowchart TD
     then open the console at 127.0.0.1 port 5000"]
 
     %% ---- Customer-owned prerequisite ----
-    UI --> Prereq[/"MANUAL: Create the AAM application
-    in the Org management account
-    (tool never does this)"/]:::manual
+    UI --> Prereq[/"MANUAL: Create the AAM application (tool never does this)"/]:::manual
 
     %% ---- Decision: which source am I migrating from? ----
     Prereq --> Decide{"Which console tab
