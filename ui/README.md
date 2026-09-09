@@ -1,5 +1,6 @@
 # AAM Migration Console
 
+<<<<<<< HEAD
 A locally-run web console for migrating to AWS [Account Access Manager (AAM)](https://docs.aws.amazon.com/IAM/latest/UserGuide/account-access-manager.html).
 Built with the [Cloudscape Design System](https://cloudscape.design/) for an
 authentic AWS Console look and feel, running entirely on your machine.
@@ -14,6 +15,12 @@ authentic AWS Console look and feel, running entirely on your machine.
 | SAML-based IAM federation | [SAML 2.0 federation](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_saml.html) |
 | IAM role trust policies | [Custom trust policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-custom.html) |
 
+=======
+A locally-run web console for migrating to AWS Account Access Manager (AAM).
+Built with the [Cloudscape Design System](https://cloudscape.design/) for an
+authentic AWS Console look and feel, running entirely on your machine.
+
+>>>>>>> ff24e0731d6796e3cf77bbbe1c95548aea1d067e
 ---
 
 ## Prerequisites
@@ -73,7 +80,11 @@ to specific strings (e.g., an old SAML provider ARN you're migrating away from).
 
 ### 2. IAM Federation → AAM
 
+<<<<<<< HEAD
 Discovers IAM roles with [SAML trust policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_saml.html) and migrates them to AAM.
+=======
+Discovers IAM roles with SAML trust policies and migrates them to AAM.
+>>>>>>> ff24e0731d6796e3cf77bbbe1c95548aea1d067e
 
 **Step 1: Discovery** — what you need:
 - **Authentication** — same options as Policy Analysis
@@ -91,8 +102,13 @@ Discovers IAM roles with [SAML trust policies](https://docs.aws.amazon.com/IAM/l
 
 ### 3. IdC → AAM
 
+<<<<<<< HEAD
 Inventories [Identity Center](https://docs.aws.amazon.com/singlesignon/latest/userguide/what-is.html) permission sets and assignments, then creates
 equivalent IAM roles with AAM [trust policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-custom.html) and [entitlements](https://docs.aws.amazon.com/account-access/latest/APIReference/API_CreateEntitlement.html).
+=======
+Inventories Identity Center permission sets and assignments, then creates
+equivalent IAM roles with AAM trust policies and entitlements.
+>>>>>>> ff24e0731d6796e3cf77bbbe1c95548aea1d067e
 
 **Step 1: Discovery** — what you need:
 - **Region** — the region where Identity Center is configured (check your IdC console)
@@ -173,8 +189,14 @@ ui/
 │   ├── cache.py              # Local-file cache helpers
 │   ├── checkpoint.py         # Scan resume/checkpoint logic
 │   ├── aws_session.py        # Credential-profile / session helpers
+<<<<<<< HEAD
 │   ├── jobs.py               # Job dispatcher
 │   ├── _jobs_local.py        # Local execution (threads, in-process scanning)
+=======
+│   ├── jobs.py               # Job dispatcher (routes to local or managed)
+│   ├── _jobs_local.py        # Local execution (threads, in-process scanning)
+│   ├── _jobs_managed.py      # Managed execution (SigV4 client to API Gateway)
+>>>>>>> ff24e0731d6796e3cf77bbbe1c95548aea1d067e
 │   ├── policy_analysis.py    # Resource policy scanning logic
 │   ├── iam_federation.py     # IAM federation discovery + migration
 │   └── idc.py                # IdC discovery + apply
@@ -202,4 +224,9 @@ For assume-role mode, verify the target role exists and trusts your caller.
 
 ### UI stuck on "running" with no progress
 The job may have failed silently. Check the browser console for errors, or
+<<<<<<< HEAD
 restart Flask.
+=======
+restart Flask. In managed mode, check the Step Functions execution history
+in the AWS Console.
+>>>>>>> ff24e0731d6796e3cf77bbbe1c95548aea1d067e
