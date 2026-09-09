@@ -118,7 +118,7 @@ API Gateway, Backup Vaults, CloudTrail, CloudWatch Logs, CodeArtifact, CodeBuild
   ],
   "skipped_resources": [
     {
-      "resource_arn": "arn:aws:kms:us-east-1:111111111111:key/abc-123",
+      "resource_arn": "arn:aws:kms:us-east-1:XXXXXXXXXXXX:key/abc-123",
       "service": "KMS",
       "error": "AccessDeniedException",
       "account_id": "111111111111"
